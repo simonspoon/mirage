@@ -5,13 +5,13 @@ mod server;
 
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Parser)]
 #[command(name = "mirage", about = "Swagger 2.0 mock API server")]
 struct Cli {
-    /// Path to the Swagger spec file
-    spec: PathBuf,
+    /// Path to Swagger 2.0 spec file (optional -- use admin UI to import)
+    spec: Option<PathBuf>,
 
     /// Port to listen on
     #[arg(short, long, default_value_t = 3000)]
@@ -22,34 +22,29 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    let mut spec = parser::SwaggerSpec::from_file(cli.spec.to_str().unwrap()).unwrap();
-    spec.resolve_refs();
-
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::create_tables(&conn, &spec).unwrap();
-    seeder::seed_tables(&conn, &spec, 10).unwrap();
-
     let db: server::Db = Arc::new(Mutex::new(conn));
 
-    let spec_info = server::SpecInfo {
-        title: spec.info.title.clone(),
-        version: spec.info.version.clone(),
-    };
-    let endpoints: Vec<server::EndpointInfo> = spec
-        .path_operations()
-        .iter()
-        .map(|(path, method, _)| server::EndpointInfo {
-            method: method.to_string(),
-            path: path.to_string(),
-        })
-        .collect();
+    let registry = Arc::new(RwLock::new(server::RouteRegistry::new()));
 
-    let state = server::AppState {
-        db,
-        spec_info,
-        endpoints,
-    };
-    let router = server::build_router(&spec, state);
+    // If spec provided, auto-import and configure
+    if let Some(spec_path) = &cli.spec {
+        let mut spec = parser::SwaggerSpec::from_file(spec_path.to_str().unwrap()).unwrap();
+        spec.resolve_refs();
+
+        // Create tables and seed
+        {
+            let conn = db.lock().unwrap();
+            schema::create_tables(&conn, &spec).unwrap();
+            seeder::seed_tables(&conn, &spec, 10).unwrap();
+        }
+
+        // Populate registry
+        server::populate_registry(&mut registry.write().unwrap(), &spec);
+    }
+
+    let state = server::AppState { db, registry };
+    let router = server::build_router(state);
 
     println!("Mirage server running on port {}", cli.port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", cli.port))
