@@ -590,28 +590,22 @@ async fn admin_configure(
     // Extract definition names from the unresolved spec's $ref paths
     let needed_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops);
 
-    // Build a mapping from path base → definition name for routing
-    // For endpoints whose definition we found, use the definition name as the table
-    // Fall back to table_name_from_path for any we couldn't resolve
-    let path_to_table = |path: &str| -> String {
-        // Check if any of the operations on this path reference a known definition
-        let methods = ["get", "post", "put", "delete", "patch"];
-        for m in &methods {
-            let ops = vec![(path.to_string(), m.to_string())];
-            let defs = crate::parser::definitions_for_paths(&raw_spec, &ops);
-            if let Some(def) = defs.into_iter().next() {
-                return def;
-            }
-        }
-        table_name_from_path(path)
-    };
+    // Build raw op map for $ref-based table name lookups
+    let raw_ops = raw_spec.path_operations();
+    let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
+        .iter()
+        .map(|(path, method, op)| ((*path, *method), *op))
+        .collect();
 
     let routes: Vec<RouteEntry> = spec
         .path_operations()
         .iter()
         .filter(|(path, method, _)| selected.contains(&(method.to_string(), path.to_string())))
         .map(|(path, method, _)| {
-            let table = path_to_table(path);
+            let table = raw_op_map
+                .get(&(*path, *method))
+                .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+                .unwrap_or_else(|| table_name_from_path(path));
             RouteEntry {
                 method: method.to_string(),
                 pattern: path.to_string(),
@@ -724,7 +718,7 @@ async fn serve_admin(uri: axum::http::Uri) -> impl IntoResponse {
     }
 }
 
-pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec) {
+pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec, raw_spec: &SwaggerSpec) {
     let spec_info = SpecInfo {
         title: spec.info.title.clone(),
         version: spec.info.version.clone(),
@@ -733,8 +727,18 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec) {
     let mut routes: Vec<RouteEntry> = Vec::new();
     let mut registered: HashSet<String> = HashSet::new();
 
+    // Use the raw (unresolved) spec for $ref-based table name lookups
+    let raw_ops = raw_spec.path_operations();
+    let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
+        .iter()
+        .map(|(path, method, op)| ((*path, *method), *op))
+        .collect();
+
     for (path, method, _op) in spec.path_operations() {
-        let table = table_name_from_path(path);
+        let table = raw_op_map
+            .get(&(path, method))
+            .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+            .unwrap_or_else(|| table_name_from_path(path));
         let has_path_param = path.contains('{');
 
         let key = format!("{method}:{path}");
@@ -780,7 +784,7 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec) {
     reg.routes = routes;
     reg.spec_info = Some(spec_info);
     reg.endpoints = endpoints;
-    reg.raw_spec = None; // CLI path already has refs resolved
+    reg.raw_spec = Some(raw_spec.clone());
     reg.spec = Some(spec.clone());
 }
 
@@ -849,13 +853,14 @@ mod tests {
 
     fn setup() -> Router {
         let mut spec = SwaggerSpec::from_file("tests/fixtures/petstore.yaml").unwrap();
+        let raw_spec = spec.clone();
         spec.resolve_refs();
         let conn = Connection::open_in_memory().unwrap();
         create_tables(&conn, &spec).unwrap();
         seed_tables(&conn, &spec, 5).unwrap();
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
-        populate_registry(&mut registry.write().unwrap(), &spec);
+        populate_registry(&mut registry.write().unwrap(), &spec, &raw_spec);
         let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
         let state = AppState { db, registry, log };
         build_router(state)

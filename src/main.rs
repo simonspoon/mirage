@@ -258,6 +258,7 @@ async fn main() {
     // If spec provided, auto-import and configure
     if let Some(spec_path) = &cli.spec {
         let mut spec = parser::SwaggerSpec::from_file(spec_path.to_str().unwrap()).unwrap();
+        let raw_spec = spec.clone();
         spec.resolve_refs();
 
         // Create tables and seed
@@ -268,7 +269,7 @@ async fn main() {
         }
 
         // Populate registry
-        server::populate_registry(&mut registry.write().unwrap(), &spec);
+        server::populate_registry(&mut registry.write().unwrap(), &spec, &raw_spec);
     }
 
     let log: server::RequestLog = Arc::new(Mutex::new(Vec::new()));

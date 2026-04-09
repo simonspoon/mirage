@@ -70,6 +70,8 @@ pub struct SchemaObject {
     pub description: Option<String>,
     #[serde(rename = "additionalProperties")]
     pub additional_properties: Option<Box<SchemaObject>>,
+    #[serde(rename = "allOf")]
+    pub all_of: Option<Vec<SchemaObject>>,
 }
 
 impl SwaggerSpec {
@@ -160,6 +162,7 @@ impl SwaggerSpec {
 /// Must be called BEFORE resolve_refs() since it reads $ref paths.
 pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> HashSet<String> {
     let mut defs = HashSet::new();
+    let spec_defs = spec.definitions.as_ref();
     for (path, method) in paths {
         if let Some(path_item) = spec.paths.get(path.as_str()) {
             let op = match method.as_str() {
@@ -173,7 +176,7 @@ pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> 
             if let Some(op) = op {
                 for response in op.responses.values() {
                     if let Some(schema) = &response.schema {
-                        collect_schema_refs(schema, &mut defs);
+                        collect_schema_refs(schema, &mut defs, spec_defs);
                     }
                 }
                 if let Some(params) = &op.parameters {
@@ -181,7 +184,7 @@ pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> 
                         if param.r#in == "body"
                             && let Some(schema) = &param.schema
                         {
-                            collect_schema_refs(schema, &mut defs);
+                            collect_schema_refs(schema, &mut defs, spec_defs);
                         }
                     }
                 }
@@ -191,18 +194,82 @@ pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> 
     defs
 }
 
-fn collect_schema_refs(schema: &SchemaObject, defs: &mut HashSet<String>) {
+/// Extract the primary definition name from the success response of an operation.
+/// Checks "200", "201", then other 2xx codes in order.
+fn response_def_name(schema: &SchemaObject) -> Option<String> {
+    // Direct $ref
+    if let Some(ref ref_path) = schema.ref_path {
+        return ref_path
+            .strip_prefix("#/definitions/")
+            .map(|s| s.to_string());
+    }
+    // Array wrapping a $ref in items
+    if schema.schema_type.as_deref() == Some("array")
+        && let Some(ref items) = schema.items
+        && let Some(ref ref_path) = items.ref_path
+    {
+        return ref_path
+            .strip_prefix("#/definitions/")
+            .map(|s| s.to_string());
+    }
+    None
+}
+
+/// Get the primary response definition name for a given operation.
+/// Prefers 200, then 201, then any other 2xx response.
+pub fn primary_response_def(op: &Operation) -> Option<String> {
+    // Check 200 first, then 201
+    for code in &["200", "201"] {
+        if let Some(resp) = op.responses.get(*code)
+            && let Some(schema) = &resp.schema
+            && let Some(name) = response_def_name(schema)
+        {
+            return Some(name);
+        }
+    }
+    // Then any other 2xx
+    let mut keys: Vec<&String> = op.responses.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key.starts_with('2')
+            && key != "200"
+            && key != "201"
+            && let Some(schema) = &op.responses[key].schema
+            && let Some(name) = response_def_name(schema)
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn collect_schema_refs(
+    schema: &SchemaObject,
+    defs: &mut HashSet<String>,
+    spec_definitions: Option<&HashMap<String, SchemaObject>>,
+) {
     if let Some(ref_path) = &schema.ref_path
         && let Some(name) = ref_path.strip_prefix("#/definitions/")
+        && defs.insert(name.to_string())
     {
-        defs.insert(name.to_string());
+        // Recurse into the referenced definition if available
+        if let Some(all_defs) = spec_definitions
+            && let Some(def_schema) = all_defs.get(name)
+        {
+            collect_schema_refs(def_schema, defs, spec_definitions);
+        }
     }
     if let Some(items) = &schema.items {
-        collect_schema_refs(items, defs);
+        collect_schema_refs(items, defs, spec_definitions);
     }
     if let Some(props) = &schema.properties {
         for prop in props.values() {
-            collect_schema_refs(prop, defs);
+            collect_schema_refs(prop, defs, spec_definitions);
+        }
+    }
+    if let Some(all_of) = &schema.all_of {
+        for member in all_of {
+            collect_schema_refs(member, defs, spec_definitions);
         }
     }
 }
@@ -232,14 +299,88 @@ fn resolve_schema(
             schema.enum_values = resolved.enum_values.clone();
             schema.description = resolved.description.clone();
             schema.additional_properties = resolved.additional_properties.clone();
+            schema.all_of = resolved.all_of.clone();
             // Clear the ref now that it's resolved
             schema.ref_path = None;
+        }
+    }
+
+    // Handle allOf: merge all member schemas into this schema
+    if let Some(all_of) = schema.all_of.take() {
+        let mut merged_props: HashMap<String, SchemaObject> =
+            schema.properties.take().unwrap_or_default();
+        let mut merged_required: Vec<String> = schema.required.take().unwrap_or_default();
+
+        for mut member in all_of {
+            // Resolve $ref members first
+            if let Some(ref ref_path) = member.ref_path.clone() {
+                let def_name = ref_path.strip_prefix("#/definitions/").unwrap_or(ref_path);
+                if !visited.contains(def_name)
+                    && let Some(resolved) = definitions.get(def_name)
+                {
+                    // Snapshot visited set so sibling allOf members can resolve
+                    // the same definitions independently (prevents contamination)
+                    let mut member_visited = visited.clone();
+                    member_visited.insert(def_name.to_string());
+                    member.schema_type = resolved.schema_type.clone();
+                    member.format = resolved.format.clone();
+                    member.properties = resolved.properties.clone();
+                    member.items = resolved.items.clone();
+                    member.required = resolved.required.clone();
+                    member.enum_values = resolved.enum_values.clone();
+                    member.description = resolved.description.clone();
+                    member.additional_properties = resolved.additional_properties.clone();
+                    member.all_of = resolved.all_of.clone();
+                    member.ref_path = None;
+
+                    // Recursively resolve allOf within the resolved member
+                    resolve_schema(&mut member, definitions, &mut member_visited);
+                    // Propagate cycle protection back to parent
+                    visited.extend(member_visited);
+                }
+            } else {
+                // Inline schema member -- resolve any nested refs
+                resolve_schema(&mut member, definitions, visited);
+            }
+
+            // Merge properties
+            if let Some(props) = member.properties {
+                merged_props.extend(props);
+            }
+            // Merge required
+            if let Some(req) = member.required {
+                for r in req {
+                    if !merged_required.contains(&r) {
+                        merged_required.push(r);
+                    }
+                }
+            }
+        }
+
+        if !merged_props.is_empty() {
+            schema.properties = Some(merged_props);
+        }
+        if !merged_required.is_empty() {
+            schema.required = Some(merged_required);
+        }
+        if schema.schema_type.is_none() {
+            schema.schema_type = Some("object".to_string());
         }
     }
 
     // Recursively resolve nested schemas
     if let Some(ref mut properties) = schema.properties {
         for prop_schema in properties.values_mut() {
+            // Handle property-level allOf (e.g. "entryUser": {"allOf": [{"$ref": "..."}]})
+            if let Some(ref all_of) = prop_schema.all_of.clone()
+                && all_of.len() == 1
+                && all_of[0].ref_path.is_some()
+            {
+                let mut resolved = all_of[0].clone();
+                resolve_schema(&mut resolved, definitions, visited);
+                *prop_schema = resolved;
+                continue;
+            }
             resolve_schema(prop_schema, definitions, visited);
         }
     }
