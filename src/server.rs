@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -27,6 +28,7 @@ pub struct RouteRegistry {
     pub spec_info: Option<SpecInfo>,
     pub endpoints: Vec<EndpointInfo>,
     pub spec: Option<SwaggerSpec>,
+    pub raw_spec: Option<SwaggerSpec>, // before resolve_refs, keeps $ref paths
 }
 
 impl RouteRegistry {
@@ -36,6 +38,7 @@ impl RouteRegistry {
             spec_info: None,
             endpoints: Vec::new(),
             spec: None,
+            raw_spec: None,
         }
     }
 }
@@ -49,10 +52,23 @@ pub struct RouteEntry {
 
 pub type Registry = Arc<RwLock<RouteRegistry>>;
 
+const MAX_LOG_ENTRIES: usize = 500;
+
+#[derive(Clone, Serialize)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+}
+
+pub type RequestLog = Arc<Mutex<Vec<LogEntry>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub registry: Registry,
+    pub log: RequestLog,
 }
 
 #[derive(Clone, Serialize)]
@@ -240,7 +256,11 @@ async fn post_create(table: String, db: Db, body: Option<Json<serde_json::Value>
             .into_response();
     }
 
-    let cols_str = insert_cols.join(", ");
+    let cols_str = insert_cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let placeholders: Vec<String> = (1..=insert_cols.len()).map(|i| format!("?{i}")).collect();
     let placeholders_str = placeholders.join(", ");
     let sql = format!("INSERT INTO \"{table}\" ({cols_str}) VALUES ({placeholders_str})");
@@ -371,6 +391,26 @@ async fn catch_all_handler(
     }
 }
 
+fn log_request(log: &RequestLog, method: &str, path: &str, status: u16) {
+    let entry = LogEntry {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        method: method.to_uppercase(),
+        path: path.to_string(),
+        status,
+    };
+    let mut log = log.lock().unwrap();
+    log.push(entry);
+    let len = log.len();
+    if len > MAX_LOG_ENTRIES {
+        log.drain(..len - MAX_LOG_ENTRIES);
+    }
+}
+
+async fn admin_log(State(state): State<AppState>) -> Response {
+    let log = state.log.lock().unwrap();
+    Json(log.clone()).into_response()
+}
+
 async fn admin_spec(State(state): State<AppState>) -> Response {
     let reg = state.registry.read().unwrap();
     match &reg.spec_info {
@@ -385,6 +425,91 @@ async fn admin_endpoints(State(state): State<AppState>) -> Response {
     Json(reg.endpoints.clone()).into_response()
 }
 
+async fn admin_tables(State(state): State<AppState>) -> Response {
+    let conn = state.db.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap();
+    let tables: Vec<serde_json::Value> = stmt
+        .query_map([], |row| {
+            let name: String = row.get(0)?;
+            Ok(name)
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .map(|name| {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{}\"", name), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(0);
+            serde_json::json!({"name": name, "row_count": count})
+        })
+        .collect();
+    Json(tables).into_response()
+}
+
+async fn admin_table_data(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let conn = state.db.lock().unwrap();
+
+    // Check table exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            [&name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "table not found"})),
+        )
+            .into_response();
+    }
+
+    // Get column info
+    let columns: Vec<serde_json::Value> = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", name))
+            .unwrap();
+        stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            let col_type: String = row.get(2)?;
+            Ok(serde_json::json!({"name": col_name, "type": col_type}))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    // Get rows
+    let sql = format!("SELECT rowid, * FROM \"{}\"", name);
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "query failed"})),
+            )
+                .into_response();
+        }
+    };
+    let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map([], |row| row_to_json(&col_names, row))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Json(serde_json::json!({"columns": columns, "rows": rows})).into_response()
+}
+
 async fn admin_import(State(state): State<AppState>, body: String) -> Response {
     let spec: SwaggerSpec = match serde_yaml::from_str(&body) {
         Ok(s) => s,
@@ -397,6 +522,7 @@ async fn admin_import(State(state): State<AppState>, body: String) -> Response {
         }
     };
     let mut spec = spec;
+    let raw_spec = spec.clone(); // keep unresolved copy for $ref extraction
     spec.resolve_refs();
 
     let endpoints: Vec<EndpointInfo> = spec
@@ -414,6 +540,7 @@ async fn admin_import(State(state): State<AppState>, body: String) -> Response {
 
     let mut reg = state.registry.write().unwrap();
     reg.spec = Some(spec);
+    reg.raw_spec = Some(raw_spec);
     reg.spec_info = Some(spec_info.clone());
 
     (
@@ -432,11 +559,12 @@ async fn admin_configure(
 ) -> Response {
     let seed_count = config.seed_count.unwrap_or(10);
 
-    let spec = {
+    let (spec, raw_spec) = {
         let reg = state.registry.read().unwrap();
-        match &reg.spec {
-            Some(s) => s.clone(),
-            None => {
+        match (&reg.spec, &reg.raw_spec) {
+            (Some(s), Some(r)) => (s.clone(), r.clone()),
+            (Some(s), None) => (s.clone(), s.clone()),
+            _ => {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "No spec imported"})),
@@ -446,39 +574,44 @@ async fn admin_configure(
         }
     };
 
-    // Drop old tables, create new ones, seed
-    {
-        let conn = state.db.lock().unwrap();
-        let tables: Vec<String> = conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        for table in &tables {
-            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
-                .unwrap();
-        }
-        schema::create_tables(&conn, &spec).unwrap();
-        seeder::seed_tables(&conn, &spec, seed_count).unwrap();
-    }
-
-    // Build route entries from selected endpoints
+    // Build selected endpoint list for definition lookup
     let selected: HashSet<(String, String)> = config
         .endpoints
         .iter()
         .map(|e| (e.method.to_lowercase(), e.path.clone()))
         .collect();
 
+    let selected_ops: Vec<(String, String)> = config
+        .endpoints
+        .iter()
+        .map(|e| (e.path.clone(), e.method.to_lowercase()))
+        .collect();
+
+    // Extract definition names from the unresolved spec's $ref paths
+    let needed_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops);
+
+    // Build a mapping from path base → definition name for routing
+    // For endpoints whose definition we found, use the definition name as the table
+    // Fall back to table_name_from_path for any we couldn't resolve
+    let path_to_table = |path: &str| -> String {
+        // Check if any of the operations on this path reference a known definition
+        let methods = ["get", "post", "put", "delete", "patch"];
+        for m in &methods {
+            let ops = vec![(path.to_string(), m.to_string())];
+            let defs = crate::parser::definitions_for_paths(&raw_spec, &ops);
+            if let Some(def) = defs.into_iter().next() {
+                return def;
+            }
+        }
+        table_name_from_path(path)
+    };
+
     let routes: Vec<RouteEntry> = spec
         .path_operations()
         .iter()
         .filter(|(path, method, _)| selected.contains(&(method.to_string(), path.to_string())))
         .map(|(path, method, _)| {
-            let table = table_name_from_path(path);
+            let table = path_to_table(path);
             RouteEntry {
                 method: method.to_string(),
                 pattern: path.to_string(),
@@ -512,6 +645,39 @@ async fn admin_configure(
 
     let mut all_routes = routes;
     all_routes.extend(collection_routes);
+
+    // Use definitions referenced by selected operations as the table filter
+    // Drop old tables, create only needed ones, seed
+    {
+        let conn = state.db.lock().unwrap();
+        let existing: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for table in &existing {
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
+                .unwrap();
+        }
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&needed_defs)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
+            )
+                .into_response();
+        }
+        if let Err(e) = seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
+            )
+                .into_response();
+        }
+    }
 
     let endpoints: Vec<EndpointInfo> = all_routes
         .iter()
@@ -614,13 +780,41 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec) {
     reg.routes = routes;
     reg.spec_info = Some(spec_info);
     reg.endpoints = endpoints;
+    reg.raw_spec = None; // CLI path already has refs resolved
     reg.spec = Some(spec.clone());
+}
+
+async fn logging_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+
+    // Skip static asset requests and log endpoint itself
+    let should_log = !path.starts_with("/_admin")
+        && path != "/_api/admin/log"
+        && path != "/_api/admin/spec"
+        && path != "/_api/admin/endpoints"
+        && path != "/_api/admin/tables";
+
+    let response = next.run(req).await;
+
+    if should_log {
+        log_request(&state.log, &method, &path, response.status().as_u16());
+    }
+
+    response
 }
 
 pub fn build_router(state: AppState) -> Router {
     let admin_api = Router::new()
         .route("/spec", get(admin_spec))
         .route("/endpoints", get(admin_endpoints))
+        .route("/tables", get(admin_tables))
+        .route("/tables/{name}", get(admin_table_data))
+        .route("/log", get(admin_log))
         .route("/import", post(admin_import))
         .route("/configure", post(admin_configure))
         .with_state(state.clone());
@@ -634,6 +828,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/_admin/", get(serve_admin))
         .route("/_admin/{*path}", get(serve_admin))
         .route("/{*path}", any(catch_all_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            logging_middleware,
+        ))
         .with_state(state)
 }
 
@@ -658,7 +856,8 @@ mod tests {
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
         populate_registry(&mut registry.write().unwrap(), &spec);
-        let state = AppState { db, registry };
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState { db, registry, log };
         build_router(state)
     }
 
@@ -666,7 +865,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
-        let state = AppState { db, registry };
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState { db, registry, log };
         build_router(state)
     }
 
@@ -834,9 +1034,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
         let state = AppState {
             db,
             registry: registry.clone(),
+            log,
         };
         let router = build_router(state);
 

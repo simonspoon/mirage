@@ -15,6 +15,7 @@ rand = "0.10"
 mime_guess = "2"
 rust-embed = "8"
 tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

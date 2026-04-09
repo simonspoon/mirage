@@ -111,15 +111,34 @@ fn map_type(schema: &SchemaObject) -> &str {
     }
 }
 
+/// Get the effective properties for a schema, handling array-typed definitions.
+fn effective_props(
+    schema: &SchemaObject,
+) -> Option<&std::collections::HashMap<String, SchemaObject>> {
+    if let Some(ref props) = schema.properties
+        && !props.is_empty()
+    {
+        return Some(props);
+    }
+    if schema.schema_type.as_deref() == Some("array")
+        && let Some(ref items) = schema.items
+        && let Some(ref props) = items.properties
+        && !props.is_empty()
+    {
+        return Some(props);
+    }
+    None
+}
+
 pub fn seed_table(
     conn: &Connection,
     table_name: &str,
     schema: &SchemaObject,
     count: usize,
 ) -> Result<(), rusqlite::Error> {
-    let props = match &schema.properties {
-        Some(p) if !p.is_empty() => p,
-        _ => return Ok(()),
+    let props = match effective_props(schema) {
+        Some(p) => p,
+        None => return Ok(()),
     };
 
     // Sort column names alphabetically (same as schema.rs)
@@ -128,7 +147,7 @@ pub fn seed_table(
 
     let columns_str = col_names
         .iter()
-        .map(|c| c.as_str())
+        .map(|c| format!("\"{}\"", c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -191,8 +210,22 @@ pub fn seed_tables(
     spec: &SwaggerSpec,
     rows_per_table: usize,
 ) -> Result<(), rusqlite::Error> {
+    seed_tables_filtered(conn, spec, rows_per_table, None)
+}
+
+pub fn seed_tables_filtered(
+    conn: &Connection,
+    spec: &SwaggerSpec,
+    rows_per_table: usize,
+    only: Option<&std::collections::HashSet<String>>,
+) -> Result<(), rusqlite::Error> {
     if let Some(ref definitions) = spec.definitions {
         for (name, schema) in definitions {
+            if let Some(filter) = only
+                && !filter.contains(name)
+            {
+                continue;
+            }
             seed_table(conn, name, schema, rows_per_table)?;
         }
     }
@@ -234,7 +267,7 @@ mod tests {
 
         // Pet.category is an object -> stored as JSON TEXT
         let rows: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT category FROM \"Pet\"").unwrap();
+            let mut stmt = conn.prepare("SELECT \"category\" FROM \"Pet\"").unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
@@ -251,7 +284,7 @@ mod tests {
 
         // Pet.tags is an array -> stored as JSON TEXT
         let rows: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT tags FROM \"Pet\"").unwrap();
+            let mut stmt = conn.prepare("SELECT \"tags\" FROM \"Pet\"").unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
@@ -270,7 +303,7 @@ mod tests {
         seed_tables(&conn, &spec, 20).unwrap();
 
         let valid = ["available", "pending", "sold"];
-        let mut stmt = conn.prepare("SELECT status FROM \"Pet\"").unwrap();
+        let mut stmt = conn.prepare("SELECT \"status\" FROM \"Pet\"").unwrap();
         let statuses: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()

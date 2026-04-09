@@ -156,6 +156,57 @@ impl SwaggerSpec {
     }
 }
 
+/// Extract definition names referenced by a set of operations.
+/// Must be called BEFORE resolve_refs() since it reads $ref paths.
+pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> HashSet<String> {
+    let mut defs = HashSet::new();
+    for (path, method) in paths {
+        if let Some(path_item) = spec.paths.get(path.as_str()) {
+            let op = match method.as_str() {
+                "get" => path_item.get.as_ref(),
+                "post" => path_item.post.as_ref(),
+                "put" => path_item.put.as_ref(),
+                "delete" => path_item.delete.as_ref(),
+                "patch" => path_item.patch.as_ref(),
+                _ => None,
+            };
+            if let Some(op) = op {
+                for response in op.responses.values() {
+                    if let Some(schema) = &response.schema {
+                        collect_schema_refs(schema, &mut defs);
+                    }
+                }
+                if let Some(params) = &op.parameters {
+                    for param in params {
+                        if param.r#in == "body"
+                            && let Some(schema) = &param.schema
+                        {
+                            collect_schema_refs(schema, &mut defs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    defs
+}
+
+fn collect_schema_refs(schema: &SchemaObject, defs: &mut HashSet<String>) {
+    if let Some(ref_path) = &schema.ref_path
+        && let Some(name) = ref_path.strip_prefix("#/definitions/")
+    {
+        defs.insert(name.to_string());
+    }
+    if let Some(items) = &schema.items {
+        collect_schema_refs(items, defs);
+    }
+    if let Some(props) = &schema.properties {
+        for prop in props.values() {
+            collect_schema_refs(prop, defs);
+        }
+    }
+}
+
 fn resolve_schema(
     schema: &mut SchemaObject,
     definitions: &HashMap<String, SchemaObject>,
