@@ -701,6 +701,8 @@ struct CreateRecipeRequest {
     spec_source: String,
     endpoints: Vec<EndpointInfo>,
     seed_count: Option<i64>,
+    shared_pools: Option<serde_json::Value>,
+    quantity_configs: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -731,6 +733,14 @@ async fn admin_create_recipe(
     };
 
     let seed_count = body.seed_count.unwrap_or(10);
+    let shared_pools_str = body
+        .shared_pools
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let quantity_configs_str = body
+        .quantity_configs
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     let recipe = {
         let conn = state.recipe_db.lock().unwrap();
@@ -740,6 +750,8 @@ async fn admin_create_recipe(
             &body.spec_source,
             &endpoints_json,
             seed_count,
+            shared_pools_str.as_deref(),
+            quantity_configs_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -997,6 +1009,71 @@ async fn admin_activate_recipe(
         .into_response()
 }
 
+async fn admin_get_recipe_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::get_recipe(&conn, id) {
+        Ok(Some(recipe)) => {
+            let shared_pools: serde_json::Value =
+                serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
+            let quantity_configs: serde_json::Value =
+                serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
+            Json(serde_json::json!({
+                "shared_pools": shared_pools,
+                "quantity_configs": quantity_configs,
+            }))
+            .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateRecipeConfigRequest {
+    shared_pools: serde_json::Value,
+    quantity_configs: serde_json::Value,
+}
+
+async fn admin_put_recipe_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(body): Json<UpdateRecipeConfigRequest>,
+) -> Response {
+    let shared_pools_str =
+        serde_json::to_string(&body.shared_pools).unwrap_or_else(|_| "{}".to_string());
+    let quantity_configs_str =
+        serde_json::to_string(&body.quantity_configs).unwrap_or_else(|_| "{}".to_string());
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::update_recipe_config(&conn, id, &shared_pools_str, &quantity_configs_str) {
+        Ok(true) => Json(serde_json::json!({
+            "shared_pools": body.shared_pools,
+            "quantity_configs": body.quantity_configs,
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update config: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct GraphRequest {
     spec_source: String,
@@ -1160,6 +1237,10 @@ pub fn build_router(state: AppState) -> Router {
             get(admin_get_recipe).delete(admin_delete_recipe),
         )
         .route("/recipes/{id}/activate", post(admin_activate_recipe))
+        .route(
+            "/recipes/{id}/config",
+            get(admin_get_recipe_config).put(admin_put_recipe_config),
+        )
         .with_state(state.clone());
 
     Router::new()
@@ -1791,5 +1872,154 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("error").is_some(), "should have error field");
+    }
+
+    #[tokio::test]
+    async fn test_get_recipe_config() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // GET config -> 200 with default empty pools/configs
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["shared_pools"], serde_json::json!({}));
+        assert_eq!(json["quantity_configs"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_put_recipe_config() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // PUT config with values
+        let config = serde_json::json!({
+            "shared_pools": {"Pet": {"is_shared": true, "pool_size": 5}},
+            "quantity_configs": {"Pet.tags": {"min": 1, "max": 3}},
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&config).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET back -> values match
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["shared_pools"]["Pet"]["pool_size"],
+            serde_json::json!(5)
+        );
+        assert_eq!(
+            json["quantity_configs"]["Pet.tags"]["max"],
+            serde_json::json!(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_recipe_config_404() {
+        let router = setup_empty();
+
+        // PUT config for non-existent id -> 404
+        let config = serde_json::json!({
+            "shared_pools": {},
+            "quantity_configs": {},
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_api/admin/recipes/99999/config")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&config).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_config() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Configured Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+            ],
+            "seed_count": 5,
+            "shared_pools": {"Pet": {"is_shared": true, "pool_size": 10}},
+            "quantity_configs": {"Pet.tags": {"min": 2, "max": 5}},
+        });
+
+        // Create recipe with config
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(created["name"], "Configured Petstore");
+
+        // GET recipe shows config fields
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // shared_pools and quantity_configs are stored as JSON strings; the server
+        // serializes Recipe with serde so they come back as strings
+        let shared_pools: serde_json::Value =
+            serde_json::from_str(json["shared_pools"].as_str().unwrap()).unwrap();
+        assert_eq!(shared_pools["Pet"]["pool_size"], serde_json::json!(10));
+        let quantity_configs: serde_json::Value =
+            serde_json::from_str(json["quantity_configs"].as_str().unwrap()).unwrap();
+        assert_eq!(quantity_configs["Pet.tags"]["max"], serde_json::json!(5));
     }
 }

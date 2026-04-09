@@ -9,6 +9,8 @@ pub struct Recipe {
     pub selected_endpoints: String,
     pub seed_count: i64,
     pub created_at: String,
+    pub shared_pools: String,
+    pub quantity_configs: String,
 }
 
 pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -23,6 +25,24 @@ pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         )",
         [],
     )?;
+    match conn.execute(
+        "ALTER TABLE \"recipes\" ADD COLUMN \"shared_pools\" TEXT NOT NULL DEFAULT '{}'",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column") => {}
+        Err(e) => return Err(e),
+    }
+    match conn.execute(
+        "ALTER TABLE \"recipes\" ADD COLUMN \"quantity_configs\" TEXT NOT NULL DEFAULT '{}'",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column") => {}
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -32,11 +52,15 @@ pub fn create_recipe(
     spec_source: &str,
     selected_endpoints_json: &str,
     seed_count: i64,
+    shared_pools: Option<&str>,
+    quantity_configs: Option<&str>,
 ) -> Result<Recipe, rusqlite::Error> {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let shared_pools = shared_pools.unwrap_or("{}");
+    let quantity_configs = quantity_configs.unwrap_or("{}");
     conn.execute(
-        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\") VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at],
+        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, shared_pools, quantity_configs],
     )?;
     let id = conn.last_insert_rowid();
     Ok(Recipe {
@@ -46,12 +70,14 @@ pub fn create_recipe(
         selected_endpoints: selected_endpoints_json.to_string(),
         seed_count,
         created_at,
+        shared_pools: shared_pools.to_string(),
+        quantity_configs: quantity_configs.to_string(),
     })
 }
 
 pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\" FROM \"recipes\" ORDER BY \"id\"",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\" FROM \"recipes\" ORDER BY \"id\"",
     )?;
     let recipes = stmt
         .query_map([], |row| {
@@ -62,6 +88,8 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
                 selected_endpoints: row.get(3)?,
                 seed_count: row.get(4)?,
                 created_at: row.get(5)?,
+                shared_pools: row.get(6)?,
+                quantity_configs: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -70,7 +98,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
 
 pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\" FROM \"recipes\" WHERE \"id\" = ?1",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\" FROM \"recipes\" WHERE \"id\" = ?1",
     )?;
     match stmt.query_row([id], |row| {
         Ok(Recipe {
@@ -80,12 +108,27 @@ pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite
             selected_endpoints: row.get(3)?,
             seed_count: row.get(4)?,
             created_at: row.get(5)?,
+            shared_pools: row.get(6)?,
+            quantity_configs: row.get(7)?,
         })
     }) {
         Ok(recipe) => Ok(Some(recipe)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+pub fn update_recipe_config(
+    conn: &Connection,
+    id: i64,
+    shared_pools: &str,
+    quantity_configs: &str,
+) -> Result<bool, rusqlite::Error> {
+    let changes = conn.execute(
+        "UPDATE \"recipes\" SET \"shared_pools\" = ?1, \"quantity_configs\" = ?2 WHERE \"id\" = ?3",
+        rusqlite::params![shared_pools, quantity_configs, id],
+    )?;
+    Ok(changes > 0)
 }
 
 pub fn delete_recipe(conn: &Connection, id: i64) -> Result<bool, rusqlite::Error> {

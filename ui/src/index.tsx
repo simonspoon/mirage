@@ -41,6 +41,8 @@ interface Recipe {
   selected_endpoints: string;
   seed_count: number;
   created_at: string;
+  shared_pools: string;
+  quantity_configs: string;
 }
 
 type Page = "dashboard" | "endpoints" | "tables" | "log" | "recipes";
@@ -73,9 +75,11 @@ function App() {
   const [recipeSeedCount, setRecipeSeedCount] = createSignal(10);
   const [recipeAvailableEndpoints, setRecipeAvailableEndpoints] = createSignal<Endpoint[]>([]);
   const [recipeSelectedEndpoints, setRecipeSelectedEndpoints] = createSignal<boolean[]>([]);
-  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "graph" | "name">("paste");
+  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "graph" | "config" | "name">("paste");
   const [entityGraph, setEntityGraph] = createSignal<any>(null);
   const [graphLoading, setGraphLoading] = createSignal(false);
+  const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
+  const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
 
   onMount(async () => {
     try {
@@ -306,6 +310,25 @@ function App() {
     }
   };
 
+  const handleGoToConfig = () => {
+    const graph = entityGraph();
+    if (!graph) return;
+
+    const pools: Record<string, {is_shared: boolean, pool_size: number}> = {};
+    for (const entity of graph.shared_entities || []) {
+      pools[entity] = { is_shared: true, pool_size: 10 };
+    }
+    setRecipeSharedPools(pools);
+
+    const configs: Record<string, {min: number, max: number}> = {};
+    for (const ap of graph.array_properties || []) {
+      configs[`${ap.def_name}.${ap.prop_name}`] = { min: 1, max: 3 };
+    }
+    setRecipeQuantityConfigs(configs);
+
+    setRecipeStep("config");
+  };
+
   const handleRecipeSave = async () => {
     const name = recipeName().trim();
     if (!name) {
@@ -328,6 +351,8 @@ function App() {
           spec_source: recipeSpecText().trim(),
           endpoints,
           seed_count: recipeSeedCount(),
+          shared_pools: recipeSharedPools(),
+          quantity_configs: recipeQuantityConfigs(),
         }),
       });
       if (!res.ok) {
@@ -344,6 +369,9 @@ function App() {
       setRecipeAvailableEndpoints([]);
       setRecipeSelectedEndpoints([]);
       setRecipeStep("paste");
+      setRecipeSharedPools({});
+      setRecipeQuantityConfigs({});
+      setEntityGraph(null);
       await refreshRecipes();
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -403,6 +431,8 @@ function App() {
     setRecipeSelectedEndpoints([]);
     setRecipeStep("paste");
     setEntityGraph(null);
+    setRecipeSharedPools({});
+    setRecipeQuantityConfigs({});
     setError(null);
   };
 
@@ -812,14 +842,101 @@ function App() {
                   </button>
                   <button
                     class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
-                    onClick={() => setRecipeStep("name")}
+                    onClick={handleGoToConfig}
                   >
-                    Next: Name & Save
+                    Next: Configure
                   </button>
                 </div>
               </Show>
 
-              {/* Step 4: Name + seed count + save */}
+              {/* Step 4: Configure data generation */}
+              <Show when={recipeStep() === "config"}>
+                <div>
+                  <h3 class="text-lg font-semibold mb-2">Configure Data Generation</h3>
+
+                  {Object.keys(recipeSharedPools()).length > 0 && (
+                    <div class="mb-6">
+                      <h4 class="text-sm font-medium text-gray-300 mb-2">Shared Entity Pools</h4>
+                      <p class="text-sm text-gray-400 mb-3">Shared entities generate a fixed pool of instances reused across endpoints.</p>
+                      <For each={Object.entries(recipeSharedPools())}>
+                        {([entity, config]) => (
+                          <div class="flex items-center gap-3 p-2 bg-gray-800 rounded mb-2">
+                            <label class="flex items-center gap-2">
+                              <input type="checkbox" checked={config.is_shared}
+                                class="accent-blue-500 rounded"
+                                onChange={(e) => {
+                                  const pools = {...recipeSharedPools()};
+                                  pools[entity] = {...pools[entity], is_shared: e.target.checked};
+                                  setRecipeSharedPools(pools);
+                                }} />
+                              <span class="text-sm text-gray-200">{entity}</span>
+                            </label>
+                            <input type="number" min="1" max="100" value={config.pool_size}
+                              class="w-20 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
+                              onInput={(e) => {
+                                const pools = {...recipeSharedPools()};
+                                pools[entity] = {...pools[entity], pool_size: parseInt(e.target.value) || 10};
+                                setRecipeSharedPools(pools);
+                              }} />
+                            <span class="text-xs text-gray-500">instances</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  )}
+
+                  {Object.keys(recipeQuantityConfigs()).length > 0 && (
+                    <div class="mb-6">
+                      <h4 class="text-sm font-medium text-gray-300 mb-2">Array Quantity Ranges</h4>
+                      <p class="text-sm text-gray-400 mb-3">Control how many items are generated for array properties.</p>
+                      <For each={Object.entries(recipeQuantityConfigs())}>
+                        {([key, config]) => (
+                          <div class="flex items-center gap-3 p-2 bg-gray-800 rounded mb-2">
+                            <span class="font-mono text-sm text-gray-200 min-w-48">{key}</span>
+                            <input type="number" min="0" max="50" value={config.min}
+                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
+                              onInput={(e) => {
+                                const configs = {...recipeQuantityConfigs()};
+                                configs[key] = {...configs[key], min: parseInt(e.target.value) || 0};
+                                setRecipeQuantityConfigs(configs);
+                              }} />
+                            <span class="text-gray-500 text-sm">to</span>
+                            <input type="number" min="1" max="50" value={config.max}
+                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
+                              onInput={(e) => {
+                                const configs = {...recipeQuantityConfigs()};
+                                configs[key] = {...configs[key], max: parseInt(e.target.value) || 3};
+                                setRecipeQuantityConfigs(configs);
+                              }} />
+                            <span class="text-xs text-gray-500">items per record</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  )}
+
+                  {Object.keys(recipeSharedPools()).length === 0 && Object.keys(recipeQuantityConfigs()).length === 0 && (
+                    <p class="text-gray-400 mb-4">No shared entities or array properties detected. You can proceed to name your recipe.</p>
+                  )}
+
+                  <div class="flex gap-3 mt-4">
+                    <button
+                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                      onClick={() => setRecipeStep("graph")}
+                    >
+                      Back
+                    </button>
+                    <button
+                      class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
+                      onClick={() => setRecipeStep("name")}
+                    >
+                      Next: Name & Save
+                    </button>
+                  </div>
+                </div>
+              </Show>
+
+              {/* Step 5: Name + seed count + save */}
               <Show when={recipeStep() === "name"}>
                 <div class="space-y-4">
                   <div>
@@ -853,7 +970,7 @@ function App() {
                     </button>
                     <button
                       class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
-                      onClick={() => setRecipeStep("graph")}
+                      onClick={() => setRecipeStep("config")}
                     >
                       Back
                     </button>

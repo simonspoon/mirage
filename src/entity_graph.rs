@@ -6,11 +6,19 @@ use crate::parser::{SchemaObject, SwaggerSpec, collect_schema_refs};
 use crate::server::EndpointInfo;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ArrayPropInfo {
+    pub def_name: String,
+    pub prop_name: String,
+    pub target_def: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityGraph {
     pub nodes: Vec<String>,
     pub roots: HashMap<String, Vec<EndpointInfo>>,
     pub edges: HashMap<String, Vec<String>>,
     pub shared_entities: Vec<String>,
+    pub array_properties: Vec<ArrayPropInfo>,
 }
 
 /// Extract the root definition name from a schema's $ref (or items.$ref for arrays).
@@ -73,6 +81,39 @@ fn direct_child_refs(schema: &SchemaObject) -> Vec<String> {
     children.sort();
     children.dedup();
     children
+}
+
+fn find_array_properties(
+    nodes: &HashSet<String>,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Vec<ArrayPropInfo> {
+    let mut result = Vec::new();
+    let defs = match spec_defs {
+        Some(d) => d,
+        None => return result,
+    };
+    for node in nodes {
+        if let Some(def) = defs.get(node)
+            && let Some(props) = &def.properties
+        {
+            for (prop_name, prop_schema) in props {
+                if prop_schema.schema_type.as_deref() == Some("array")
+                    && let Some(ref items) = prop_schema.items
+                    && let Some(ref ref_path) = items.ref_path
+                    && let Some(target) = ref_path.strip_prefix("#/definitions/")
+                    && nodes.contains(target)
+                {
+                    result.push(ArrayPropInfo {
+                        def_name: node.clone(),
+                        prop_name: prop_name.clone(),
+                        target_def: target.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    result.sort_by(|a, b| (&a.def_name, &a.prop_name).cmp(&(&b.def_name, &b.prop_name)));
+    result
 }
 
 pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> EntityGraph {
@@ -199,6 +240,9 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         .collect();
     shared_entities.sort();
 
+    // Compute array properties before consuming all_nodes
+    let array_properties = find_array_properties(&all_nodes, spec_defs);
+
     // Sort nodes
     let mut nodes: Vec<String> = all_nodes.into_iter().collect();
     nodes.sort();
@@ -213,6 +257,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         roots,
         edges,
         shared_entities,
+        array_properties,
     }
 }
 
@@ -245,6 +290,13 @@ mod tests {
                 .contains(&"Category".to_string())
         );
         assert!(graph.edges.get("Pet").unwrap().contains(&"Tag".to_string()));
+
+        // Pet.tags is an array referencing Tag -> should appear
+        assert_eq!(graph.array_properties.len(), 1);
+        assert_eq!(graph.array_properties[0].def_name, "Pet");
+        assert_eq!(graph.array_properties[0].prop_name, "tags");
+        assert_eq!(graph.array_properties[0].target_def, "Tag");
+        // photoUrls is a primitive array (string) -> should NOT appear
     }
 
     #[test]
@@ -271,6 +323,7 @@ mod tests {
         assert!(graph.roots.is_empty());
         assert!(graph.edges.is_empty());
         assert!(graph.shared_entities.is_empty());
+        assert!(graph.array_properties.is_empty());
     }
 
     #[test]
