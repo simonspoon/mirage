@@ -106,7 +106,7 @@ fn row_to_json(
 
 async fn get_collection(table: String, db: Db) -> Response {
     let conn = db.lock().unwrap();
-    let sql = format!("SELECT * FROM {table}");
+    let sql = format!("SELECT * FROM \"{table}\"");
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => {
@@ -138,7 +138,7 @@ async fn get_single(table: String, db: Db, id: String) -> Response {
         }
     };
     let conn = db.lock().unwrap();
-    let sql = format!("SELECT * FROM {table} WHERE rowid = ?");
+    let sql = format!("SELECT * FROM \"{table}\" WHERE rowid = ?");
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => {
@@ -180,7 +180,7 @@ async fn post_create(table: String, db: Db, body: Option<Json<serde_json::Value>
 
     // Get column names from the table
     let col_names: Vec<String> = {
-        let sql = format!("PRAGMA table_info({table})");
+        let sql = format!("PRAGMA table_info(\"{table}\")");
         let mut stmt = conn.prepare(&sql).unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -243,7 +243,7 @@ async fn post_create(table: String, db: Db, body: Option<Json<serde_json::Value>
     let cols_str = insert_cols.join(", ");
     let placeholders: Vec<String> = (1..=insert_cols.len()).map(|i| format!("?{i}")).collect();
     let placeholders_str = placeholders.join(", ");
-    let sql = format!("INSERT INTO {table} ({cols_str}) VALUES ({placeholders_str})");
+    let sql = format!("INSERT INTO \"{table}\" ({cols_str}) VALUES ({placeholders_str})");
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         insert_vals.iter().map(|p| p.as_ref()).collect();
@@ -274,7 +274,7 @@ async fn delete_single(table: String, db: Db, id: String) -> Response {
         }
     };
     let conn = db.lock().unwrap();
-    let sql = format!("DELETE FROM {table} WHERE rowid = ?");
+    let sql = format!("DELETE FROM \"{table}\" WHERE rowid = ?");
     match conn.execute(&sql, [id]) {
         Ok(changes) if changes > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => (
@@ -459,7 +459,7 @@ async fn admin_configure(
             .filter_map(|r| r.ok())
             .collect();
         for table in &tables {
-            conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
         schema::create_tables(&conn, &spec).unwrap();

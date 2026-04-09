@@ -36,9 +36,12 @@ pub fn generate_table_sql(name: &str, schema: &SchemaObject) -> String {
                 })
                 .collect();
             columns.sort();
-            format!("CREATE TABLE IF NOT EXISTS {name} ({})", columns.join(", "))
+            format!(
+                "CREATE TABLE IF NOT EXISTS \"{name}\" ({})",
+                columns.join(", ")
+            )
         }
-        _ => format!("CREATE TABLE IF NOT EXISTS {name} (id INTEGER PRIMARY KEY)"),
+        _ => format!("CREATE TABLE IF NOT EXISTS \"{name}\" (id INTEGER PRIMARY KEY)"),
     }
 }
 

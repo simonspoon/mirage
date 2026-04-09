@@ -135,7 +135,7 @@ pub fn seed_table(
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{i}")).collect();
     let placeholders_str = placeholders.join(", ");
 
-    let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
+    let sql = format!("INSERT INTO \"{table_name}\" ({columns_str}) VALUES ({placeholders_str})");
 
     for _ in 0..count {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -221,7 +221,7 @@ mod tests {
 
         let defs = spec.definitions.as_ref().unwrap();
         for table_name in defs.keys() {
-            let sql = format!("SELECT COUNT(*) FROM {table_name}");
+            let sql = format!("SELECT COUNT(*) FROM \"{table_name}\"");
             let count: i64 = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
             assert_eq!(count, 10, "Table {table_name} should have 10 rows");
         }
@@ -234,7 +234,7 @@ mod tests {
 
         // Pet.category is an object -> stored as JSON TEXT
         let rows: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT category FROM Pet").unwrap();
+            let mut stmt = conn.prepare("SELECT category FROM \"Pet\"").unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
@@ -251,7 +251,7 @@ mod tests {
 
         // Pet.tags is an array -> stored as JSON TEXT
         let rows: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT tags FROM Pet").unwrap();
+            let mut stmt = conn.prepare("SELECT tags FROM \"Pet\"").unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
@@ -270,7 +270,7 @@ mod tests {
         seed_tables(&conn, &spec, 20).unwrap();
 
         let valid = ["available", "pending", "sold"];
-        let mut stmt = conn.prepare("SELECT status FROM Pet").unwrap();
+        let mut stmt = conn.prepare("SELECT status FROM \"Pet\"").unwrap();
         let statuses: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
