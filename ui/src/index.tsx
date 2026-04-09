@@ -32,8 +32,10 @@ function App() {
         setSpecInfo(spec);
         const epRes = await fetch("/_api/admin/endpoints");
         const eps: Endpoint[] = await epRes.json();
-        setActiveEndpoints(eps);
-        setState("running");
+        if (eps.length > 0) {
+          setActiveEndpoints(eps);
+          setState("running");
+        }
       }
     } catch {
       // Stay in idle state
