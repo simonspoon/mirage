@@ -3,16 +3,41 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rusqlite::types::Value as SqlValue;
+use rust_embed::Embed;
+use serde::Serialize;
 
 use crate::parser::SwaggerSpec;
 
 pub type Db = Arc<Mutex<rusqlite::Connection>>;
+
+#[derive(Embed)]
+#[folder = "ui/dist/"]
+struct AdminAssets;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Db,
+    pub spec_info: SpecInfo,
+    pub endpoints: Vec<EndpointInfo>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SpecInfo {
+    pub title: String,
+    pub version: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct EndpointInfo {
+    pub method: String,
+    pub path: String,
+}
 
 fn row_to_json(
     col_names: &[String],
@@ -208,7 +233,40 @@ fn swagger_to_axum_path(path: &str) -> String {
     path.to_string()
 }
 
-pub fn build_router(spec: &SwaggerSpec, db: Db) -> Router {
+async fn admin_spec(State(state): State<AppState>) -> Json<SpecInfo> {
+    Json(state.spec_info)
+}
+
+async fn admin_endpoints(State(state): State<AppState>) -> Json<Vec<EndpointInfo>> {
+    Json(state.endpoints)
+}
+
+async fn serve_admin(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().strip_prefix("/_admin/").unwrap_or("");
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match AdminAssets::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => match AdminAssets::get("index.html") {
+            Some(file) => (
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                file.data.into_owned(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+    }
+}
+
+pub fn build_router(spec: &SwaggerSpec, state: AppState) -> Router {
+    let db = state.db.clone();
     let mut router = Router::new();
     let mut registered: HashSet<String> = HashSet::new();
 
@@ -281,7 +339,19 @@ pub fn build_router(spec: &SwaggerSpec, db: Db) -> Router {
         }
     }
 
+    let admin_api = Router::new()
+        .route("/spec", get(admin_spec))
+        .route("/endpoints", get(admin_endpoints))
+        .with_state(state);
+
     router
+        .nest("/_api/admin", admin_api)
+        .route(
+            "/_admin",
+            get(|| async { axum::response::Redirect::permanent("/_admin/") }),
+        )
+        .route("/_admin/", get(serve_admin))
+        .route("/_admin/{*path}", get(serve_admin))
 }
 
 #[cfg(test)]
@@ -303,7 +373,24 @@ mod tests {
         create_tables(&conn, &spec).unwrap();
         seed_tables(&conn, &spec, 5).unwrap();
         let db: Db = Arc::new(Mutex::new(conn));
-        build_router(&spec, db)
+        let spec_info = SpecInfo {
+            title: spec.info.title.clone(),
+            version: spec.info.version.clone(),
+        };
+        let endpoints: Vec<EndpointInfo> = spec
+            .path_operations()
+            .iter()
+            .map(|(path, method, _)| EndpointInfo {
+                method: method.to_string(),
+                path: path.to_string(),
+            })
+            .collect();
+        let state = AppState {
+            db,
+            spec_info,
+            endpoints,
+        };
+        build_router(&spec, state)
     }
 
     #[tokio::test]
@@ -383,5 +470,59 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_admin_page() {
+        let router = setup();
+        let req = Request::builder()
+            .uri("/_admin/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/html"),
+            "expected text/html, got {content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_spec() {
+        let router = setup();
+        let req = Request::builder()
+            .uri("/_api/admin/spec")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("title").is_some(), "spec should have title");
+        assert!(json.get("version").is_some(), "spec should have version");
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_endpoints() {
+        let router = setup();
+        let req = Request::builder()
+            .uri("/_api/admin/endpoints")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("endpoints should be an array");
+        assert!(!arr.is_empty(), "endpoints should not be empty");
+        let first = &arr[0];
+        assert!(first.get("method").is_some(), "endpoint should have method");
+        assert!(first.get("path").is_some(), "endpoint should have path");
     }
 }

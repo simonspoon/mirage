@@ -30,7 +30,26 @@ async fn main() {
     seeder::seed_tables(&conn, &spec, 10).unwrap();
 
     let db: server::Db = Arc::new(Mutex::new(conn));
-    let router = server::build_router(&spec, db);
+
+    let spec_info = server::SpecInfo {
+        title: spec.info.title.clone(),
+        version: spec.info.version.clone(),
+    };
+    let endpoints: Vec<server::EndpointInfo> = spec
+        .path_operations()
+        .iter()
+        .map(|(path, method, _)| server::EndpointInfo {
+            method: method.to_string(),
+            path: path.to_string(),
+        })
+        .collect();
+
+    let state = server::AppState {
+        db,
+        spec_info,
+        endpoints,
+    };
+    let router = server::build_router(&spec, state);
 
     println!("Mirage server running on port {}", cli.port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", cli.port))

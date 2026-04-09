@@ -4,7 +4,9 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [solid(), tailwindcss()],
+  base: "/_admin/",
   build: {
+    target: "esnext",
     outDir: "dist",
   },
 });
