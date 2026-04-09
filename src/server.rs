@@ -13,6 +13,7 @@ use rusqlite::types::Value as SqlValue;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
+use crate::composer::DocumentStore;
 use crate::parser::SwaggerSpec;
 use crate::schema;
 use crate::seeder;
@@ -70,6 +71,7 @@ pub struct AppState {
     pub registry: Registry,
     pub log: RequestLog,
     pub recipe_db: Db,
+    pub documents: Arc<RwLock<DocumentStore>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -354,6 +356,102 @@ fn match_route(pattern: &str, path: &str) -> Option<Option<String>> {
     Some(captured)
 }
 
+fn doc_get_collection(table: String, documents: Arc<RwLock<DocumentStore>>) -> Response {
+    let docs = documents.read().unwrap();
+    match docs.get(&table) {
+        Some(items) => (
+            StatusCode::OK,
+            Json(serde_json::Value::Array(items.clone())),
+        )
+            .into_response(),
+        None => (StatusCode::OK, Json(serde_json::Value::Array(vec![]))).into_response(),
+    }
+}
+
+fn doc_get_single(table: String, documents: Arc<RwLock<DocumentStore>>, id: String) -> Response {
+    let id_num: i64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid id"})),
+            )
+                .into_response();
+        }
+    };
+    let docs = documents.read().unwrap();
+    if let Some(items) = docs.get(&table) {
+        for item in items {
+            if let Some(doc_id) = item.get("id").and_then(|v| v.as_i64())
+                && doc_id == id_num
+            {
+                return (StatusCode::OK, Json(item.clone())).into_response();
+            }
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "not found"})),
+    )
+        .into_response()
+}
+
+fn doc_post_create(
+    table: String,
+    documents: Arc<RwLock<DocumentStore>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let body = match body {
+        Some(Json(v)) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "expected JSON body"})),
+            )
+                .into_response();
+        }
+    };
+    let mut docs = documents.write().unwrap();
+    let items = docs.entry(table).or_default();
+    let new_id = items.len() + 1;
+    let mut doc = body;
+    if let serde_json::Value::Object(ref mut map) = doc {
+        map.insert(
+            "id".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(new_id)),
+        );
+    }
+    items.push(doc.clone());
+    (StatusCode::CREATED, Json(doc)).into_response()
+}
+
+fn doc_delete_single(table: String, documents: Arc<RwLock<DocumentStore>>, id: String) -> Response {
+    let id_num: i64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid id"})),
+            )
+                .into_response();
+        }
+    };
+    let mut docs = documents.write().unwrap();
+    if let Some(items) = docs.get_mut(&table)
+        && let Some(pos) = items
+            .iter()
+            .position(|item| item.get("id").and_then(|v| v.as_i64()) == Some(id_num))
+    {
+        items.remove(pos);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "not found"})),
+    )
+        .into_response()
+}
+
 async fn catch_all_handler(
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -381,14 +479,31 @@ async fn catch_all_handler(
         }
     };
 
-    let db = state.db.clone();
+    // Check if document store has data for this definition
+    let has_documents = {
+        let docs = state.documents.read().unwrap();
+        docs.contains_key(&table)
+    };
 
-    match (m, has_path_param) {
-        ("get", true) => get_single(table, db, param_value.unwrap()).await,
-        ("get", false) => get_collection(table, db).await,
-        ("post", _) => post_create(table, db, body).await,
-        ("delete", true) => delete_single(table, db, param_value.unwrap()).await,
-        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    if has_documents {
+        match (m, has_path_param) {
+            ("get", true) => doc_get_single(table, state.documents.clone(), param_value.unwrap()),
+            ("get", false) => doc_get_collection(table, state.documents.clone()),
+            ("post", _) => doc_post_create(table, state.documents.clone(), body),
+            ("delete", true) => {
+                doc_delete_single(table, state.documents.clone(), param_value.unwrap())
+            }
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    } else {
+        let db = state.db.clone();
+        match (m, has_path_param) {
+            ("get", true) => get_single(table, db, param_value.unwrap()).await,
+            ("get", false) => get_collection(table, db).await,
+            ("post", _) => post_create(table, db, body).await,
+            ("delete", true) => delete_single(table, db, param_value.unwrap()).await,
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
     }
 }
 
@@ -873,6 +988,10 @@ async fn admin_activate_recipe(
 
     let seed_count = recipe.seed_count as usize;
 
+    // Parse shared_pools and quantity_configs from recipe
+    let pool_config = crate::composer::parse_shared_pools(&recipe.shared_pools);
+    let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
+
     // Store spec in registry (same as admin_import)
     {
         let spec_info = SpecInfo {
@@ -983,6 +1102,37 @@ async fn admin_activate_recipe(
             )
                 .into_response();
         }
+    }
+
+    // Generate document store using composer
+    let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
+    let pools = crate::composer::generate_pools(&spec, &pool_config);
+
+    // Build quantity configs: use recipe quantity_configs, with seed_count as default
+    let mut effective_quantities = quantity_configs;
+    // For definitions that don't have explicit quantity configs, use seed_count
+    for def_name in &needed_defs {
+        effective_quantities
+            .entry(def_name.clone())
+            .or_insert(crate::composer::QuantityConfig {
+                min: seed_count,
+                max: seed_count,
+            });
+    }
+
+    let composed = crate::composer::compose_documents(
+        &spec,
+        &raw_spec,
+        &entity_graph,
+        &pools,
+        &effective_quantities,
+        &endpoints,
+    );
+
+    // Store composed documents
+    {
+        let mut docs = state.documents.write().unwrap();
+        *docs = composed;
     }
 
     let activated_endpoints: Vec<EndpointInfo> = all_routes
@@ -1290,6 +1440,7 @@ mod tests {
             registry,
             log,
             recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         build_router(state)
     }
@@ -1307,6 +1458,7 @@ mod tests {
             registry,
             log,
             recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         build_router(state)
     }
@@ -1484,6 +1636,7 @@ mod tests {
             registry: registry.clone(),
             log,
             recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
 
@@ -1753,6 +1906,7 @@ mod tests {
             registry,
             log,
             recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
 

@@ -1,3 +1,4 @@
+mod composer;
 mod entity_graph;
 mod parser;
 mod recipe;
@@ -6,6 +7,7 @@ mod seeder;
 mod server;
 
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -262,6 +264,8 @@ async fn main() {
 
     let registry = Arc::new(RwLock::new(server::RouteRegistry::new()));
 
+    let documents: Arc<RwLock<composer::DocumentStore>> = Arc::new(RwLock::new(HashMap::new()));
+
     // If spec provided, auto-import and configure
     if let Some(spec_path) = &cli.spec {
         let mut spec = parser::SwaggerSpec::from_file(spec_path.to_str().unwrap()).unwrap();
@@ -277,6 +281,42 @@ async fn main() {
 
         // Populate registry
         server::populate_registry(&mut registry.write().unwrap(), &spec, &raw_spec);
+
+        // Populate document store using composer with default configs
+        let all_ops: Vec<(String, String)> = raw_spec
+            .path_operations()
+            .iter()
+            .map(|(path, method, _)| (path.to_string(), method.to_string()))
+            .collect();
+        let entity_graph = entity_graph::build_entity_graph(&raw_spec, &all_ops);
+        let pool_config = composer::SharedPoolConfig::new();
+        let pools = composer::generate_pools(&spec, &pool_config);
+        let mut quantities = composer::QuantityConfigs::new();
+        if let Some(defs) = &spec.definitions {
+            for def_name in defs.keys() {
+                quantities.insert(
+                    def_name.clone(),
+                    composer::QuantityConfig { min: 10, max: 10 },
+                );
+            }
+        }
+        let all_endpoints: Vec<server::EndpointInfo> = raw_spec
+            .path_operations()
+            .iter()
+            .map(|(path, method, _)| server::EndpointInfo {
+                method: method.to_string(),
+                path: path.to_string(),
+            })
+            .collect();
+        let composed = composer::compose_documents(
+            &spec,
+            &raw_spec,
+            &entity_graph,
+            &pools,
+            &quantities,
+            &all_endpoints,
+        );
+        *documents.write().unwrap() = composed;
     }
 
     let log: server::RequestLog = Arc::new(Mutex::new(Vec::new()));
@@ -285,6 +325,7 @@ async fn main() {
         registry,
         log,
         recipe_db,
+        documents,
     };
     let router = server::build_router(state);
 

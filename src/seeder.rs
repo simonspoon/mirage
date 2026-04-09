@@ -21,7 +21,7 @@ const LOREM: &[&str] = &[
     "Some additional context for the field.",
 ];
 
-fn fake_value_for_field(name: &str, schema: &SchemaObject) -> serde_json::Value {
+pub fn fake_value_for_field(name: &str, schema: &SchemaObject) -> serde_json::Value {
     let mut rng = rand::rng();
 
     // Check enum_values first
