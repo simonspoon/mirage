@@ -45,7 +45,30 @@ interface Recipe {
   quantity_configs: string;
 }
 
-type Page = "dashboard" | "endpoints" | "tables" | "log" | "recipes";
+interface PropertyInfo {
+  type: string;
+  format: string | null;
+  required: boolean;
+  ref_name: string | null;
+  is_array: boolean;
+  items_ref: string | null;
+  enum_values: string[] | null;
+  description: string | null;
+}
+
+interface DefinitionInfo {
+  description?: string;
+  extends?: string;
+  properties: Record<string, PropertyInfo>;
+}
+
+interface RouteInfo {
+  method: string;
+  path: string;
+  definition: string;
+}
+
+type Page = "dashboard" | "endpoints" | "tables" | "schemas" | "log" | "recipes";
 type WizardState = "idle" | "selecting" | "running";
 
 function App() {
@@ -80,6 +103,12 @@ function App() {
   const [graphLoading, setGraphLoading] = createSignal(false);
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
+
+  // Schema state
+  const [definitions, setDefinitions] = createSignal<Record<string, DefinitionInfo>>({});
+  const [schemaRoutes, setSchemaRoutes] = createSignal<RouteInfo[]>([]);
+  const [expandedDefs, setExpandedDefs] = createSignal<Set<string>>(new Set());
+  const [selectedDef, setSelectedDef] = createSignal<string | null>(null);
 
   onMount(async () => {
     try {
@@ -138,6 +167,23 @@ function App() {
   createEffect(() => {
     if (page() === "recipes") {
       refreshRecipes();
+    }
+  });
+
+  createEffect(() => {
+    if (page() === "schemas") {
+      (async () => {
+        try {
+          const [defRes, routesRes] = await Promise.all([
+            fetch("/_api/admin/definitions"),
+            fetch("/_api/admin/routes"),
+          ]);
+          setDefinitions(await defRes.json());
+          setSchemaRoutes(await routesRes.json());
+        } catch {
+          // ignore
+        }
+      })();
     }
   });
 
@@ -472,10 +518,38 @@ function App() {
     setError(null);
   };
 
+  const toggleDef = (name: string) => {
+    const next = new Set(expandedDefs());
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    setExpandedDefs(next);
+  };
+
+  const selectDef = (name: string) => {
+    setSelectedDef(name);
+    if (!expandedDefs().has(name)) toggleDef(name);
+  };
+
+  const endpointsForDef = (defName: string) =>
+    schemaRoutes().filter(r => r.definition === defName);
+
+  const typeBadgeClass = (type: string, isRef: boolean, isEnum: boolean) => {
+    if (isEnum) return "bg-pink-500/10 text-pink-400";
+    if (isRef) return "bg-purple-500/10 text-purple-400";
+    switch (type) {
+      case "string": return "bg-green-500/10 text-green-400";
+      case "integer": case "number": return "bg-blue-500/10 text-blue-400";
+      case "boolean": return "bg-yellow-500/10 text-yellow-400";
+      case "array": return "bg-orange-500/10 text-orange-400";
+      default: return "bg-purple-500/10 text-purple-400";
+    }
+  };
+
   const navItems: { id: Page; label: string; icon: string }[] = [
     { id: "dashboard", label: "Dashboard", icon: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" },
     { id: "endpoints", label: "Endpoints", icon: "M13 10V3L4 14h7v7l9-11h-7z" },
     { id: "tables", label: "Tables", icon: "M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" },
+    { id: "schemas", label: "Schemas", icon: "M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" },
     { id: "recipes", label: "Recipes", icon: "M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" },
     { id: "log", label: "Log", icon: "M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" },
   ];
@@ -523,7 +597,7 @@ function App() {
 
       {/* Main */}
       <main class="flex-1 min-h-screen">
-        <div class="max-w-5xl p-8">
+        <div class={`p-8 ${page() === "schemas" ? "max-w-7xl" : "max-w-5xl"}`}>
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error()}
@@ -745,6 +819,233 @@ function App() {
                   </div>
                 </div>
               </Show>
+            </Show>
+          </Show>
+
+          {/* === Schemas === */}
+          <Show when={page() === "schemas"}>
+            <h2 class="text-2xl font-semibold mb-6">Schemas</h2>
+            <Show when={Object.keys(definitions()).length === 0}>
+              <p class="text-gray-500">No definitions available. Import a spec first.</p>
+            </Show>
+            <Show when={Object.keys(definitions()).length > 0}>
+              <div class="flex gap-6" style="max-width: 100%; min-height: 400px;">
+                {/* Left panel - Definition list */}
+                <div class="w-72 shrink-0">
+                  <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
+                    <div class="px-4 py-3 border-b border-[#141b28] flex items-center justify-between">
+                      <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
+                      <span class="text-xs text-gray-600 tabular-nums">{Object.keys(definitions()).length}</span>
+                    </div>
+                    <div class="max-h-[calc(100vh-200px)] overflow-y-auto">
+                      <For each={Object.keys(definitions()).sort()}>
+                        {(defName) => {
+                          const def = () => definitions()[defName];
+                          const epCount = () => endpointsForDef(defName).length;
+                          const isSelected = () => selectedDef() === defName;
+                          const isExpanded = () => expandedDefs().has(defName);
+                          return (
+                            <div>
+                              <button
+                                class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
+                                  isSelected()
+                                    ? "bg-blue-600/15 text-blue-400 font-medium"
+                                    : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                                }`}
+                                onClick={() => selectDef(defName)}
+                              >
+                                <svg
+                                  class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
+                                  fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                                  onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
+                                >
+                                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                                </svg>
+                                <span class="truncate flex-1 text-left">{defName}</span>
+                                <Show when={epCount() > 0}>
+                                  <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                                </Show>
+                              </button>
+                              <Show when={def()?.extends}>
+                                <div class="px-3 pl-8 pb-1">
+                                  <span class="text-xs text-gray-600">extends </span>
+                                  <span
+                                    class="text-xs text-purple-400 cursor-pointer hover:underline"
+                                    onClick={() => selectDef(def()!.extends!)}
+                                  >{def()!.extends}</span>
+                                </div>
+                              </Show>
+                              <Show when={isExpanded()}>
+                                <div class="pb-1">
+                                  <For each={Object.entries(def()?.properties || {})}>
+                                    {([propName, prop]) => (
+                                      <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
+                                        <span class="text-gray-400 truncate">
+                                          {propName}
+                                          <Show when={prop.required}><span class="text-red-400">*</span></Show>
+                                        </span>
+                                        <Show when={prop.ref_name}>
+                                          <span
+                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                            onClick={() => selectDef(prop.ref_name!)}
+                                          >{prop.ref_name}</span>
+                                        </Show>
+                                        <Show when={prop.is_array && prop.items_ref}>
+                                          <span
+                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                            onClick={() => selectDef(prop.items_ref!)}
+                                          >[{prop.items_ref}]</span>
+                                        </Show>
+                                        <Show when={prop.is_array && !prop.items_ref}>
+                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                        </Show>
+                                        <Show when={prop.enum_values}>
+                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                        </Show>
+                                        <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                          <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
+                                        </Show>
+                                      </div>
+                                    )}
+                                  </For>
+                                </div>
+                              </Show>
+                            </div>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right panel - Detail view */}
+                <div class="flex-1 min-w-0">
+                  <Show when={!selectedDef()}>
+                    <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
+                      <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
+                    </div>
+                  </Show>
+                  <Show when={selectedDef() && definitions()[selectedDef()!]}>
+                    {(() => {
+                      const defName = () => selectedDef()!;
+                      const def = () => definitions()[defName()];
+                      const eps = () => endpointsForDef(defName());
+                      return (
+                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
+                          <div class="px-6 py-5 border-b border-[#141b28]">
+                            <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
+                            <Show when={def()?.description}>
+                              <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
+                            </Show>
+                            <Show when={def()?.extends}>
+                              <p class="text-sm text-gray-500 mt-1">
+                                Extends:{" "}
+                                <span
+                                  class="text-purple-400 cursor-pointer hover:underline"
+                                  onClick={() => selectDef(def()!.extends!)}
+                                >{def()!.extends}</span>
+                              </p>
+                            </Show>
+                          </div>
+
+                          {/* Properties table */}
+                          <div class="px-6 py-4">
+                            <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
+                            <Show when={Object.keys(def()?.properties || {}).length === 0}>
+                              <p class="text-sm text-gray-600">No properties defined.</p>
+                            </Show>
+                            <Show when={Object.keys(def()?.properties || {}).length > 0}>
+                              <div class="rounded-lg border border-[#141b28] overflow-hidden">
+                                <table class="w-full text-left">
+                                  <thead>
+                                    <tr class="bg-[#090e1a]">
+                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
+                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    <For each={Object.entries(def()?.properties || {})}>
+                                      {([propName, prop]) => (
+                                        <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
+                                          <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
+                                            {propName}
+                                            <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
+                                          </td>
+                                          <td class="py-2.5 px-4">
+                                            <Show when={prop.ref_name}>
+                                              <span
+                                                class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                                onClick={() => selectDef(prop.ref_name!)}
+                                              >{prop.ref_name}</span>
+                                            </Show>
+                                            <Show when={prop.is_array && prop.items_ref}>
+                                              <span
+                                                class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                                onClick={() => selectDef(prop.items_ref!)}
+                                              >[{prop.items_ref}]</span>
+                                            </Show>
+                                            <Show when={prop.is_array && !prop.items_ref}>
+                                              <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                            </Show>
+                                            <Show when={prop.enum_values}>
+                                              <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                            </Show>
+                                            <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                              <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
+                                                {prop.type}{prop.format ? ` (${prop.format})` : ""}
+                                              </span>
+                                            </Show>
+                                            <Show when={prop.enum_values}>
+                                              <div class="flex flex-wrap gap-1 mt-1">
+                                                <For each={prop.enum_values!}>
+                                                  {(val) => (
+                                                    <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
+                                                  )}
+                                                </For>
+                                              </div>
+                                            </Show>
+                                          </td>
+                                          <td class="py-2.5 px-4 text-center">
+                                            <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
+                                              {prop.required ? "\u2713" : "\u2014"}
+                                            </span>
+                                          </td>
+                                          <td class="py-2.5 px-4 text-sm text-gray-500">
+                                            {prop.description || "\u2014"}
+                                          </td>
+                                        </tr>
+                                      )}
+                                    </For>
+                                  </tbody>
+                                </table>
+                              </div>
+                            </Show>
+                          </div>
+
+                          {/* Used by endpoints */}
+                          <Show when={eps().length > 0}>
+                            <div class="px-6 py-4 border-t border-[#141b28]">
+                              <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
+                              <div class="space-y-1.5">
+                                <For each={eps()}>
+                                  {(route) => (
+                                    <div class="flex items-center gap-2">
+                                      <MethodBadge method={route.method} />
+                                      <span class="font-mono text-sm text-gray-400">{route.path}</span>
+                                    </div>
+                                  )}
+                                </For>
+                              </div>
+                            </div>
+                          </Show>
+                        </div>
+                      );
+                    })()}
+                  </Show>
+                </div>
+              </div>
             </Show>
           </Show>
 
