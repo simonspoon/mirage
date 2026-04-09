@@ -1,6 +1,6 @@
 // Axum API server
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::State;
@@ -539,6 +539,133 @@ async fn admin_spec(State(state): State<AppState>) -> Response {
 async fn admin_endpoints(State(state): State<AppState>) -> Response {
     let reg = state.registry.read().unwrap();
     Json(reg.endpoints.clone()).into_response()
+}
+
+async fn admin_definitions(State(state): State<AppState>) -> Response {
+    let reg = state.registry.read().unwrap();
+    let raw_spec = match &reg.raw_spec {
+        Some(s) => s,
+        None => return Json(serde_json::json!({})).into_response(),
+    };
+    let definitions = match &raw_spec.definitions {
+        Some(d) => d,
+        None => return Json(serde_json::json!({})).into_response(),
+    };
+
+    let mut result = serde_json::Map::new();
+
+    for (def_name, schema) in definitions {
+        let mut def_obj = serde_json::Map::new();
+
+        // Handle description at definition level
+        if let Some(desc) = &schema.description {
+            def_obj.insert("description".to_string(), serde_json::json!(desc));
+        }
+
+        // Collect properties and required fields, handling allOf
+        let mut all_props: HashMap<String, &crate::parser::SchemaObject> = HashMap::new();
+        let mut all_required: Vec<String> = schema.required.clone().unwrap_or_default();
+        let mut extends: Option<String> = None;
+
+        if let Some(all_of) = &schema.all_of {
+            for member in all_of {
+                if let Some(ref ref_path) = member.ref_path {
+                    // A $ref-only member is a "base type"
+                    let base = ref_path.strip_prefix("#/definitions/").unwrap_or(ref_path);
+                    extends = Some(base.to_string());
+                }
+                if let Some(props) = &member.properties {
+                    for (k, v) in props {
+                        all_props.insert(k.clone(), v);
+                    }
+                }
+                if let Some(req) = &member.required {
+                    for r in req {
+                        if !all_required.contains(r) {
+                            all_required.push(r.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(props) = &schema.properties {
+            for (k, v) in props {
+                all_props.insert(k.clone(), v);
+            }
+        }
+
+        if let Some(ext) = &extends {
+            def_obj.insert("extends".to_string(), serde_json::json!(ext));
+        }
+
+        let mut props_obj = serde_json::Map::new();
+        for (prop_name, prop_schema) in &all_props {
+            let prop_type = if prop_schema.ref_path.is_some() {
+                "object".to_string()
+            } else {
+                prop_schema.schema_type.clone().unwrap_or_default()
+            };
+
+            let ref_name = prop_schema
+                .ref_path
+                .as_ref()
+                .map(|r| r.strip_prefix("#/definitions/").unwrap_or(r).to_string());
+
+            let is_array = prop_schema.schema_type.as_deref() == Some("array");
+
+            let items_ref = if is_array {
+                prop_schema.items.as_ref().and_then(|items| {
+                    items
+                        .ref_path
+                        .as_ref()
+                        .map(|r| r.strip_prefix("#/definitions/").unwrap_or(r).to_string())
+                })
+            } else {
+                None
+            };
+
+            let required = all_required.contains(prop_name);
+
+            props_obj.insert(
+                prop_name.clone(),
+                serde_json::json!({
+                    "type": prop_type,
+                    "format": prop_schema.format,
+                    "required": required,
+                    "ref_name": ref_name,
+                    "is_array": is_array,
+                    "items_ref": items_ref,
+                    "enum_values": prop_schema.enum_values,
+                    "description": prop_schema.description,
+                }),
+            );
+        }
+
+        def_obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(props_obj),
+        );
+        result.insert(def_name.clone(), serde_json::Value::Object(def_obj));
+    }
+
+    Json(serde_json::Value::Object(result)).into_response()
+}
+
+async fn admin_routes(State(state): State<AppState>) -> Response {
+    let reg = state.registry.read().unwrap();
+    let routes: Vec<serde_json::Value> = reg
+        .routes
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "method": r.method,
+                "path": r.pattern,
+                "definition": r.table,
+            })
+        })
+        .collect();
+    Json(serde_json::json!(routes)).into_response()
 }
 
 async fn admin_tables(State(state): State<AppState>) -> Response {
@@ -1372,6 +1499,8 @@ pub fn build_router(state: AppState) -> Router {
     let admin_api = Router::new()
         .route("/spec", get(admin_spec))
         .route("/endpoints", get(admin_endpoints))
+        .route("/definitions", get(admin_definitions))
+        .route("/routes", get(admin_routes))
         .route("/tables", get(admin_tables))
         .route("/tables/{name}", get(admin_table_data))
         .route("/log", get(admin_log))
