@@ -235,19 +235,6 @@ function App() {
     setLoading(false);
   };
 
-  const handleReset = () => {
-    setError(null);
-    setSpecInfo(null);
-    setAvailableEndpoints([]);
-    setSelected([]);
-    setActiveEndpoints([]);
-    setTables([]);
-    setSelectedTable(null);
-    setTableData(null);
-    setState("idle");
-    setPage("dashboard");
-  };
-
   const handleRecipeParseSpec = async () => {
     const value = recipeSpecText().trim();
     if (!value) {
@@ -564,15 +551,7 @@ function App() {
             </Show>
 
             <Show when={state() !== "idle"}>
-              <div class="flex items-center justify-between mb-8">
-                <h2 class="text-2xl font-semibold">Dashboard</h2>
-                <button
-                  class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
-                  onClick={handleReset}
-                >
-                  Import New Spec
-                </button>
-              </div>
+              <h2 class="text-2xl font-semibold mb-8">Dashboard</h2>
               <div class="grid grid-cols-3 gap-5">
                 <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-5">
                   <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Spec</p>
