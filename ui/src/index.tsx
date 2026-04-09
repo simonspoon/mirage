@@ -329,7 +329,10 @@ function App() {
     setRecipeStep("config");
   };
 
-  const handleRecipeSave = async () => {
+  const [saveActivatePhase, setSaveActivatePhase] = createSignal<"idle" | "saving" | "activating">("idle");
+  const [savedRecipeId, setSavedRecipeId] = createSignal<number | null>(null);
+
+  const handleRecipeSaveAndActivate = async () => {
     const name = recipeName().trim();
     if (!name) {
       setError("Please enter a recipe name.");
@@ -342,6 +345,11 @@ function App() {
     }
     setError(null);
     setLoading(true);
+    setSaveActivatePhase("saving");
+    setSavedRecipeId(null);
+
+    // Phase 1: Save
+    let recipeId: number;
     try {
       const res = await fetch("/_api/admin/recipes", {
         method: "POST",
@@ -359,8 +367,45 @@ function App() {
         const text = await res.text();
         try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
         setLoading(false);
+        setSaveActivatePhase("idle");
         return;
       }
+      const saved = await res.json();
+      recipeId = saved.id;
+      setSavedRecipeId(recipeId);
+    } catch (e: any) {
+      setError(String(e?.message || e));
+      setLoading(false);
+      setSaveActivatePhase("idle");
+      return;
+    }
+
+    // Phase 2: Activate
+    await activateSavedRecipe(recipeId);
+  };
+
+  const activateSavedRecipe = async (id: number) => {
+    setError(null);
+    setLoading(true);
+    setSaveActivatePhase("activating");
+    try {
+      const res = await fetch(`/_api/admin/recipes/${id}/activate`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError("Recipe saved but activation failed: " + (JSON.parse(text).error || text)); } catch { setError(`Recipe saved but activation failed: ${res.status}: ${text}`); }
+        setLoading(false);
+        setSaveActivatePhase("idle");
+        await refreshRecipes();
+        return;
+      }
+      const data = await res.json();
+      setActiveEndpoints(data.endpoints);
+      const specRes = await fetch("/_api/admin/spec");
+      const spec: SpecInfo = await specRes.json();
+      setSpecInfo(spec);
+      setState("running");
       // Reset creation state
       setRecipeCreating(false);
       setRecipeSpecText("");
@@ -372,9 +417,13 @@ function App() {
       setRecipeSharedPools({});
       setRecipeQuantityConfigs({});
       setEntityGraph(null);
-      await refreshRecipes();
+      setSavedRecipeId(null);
+      setSaveActivatePhase("idle");
+      setPage("dashboard");
     } catch (e: any) {
-      setError(String(e?.message || e));
+      setError("Recipe saved but activation failed: " + String(e?.message || e));
+      setSaveActivatePhase("idle");
+      await refreshRecipes();
     }
     setLoading(false);
   };
@@ -743,6 +792,8 @@ function App() {
             </div>
 
             <Show when={recipeCreating()}>
+              <StepIndicator current={recipeStep()} onNavigate={(s) => { if (saveActivatePhase() === "idle") setRecipeStep(s); }} />
+
               {/* Step 1: Paste spec */}
               <Show when={recipeStep() === "paste"}>
                 <p class="text-gray-500 mb-4">Paste a Swagger 2.0 spec to create a recipe.</p>
@@ -936,7 +987,7 @@ function App() {
                 </div>
               </Show>
 
-              {/* Step 5: Name + seed count + save */}
+              {/* Step 5: Name + seed count + save & activate */}
               <Show when={recipeStep() === "name"}>
                 <div class="space-y-4">
                   <div>
@@ -960,17 +1011,42 @@ function App() {
                       class="w-24 bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-2 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
                     />
                   </div>
+
+                  <Show when={saveActivatePhase() !== "idle" && loading()}>
+                    <div class="flex items-center gap-3 px-4 py-3 rounded-md bg-blue-500/10 border border-blue-500/20 text-blue-400 text-sm">
+                      <div class="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                      {saveActivatePhase() === "saving" ? "Saving recipe..." : "Activating mock server..."}
+                    </div>
+                  </Show>
+
+                  <Show when={savedRecipeId() !== null && !loading()}>
+                    <div class="flex items-center gap-3 px-4 py-3 rounded-md bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm">
+                      Recipe saved. Activation failed.
+                      <button
+                        class="ml-auto px-3 py-1 bg-amber-600 hover:bg-amber-500 rounded-md text-xs font-medium text-white transition-colors"
+                        onClick={() => activateSavedRecipe(savedRecipeId()!)}
+                      >
+                        Retry Activate
+                      </button>
+                    </div>
+                  </Show>
+
                   <div class="flex gap-3 pt-2">
                     <button
                       class="px-5 py-2.5 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                      onClick={handleRecipeSave}
+                      onClick={handleRecipeSaveAndActivate}
                       disabled={loading()}
                     >
-                      {loading() ? "Saving..." : "Save Recipe"}
+                      {loading()
+                        ? saveActivatePhase() === "saving"
+                          ? "Saving..."
+                          : "Activating..."
+                        : "Save & Activate"}
                     </button>
                     <button
-                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-50"
                       onClick={() => setRecipeStep("config")}
+                      disabled={loading()}
                     >
                       Back
                     </button>
@@ -1132,6 +1208,62 @@ function formatCell(value: unknown): string {
   }
   if (typeof value === "string" && value.length > 80) return value.slice(0, 77) + "...";
   return String(value);
+}
+
+function StepIndicator(props: {
+  current: "paste" | "select" | "graph" | "config" | "name";
+  onNavigate: (step: "paste" | "select" | "graph" | "config" | "name") => void;
+}) {
+  const steps: { key: "paste" | "select" | "graph" | "config" | "name"; label: string }[] = [
+    { key: "paste", label: "Import" },
+    { key: "select", label: "Endpoints" },
+    { key: "graph", label: "Entity Graph" },
+    { key: "config", label: "Configure" },
+    { key: "name", label: "Generate" },
+  ];
+  const stepIndex = (key: string) => steps.findIndex((s) => s.key === key);
+  const currentIdx = () => stepIndex(props.current);
+
+  return (
+    <div class="flex items-center mb-8">
+      <For each={steps}>
+        {(step, i) => {
+          const isActive = () => i() === currentIdx();
+          const isCompleted = () => i() < currentIdx();
+          const isFuture = () => i() > currentIdx();
+          return (
+            <>
+              <button
+                class={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  isActive()
+                    ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                    : isCompleted()
+                    ? "text-gray-300 hover:text-white hover:bg-white/5 cursor-pointer"
+                    : "text-gray-600 cursor-default"
+                }`}
+                onClick={() => { if (isCompleted()) props.onNavigate(step.key); }}
+                disabled={isFuture()}
+              >
+                <span class={`flex items-center justify-center w-5 h-5 rounded-full text-xs font-bold ${
+                  isActive()
+                    ? "bg-blue-600 text-white"
+                    : isCompleted()
+                    ? "bg-green-600 text-white"
+                    : "bg-gray-800 text-gray-600"
+                }`}>
+                  {isCompleted() ? "\u2713" : i() + 1}
+                </span>
+                {step.label}
+              </button>
+              {i() < steps.length - 1 && (
+                <div class={`flex-1 h-px mx-1 ${i() < currentIdx() ? "bg-green-600/40" : "bg-gray-800"}`} />
+              )}
+            </>
+          );
+        }}
+      </For>
+    </div>
+  );
 }
 
 render(() => <App />, document.getElementById("root")!);
