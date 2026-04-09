@@ -73,7 +73,9 @@ function App() {
   const [recipeSeedCount, setRecipeSeedCount] = createSignal(10);
   const [recipeAvailableEndpoints, setRecipeAvailableEndpoints] = createSignal<Endpoint[]>([]);
   const [recipeSelectedEndpoints, setRecipeSelectedEndpoints] = createSignal<boolean[]>([]);
-  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "name">("paste");
+  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "graph" | "name">("paste");
+  const [entityGraph, setEntityGraph] = createSignal<any>(null);
+  const [graphLoading, setGraphLoading] = createSignal(false);
 
   onMount(async () => {
     try {
@@ -280,6 +282,30 @@ function App() {
     });
   };
 
+  const handleFetchGraph = async () => {
+    setGraphLoading(true);
+    setError(null);
+    try {
+      const resp = await fetch("/_api/admin/graph", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec_source: recipeSpecText(),
+          endpoints: recipeAvailableEndpoints()
+            .filter((_, i) => recipeSelectedEndpoints()[i])
+            .map((e) => ({ method: e.method, path: e.path })),
+        }),
+      });
+      if (!resp.ok) throw new Error("Failed to compute graph");
+      setEntityGraph(await resp.json());
+      setRecipeStep("graph");
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    } finally {
+      setGraphLoading(false);
+    }
+  };
+
   const handleRecipeSave = async () => {
     const name = recipeName().trim();
     if (!name) {
@@ -376,6 +402,7 @@ function App() {
     setRecipeAvailableEndpoints([]);
     setRecipeSelectedEndpoints([]);
     setRecipeStep("paste");
+    setEntityGraph(null);
     setError(null);
   };
 
@@ -740,14 +767,59 @@ function App() {
                   </For>
                 </div>
                 <button
-                  class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
-                  onClick={() => setRecipeStep("name")}
+                  class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                  onClick={handleFetchGraph}
+                  disabled={graphLoading()}
                 >
-                  Next: Name & Save
+                  {graphLoading() ? "Computing graph..." : "Next: Entity Graph"}
                 </button>
               </Show>
 
-              {/* Step 3: Name + seed count + save */}
+              {/* Step 3: Entity Graph */}
+              <Show when={recipeStep() === "graph"}>
+                <h3 class="text-lg font-semibold mb-2">Entity Graph</h3>
+                <p class="text-sm text-gray-400 mb-4">Definitions reachable from your selected endpoints. Shared entities are highlighted.</p>
+                <div class="space-y-2">
+                  <For each={entityGraph()?.nodes || []}>
+                    {(node: string) => (
+                      <div class={`p-3 rounded ${entityGraph()?.shared_entities?.includes(node) ? 'bg-yellow-900/30 border border-yellow-700' : 'bg-gray-800'}`}>
+                        <div class="flex items-center justify-between">
+                          <span class="font-medium">{node}</span>
+                          {entityGraph()?.shared_entities?.includes(node) && (
+                            <span class="text-xs bg-yellow-700 px-2 py-0.5 rounded">shared</span>
+                          )}
+                        </div>
+                        {entityGraph()?.roots?.[node] && (
+                          <div class="text-xs text-gray-400 mt-1">
+                            Root for: {entityGraph().roots[node].map((e: any) => `${e.method.toUpperCase()} ${e.path}`).join(", ")}
+                          </div>
+                        )}
+                        {entityGraph()?.edges?.[node]?.length > 0 && (
+                          <div class="text-xs text-gray-500 mt-1">
+                            References: {entityGraph().edges[node].join(", ")}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <div class="flex gap-3 mt-4">
+                  <button
+                    class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                    onClick={() => setRecipeStep("select")}
+                  >
+                    Back
+                  </button>
+                  <button
+                    class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
+                    onClick={() => setRecipeStep("name")}
+                  >
+                    Next: Name & Save
+                  </button>
+                </div>
+              </Show>
+
+              {/* Step 4: Name + seed count + save */}
               <Show when={recipeStep() === "name"}>
                 <div class="space-y-4">
                   <div>
@@ -781,7 +853,7 @@ function App() {
                     </button>
                     <button
                       class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
-                      onClick={() => setRecipeStep("select")}
+                      onClick={() => setRecipeStep("graph")}
                     >
                       Back
                     </button>

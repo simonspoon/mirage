@@ -78,7 +78,7 @@ pub struct SpecInfo {
     pub version: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointInfo {
     pub method: String,
     pub path: String,
@@ -997,6 +997,32 @@ async fn admin_activate_recipe(
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct GraphRequest {
+    spec_source: String,
+    endpoints: Vec<EndpointInfo>,
+}
+
+async fn admin_graph(Json(req): Json<GraphRequest>) -> impl IntoResponse {
+    let spec: SwaggerSpec = match serde_yaml::from_str(&req.spec_source) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let selected: Vec<(String, String)> = req
+        .endpoints
+        .iter()
+        .map(|e| (e.path.clone(), e.method.to_lowercase()))
+        .collect();
+    let graph = crate::entity_graph::build_entity_graph(&spec, &selected);
+    (StatusCode::OK, Json(serde_json::json!(graph))).into_response()
+}
+
 async fn serve_admin(uri: axum::http::Uri) -> impl IntoResponse {
     let path = uri.path().strip_prefix("/_admin/").unwrap_or("");
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1124,6 +1150,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/log", get(admin_log))
         .route("/import", post(admin_import))
         .route("/configure", post(admin_configure))
+        .route("/graph", post(admin_graph))
         .route(
             "/recipes",
             post(admin_create_recipe).get(admin_list_recipes),
@@ -1697,5 +1724,72 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().expect("response should be an array");
         assert_eq!(arr.len(), 1, "recipe should survive mock DB configure");
+    }
+
+    #[tokio::test]
+    async fn test_admin_graph_petstore() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/graph")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nodes = json["nodes"].as_array().unwrap();
+        let node_strs: Vec<&str> = nodes.iter().map(|n| n.as_str().unwrap()).collect();
+        assert!(node_strs.contains(&"Pet"));
+        assert!(node_strs.contains(&"Category"));
+        assert!(node_strs.contains(&"Tag"));
+    }
+
+    #[tokio::test]
+    async fn test_admin_graph_empty_endpoints() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "spec_source": spec_yaml,
+            "endpoints": []
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/graph")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nodes = json["nodes"].as_array().unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_admin_graph_invalid_spec() {
+        let router = setup_empty();
+        let body = serde_json::json!({
+            "spec_source": "not valid yaml {{{{",
+            "endpoints": [{"method": "get", "path": "/test"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/graph")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "should have error field");
     }
 }

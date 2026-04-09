@@ -243,7 +243,7 @@ pub fn primary_response_def(op: &Operation) -> Option<String> {
     None
 }
 
-fn collect_schema_refs(
+pub(crate) fn collect_schema_refs(
     schema: &SchemaObject,
     defs: &mut HashSet<String>,
     spec_definitions: Option<&HashMap<String, SchemaObject>>,
@@ -271,6 +271,9 @@ fn collect_schema_refs(
         for member in all_of {
             collect_schema_refs(member, defs, spec_definitions);
         }
+    }
+    if let Some(ap) = &schema.additional_properties {
+        collect_schema_refs(ap, defs, spec_definitions);
     }
 }
 

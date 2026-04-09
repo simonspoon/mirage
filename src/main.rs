@@ -1,3 +1,4 @@
+mod entity_graph;
 mod parser;
 mod recipe;
 mod schema;
