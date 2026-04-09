@@ -14,3 +14,7 @@ fake = { version = "5", features = ["derive"] }
 rand = "0.10"
 rust-embed = "8"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

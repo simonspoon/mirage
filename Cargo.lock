@@ -675,6 +675,7 @@ dependencies = [
  "axum",
  "clap",
  "fake",
+ "http-body-util",
  "rand",
  "rusqlite",
  "rust-embed",
@@ -682,6 +683,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tower",
 ]
 
 [[package]]
