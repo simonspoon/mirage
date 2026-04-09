@@ -69,6 +69,7 @@ pub struct AppState {
     pub db: Db,
     pub registry: Registry,
     pub log: RequestLog,
+    pub recipe_db: Db,
 }
 
 #[derive(Clone, Serialize)]
@@ -694,6 +695,308 @@ async fn admin_configure(
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct CreateRecipeRequest {
+    name: String,
+    spec_source: String,
+    endpoints: Vec<EndpointInfo>,
+    seed_count: Option<i64>,
+}
+
+async fn admin_create_recipe(
+    State(state): State<AppState>,
+    Json(body): Json<CreateRecipeRequest>,
+) -> Response {
+    // Validate the spec_source is valid swagger
+    let _spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid spec: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let endpoints_json = match serde_json::to_string(&body.endpoints) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to serialize endpoints: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let seed_count = body.seed_count.unwrap_or(10);
+
+    let recipe = {
+        let conn = state.recipe_db.lock().unwrap();
+        match crate::recipe::create_recipe(
+            &conn,
+            &body.name,
+            &body.spec_source,
+            &endpoints_json,
+            seed_count,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create recipe: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response()
+}
+
+async fn admin_list_recipes(State(state): State<AppState>) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::list_recipes(&conn) {
+        Ok(recipes) => Json(serde_json::json!(recipes)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list recipes: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_get_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::get_recipe(&conn, id) {
+        Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_delete_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::delete_recipe(&conn, id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to delete recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_activate_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    // Load recipe
+    let recipe = {
+        let conn = state.recipe_db.lock().unwrap();
+        match crate::recipe::get_recipe(&conn, id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "recipe not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to load recipe: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Parse spec from recipe
+    let mut spec: SwaggerSpec = match serde_yaml::from_str(&recipe.spec_source) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid spec in recipe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let raw_spec = spec.clone();
+    spec.resolve_refs();
+
+    // Parse selected endpoints
+    let endpoints: Vec<EndpointInfo> = match serde_json::from_str(&recipe.selected_endpoints) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Invalid endpoints in recipe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let seed_count = recipe.seed_count as usize;
+
+    // Store spec in registry (same as admin_import)
+    {
+        let spec_info = SpecInfo {
+            title: spec.info.title.clone(),
+            version: spec.info.version.clone(),
+        };
+        let mut reg = state.registry.write().unwrap();
+        reg.spec = Some(spec.clone());
+        reg.raw_spec = Some(raw_spec.clone());
+        reg.spec_info = Some(spec_info);
+    }
+
+    // Run configure logic (same as admin_configure)
+    let config = ConfigureRequest {
+        endpoints: endpoints.clone(),
+        seed_count: Some(seed_count),
+    };
+
+    let selected: HashSet<(String, String)> = config
+        .endpoints
+        .iter()
+        .map(|e| (e.method.to_lowercase(), e.path.clone()))
+        .collect();
+
+    let selected_ops: Vec<(String, String)> = config
+        .endpoints
+        .iter()
+        .map(|e| (e.path.clone(), e.method.to_lowercase()))
+        .collect();
+
+    let needed_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops);
+
+    let raw_ops = raw_spec.path_operations();
+    let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
+        .iter()
+        .map(|(path, method, op)| ((*path, *method), *op))
+        .collect();
+
+    let routes: Vec<RouteEntry> = spec
+        .path_operations()
+        .iter()
+        .filter(|(path, method, _)| selected.contains(&(method.to_string(), path.to_string())))
+        .map(|(path, method, _)| {
+            let table = raw_op_map
+                .get(&(*path, *method))
+                .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+                .unwrap_or_else(|| table_name_from_path(path));
+            RouteEntry {
+                method: method.to_string(),
+                pattern: path.to_string(),
+                table,
+                has_path_param: path.contains('{'),
+            }
+        })
+        .collect();
+
+    let mut collection_routes: Vec<RouteEntry> = Vec::new();
+    let mut seen_tables: HashSet<String> = HashSet::new();
+    for route in &routes {
+        if !route.has_path_param && route.method == "get" {
+            continue;
+        }
+        let base = format!("/{}", route.table.to_lowercase());
+        if seen_tables.insert(route.table.clone())
+            && !routes
+                .iter()
+                .any(|r| r.method == "get" && r.pattern == base && !r.has_path_param)
+        {
+            collection_routes.push(RouteEntry {
+                method: "get".to_string(),
+                pattern: base,
+                table: route.table.clone(),
+                has_path_param: false,
+            });
+        }
+    }
+
+    let mut all_routes = routes;
+    all_routes.extend(collection_routes);
+
+    // Drop old tables, create only needed ones, seed
+    {
+        let conn = state.db.lock().unwrap();
+        let existing: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for table in &existing {
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
+                .unwrap();
+        }
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&needed_defs)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
+            )
+                .into_response();
+        }
+        if let Err(e) = seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
+    let activated_endpoints: Vec<EndpointInfo> = all_routes
+        .iter()
+        .map(|r| EndpointInfo {
+            method: r.method.clone(),
+            path: r.pattern.clone(),
+        })
+        .collect();
+
+    {
+        let mut reg = state.registry.write().unwrap();
+        reg.routes = all_routes;
+        reg.endpoints = activated_endpoints.clone();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "activated",
+            "endpoints": activated_endpoints,
+        })),
+    )
+        .into_response()
+}
+
 async fn serve_admin(uri: axum::http::Uri) -> impl IntoResponse {
     let path = uri.path().strip_prefix("/_admin/").unwrap_or("");
     let path = if path.is_empty() { "index.html" } else { path };
@@ -821,6 +1124,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/log", get(admin_log))
         .route("/import", post(admin_import))
         .route("/configure", post(admin_configure))
+        .route(
+            "/recipes",
+            post(admin_create_recipe).get(admin_list_recipes),
+        )
+        .route(
+            "/recipes/{id}",
+            get(admin_get_recipe).delete(admin_delete_recipe),
+        )
+        .route("/recipes/{id}/activate", post(admin_activate_recipe))
         .with_state(state.clone());
 
     Router::new()
@@ -862,7 +1174,15 @@ mod tests {
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
         populate_registry(&mut registry.write().unwrap(), &spec, &raw_spec);
         let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
-        let state = AppState { db, registry, log };
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db,
+        };
         build_router(state)
     }
 
@@ -871,7 +1191,15 @@ mod tests {
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
         let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
-        let state = AppState { db, registry, log };
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db,
+        };
         build_router(state)
     }
 
@@ -1040,10 +1368,14 @@ mod tests {
         let db: Db = Arc::new(Mutex::new(conn));
         let registry = Arc::new(RwLock::new(RouteRegistry::new()));
         let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
         let state = AppState {
             db,
             registry: registry.clone(),
             log,
+            recipe_db,
         };
         let router = build_router(state);
 
@@ -1102,5 +1434,268 @@ mod tests {
         let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn recipe_test_body() -> serde_json::Value {
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        serde_json::json!({
+            "name": "My Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"},
+                {"method": "delete", "path": "/pet/{petId}"}
+            ],
+            "seed_count": 5
+        })
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("id").is_some(), "response should have id");
+        assert!(
+            json.get("created_at").is_some(),
+            "response should have created_at"
+        );
+        assert_eq!(json["name"], "My Petstore");
+        assert_eq!(json["seed_count"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_list_recipes() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create first recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Create second recipe
+        let mut body2 = recipe_test_body();
+        body2["name"] = serde_json::json!("Second Recipe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body2).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // List recipes
+        let req = Request::builder()
+            .uri("/_api/admin/recipes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_recipe() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Get by id
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "My Petstore");
+
+        // Get non-existent
+        let req = Request::builder()
+            .uri("/_api/admin/recipes/99999")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_recipe() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Delete
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Get should 404
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "activated");
+        assert!(
+            json.get("endpoints").is_some(),
+            "response should have endpoints"
+        );
+
+        // Mock endpoint should now work
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 5, "should have 5 seeded rows from recipe");
+    }
+
+    #[tokio::test]
+    async fn test_recipe_survives_configure() {
+        let conn = Connection::open_in_memory().unwrap();
+        let db: Db = Arc::new(Mutex::new(conn));
+        let registry = Arc::new(RwLock::new(RouteRegistry::new()));
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db,
+        };
+        let router = build_router(state);
+
+        // Create a recipe
+        let body = recipe_test_body();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Import spec and configure mock DB (this recreates mock tables)
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/import")
+            .header("content-type", "text/plain")
+            .body(Body::from(spec_yaml))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let config = serde_json::json!({
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 3
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/configure")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&config).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Recipe should still be there
+        let req = Request::builder()
+            .uri("/_api/admin/recipes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert_eq!(arr.len(), 1, "recipe should survive mock DB configure");
     }
 }

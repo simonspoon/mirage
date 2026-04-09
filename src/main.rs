@@ -1,4 +1,5 @@
 mod parser;
+mod recipe;
 mod schema;
 mod seeder;
 mod server;
@@ -253,6 +254,11 @@ async fn main() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     let db: server::Db = Arc::new(Mutex::new(conn));
 
+    // File-backed DB for recipe storage (persists across restarts)
+    let recipe_conn = rusqlite::Connection::open("mirage.db").unwrap();
+    recipe::init_recipe_db(&recipe_conn).unwrap();
+    let recipe_db: server::Db = Arc::new(Mutex::new(recipe_conn));
+
     let registry = Arc::new(RwLock::new(server::RouteRegistry::new()));
 
     // If spec provided, auto-import and configure
@@ -273,7 +279,12 @@ async fn main() {
     }
 
     let log: server::RequestLog = Arc::new(Mutex::new(Vec::new()));
-    let state = server::AppState { db, registry, log };
+    let state = server::AppState {
+        db,
+        registry,
+        log,
+        recipe_db,
+    };
     let router = server::build_router(state);
 
     println!("Mirage server running on port {}", cli.port);

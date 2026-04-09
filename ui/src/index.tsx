@@ -34,7 +34,16 @@ interface LogEntry {
   status: number;
 }
 
-type Page = "dashboard" | "endpoints" | "tables" | "log";
+interface Recipe {
+  id: number;
+  name: string;
+  spec_source: string;
+  selected_endpoints: string;
+  seed_count: number;
+  created_at: string;
+}
+
+type Page = "dashboard" | "endpoints" | "tables" | "log" | "recipes";
 type WizardState = "idle" | "selecting" | "running";
 
 function App() {
@@ -55,6 +64,16 @@ function App() {
 
   // Log state
   const [logEntries, setLogEntries] = createSignal<LogEntry[]>([]);
+
+  // Recipe state
+  const [recipes, setRecipes] = createSignal<Recipe[]>([]);
+  const [recipeCreating, setRecipeCreating] = createSignal(false);
+  const [recipeSpecText, setRecipeSpecText] = createSignal("");
+  const [recipeName, setRecipeName] = createSignal("");
+  const [recipeSeedCount, setRecipeSeedCount] = createSignal(10);
+  const [recipeAvailableEndpoints, setRecipeAvailableEndpoints] = createSignal<Endpoint[]>([]);
+  const [recipeSelectedEndpoints, setRecipeSelectedEndpoints] = createSignal<boolean[]>([]);
+  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "name">("paste");
 
   onMount(async () => {
     try {
@@ -99,6 +118,22 @@ function App() {
       // ignore
     }
   };
+
+  const refreshRecipes = async () => {
+    try {
+      const res = await fetch("/_api/admin/recipes");
+      const data: Recipe[] = await res.json();
+      setRecipes(data);
+    } catch {
+      // ignore
+    }
+  };
+
+  createEffect(() => {
+    if (page() === "recipes") {
+      refreshRecipes();
+    }
+  });
 
   // Poll log every 2s when on the log page
   createEffect(() => {
@@ -207,10 +242,148 @@ function App() {
     setPage("dashboard");
   };
 
+  const handleRecipeParseSpec = async () => {
+    const value = recipeSpecText().trim();
+    if (!value) {
+      setError("Please paste a spec first.");
+      return;
+    }
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch("/_api/admin/import", {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: value,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        setLoading(false);
+        return;
+      }
+      const data = await res.json();
+      setRecipeAvailableEndpoints(data.endpoints);
+      setRecipeSelectedEndpoints(data.endpoints.map(() => true));
+      setRecipeStep("select");
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+    setLoading(false);
+  };
+
+  const toggleRecipeEndpoint = (index: number) => {
+    setRecipeSelectedEndpoints((prev) => {
+      const next = [...prev];
+      next[index] = !next[index];
+      return next;
+    });
+  };
+
+  const handleRecipeSave = async () => {
+    const name = recipeName().trim();
+    if (!name) {
+      setError("Please enter a recipe name.");
+      return;
+    }
+    const endpoints = recipeAvailableEndpoints().filter((_, i) => recipeSelectedEndpoints()[i]);
+    if (endpoints.length === 0) {
+      setError("Select at least one endpoint.");
+      return;
+    }
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch("/_api/admin/recipes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          spec_source: recipeSpecText().trim(),
+          endpoints,
+          seed_count: recipeSeedCount(),
+        }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        setLoading(false);
+        return;
+      }
+      // Reset creation state
+      setRecipeCreating(false);
+      setRecipeSpecText("");
+      setRecipeName("");
+      setRecipeSeedCount(10);
+      setRecipeAvailableEndpoints([]);
+      setRecipeSelectedEndpoints([]);
+      setRecipeStep("paste");
+      await refreshRecipes();
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+    setLoading(false);
+  };
+
+  const handleRecipeActivate = async (id: number) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`/_api/admin/recipes/${id}/activate`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        setLoading(false);
+        return;
+      }
+      const data = await res.json();
+      setActiveEndpoints(data.endpoints);
+      // Refresh spec info
+      const specRes = await fetch("/_api/admin/spec");
+      const spec: SpecInfo = await specRes.json();
+      setSpecInfo(spec);
+      setState("running");
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+    setLoading(false);
+  };
+
+  const handleRecipeDelete = async (id: number) => {
+    setError(null);
+    try {
+      const res = await fetch(`/_api/admin/recipes/${id}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        return;
+      }
+      await refreshRecipes();
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+  };
+
+  const handleRecipeCancelCreate = () => {
+    setRecipeCreating(false);
+    setRecipeSpecText("");
+    setRecipeName("");
+    setRecipeSeedCount(10);
+    setRecipeAvailableEndpoints([]);
+    setRecipeSelectedEndpoints([]);
+    setRecipeStep("paste");
+    setError(null);
+  };
+
   const navItems: { id: Page; label: string; icon: string }[] = [
     { id: "dashboard", label: "Dashboard", icon: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" },
     { id: "endpoints", label: "Endpoints", icon: "M13 10V3L4 14h7v7l9-11h-7z" },
     { id: "tables", label: "Tables", icon: "M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" },
+    { id: "recipes", label: "Recipes", icon: "M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" },
     { id: "log", label: "Log", icon: "M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" },
   ];
 
@@ -485,6 +658,177 @@ function App() {
                       </div>
                     </Show>
                   </div>
+                </div>
+              </Show>
+            </Show>
+          </Show>
+
+          {/* === Recipes === */}
+          <Show when={page() === "recipes"}>
+            <div class="flex items-center justify-between mb-6">
+              <h2 class="text-2xl font-semibold">Recipes</h2>
+              <Show when={!recipeCreating()}>
+                <button
+                  class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
+                  onClick={() => setRecipeCreating(true)}
+                >
+                  Create Recipe
+                </button>
+              </Show>
+              <Show when={recipeCreating()}>
+                <button
+                  class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                  onClick={handleRecipeCancelCreate}
+                >
+                  Cancel
+                </button>
+              </Show>
+            </div>
+
+            <Show when={recipeCreating()}>
+              {/* Step 1: Paste spec */}
+              <Show when={recipeStep() === "paste"}>
+                <p class="text-gray-500 mb-4">Paste a Swagger 2.0 spec to create a recipe.</p>
+                <textarea
+                  class="w-full h-48 bg-[#070c17] border border-gray-800 rounded-lg p-4 font-mono text-sm text-gray-300 resize-y placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 transition-colors"
+                  placeholder="Paste Swagger 2.0 YAML or JSON here..."
+                  value={recipeSpecText()}
+                  onInput={(e) => setRecipeSpecText(e.currentTarget.value)}
+                />
+                <button
+                  class="mt-4 px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                  onClick={handleRecipeParseSpec}
+                  disabled={loading()}
+                >
+                  {loading() ? "Parsing..." : "Next: Select Endpoints"}
+                </button>
+              </Show>
+
+              {/* Step 2: Select endpoints */}
+              <Show when={recipeStep() === "select"}>
+                <div class="flex items-center justify-between mb-4">
+                  <p class="text-gray-500">Select endpoints for this recipe.</p>
+                  <div class="flex gap-2">
+                    <button
+                      class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                      onClick={() => setRecipeSelectedEndpoints(recipeAvailableEndpoints().map(() => true))}
+                    >
+                      Select All
+                    </button>
+                    <button
+                      class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                      onClick={() => setRecipeSelectedEndpoints(recipeAvailableEndpoints().map(() => false))}
+                    >
+                      Deselect All
+                    </button>
+                  </div>
+                </div>
+                <div class="space-y-0.5 mb-6">
+                  <For each={recipeAvailableEndpoints()}>
+                    {(ep, i) => (
+                      <label class="flex items-center gap-3 px-3 py-2.5 rounded-md cursor-pointer hover:bg-white/[0.03] transition-colors">
+                        <input
+                          type="checkbox"
+                          checked={recipeSelectedEndpoints()[i()]}
+                          onChange={() => toggleRecipeEndpoint(i())}
+                          class="accent-blue-500 rounded"
+                        />
+                        <MethodBadge method={ep.method} />
+                        <span class="font-mono text-sm text-gray-300">{ep.path}</span>
+                      </label>
+                    )}
+                  </For>
+                </div>
+                <button
+                  class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
+                  onClick={() => setRecipeStep("name")}
+                >
+                  Next: Name & Save
+                </button>
+              </Show>
+
+              {/* Step 3: Name + seed count + save */}
+              <Show when={recipeStep() === "name"}>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm text-gray-400 mb-1.5">Recipe Name</label>
+                    <input
+                      type="text"
+                      value={recipeName()}
+                      onInput={(e) => setRecipeName(e.currentTarget.value)}
+                      placeholder="e.g., Petstore Dev"
+                      class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-4 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label class="block text-sm text-gray-400 mb-1.5">Seed rows per table</label>
+                    <input
+                      type="number"
+                      value={recipeSeedCount()}
+                      min={1}
+                      max={100}
+                      onInput={(e) => setRecipeSeedCount(parseInt(e.currentTarget.value) || 1)}
+                      class="w-24 bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-2 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
+                    />
+                  </div>
+                  <div class="flex gap-3 pt-2">
+                    <button
+                      class="px-5 py-2.5 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                      onClick={handleRecipeSave}
+                      disabled={loading()}
+                    >
+                      {loading() ? "Saving..." : "Save Recipe"}
+                    </button>
+                    <button
+                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                      onClick={() => setRecipeStep("select")}
+                    >
+                      Back
+                    </button>
+                  </div>
+                </div>
+              </Show>
+            </Show>
+
+            <Show when={!recipeCreating()}>
+              <Show when={recipes().length === 0}>
+                <p class="text-gray-500">No saved recipes yet. Create one to get started.</p>
+              </Show>
+
+              <Show when={recipes().length > 0}>
+                <div class="space-y-3">
+                  <For each={recipes()}>
+                    {(recipe) => {
+                      const endpoints: Endpoint[] = (() => {
+                        try { return JSON.parse(recipe.selected_endpoints); } catch { return []; }
+                      })();
+                      return (
+                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-5 flex items-center justify-between">
+                          <div>
+                            <p class="font-semibold text-gray-100">{recipe.name}</p>
+                            <p class="text-sm text-gray-500 mt-0.5">
+                              {endpoints.length} endpoint{endpoints.length !== 1 ? "s" : ""} &middot; {recipe.seed_count} seed rows &middot; {new Date(recipe.created_at).toLocaleDateString()}
+                            </p>
+                          </div>
+                          <div class="flex gap-2">
+                            <button
+                              class="px-4 py-1.5 bg-green-600 hover:bg-green-500 rounded-md text-xs font-medium transition-colors disabled:opacity-50"
+                              onClick={() => handleRecipeActivate(recipe.id)}
+                              disabled={loading()}
+                            >
+                              Activate
+                            </button>
+                            <button
+                              class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"
+                              onClick={() => handleRecipeDelete(recipe.id)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }}
+                  </For>
                 </div>
               </Show>
             </Show>
