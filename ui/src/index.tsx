@@ -1,5 +1,5 @@
 import { render } from "solid-js/web";
-import { createSignal, onMount, onCleanup, For, Show, createEffect } from "solid-js";
+import { createSignal, onMount, onCleanup, For, Show, createEffect, createMemo } from "solid-js";
 import "./index.css";
 import ForceGraph from "./ForceGraph";
 
@@ -139,15 +139,11 @@ function App() {
   const [definitions, setDefinitions] = createSignal<Record<string, DefinitionInfo>>({});
   const [schemaRoutes, setSchemaRoutes] = createSignal<RouteInfo[]>([]);
   const [expandedDefs, setExpandedDefs] = createSignal<Set<string>>(new Set());
-  const [selectedDef, setSelectedDef] = createSignal<string | null>(null);
-  const [defFilter, setDefFilter] = createSignal("");
-  const [schemaTab, setSchemaTab] = createSignal<"definitions" | "graph">("definitions");
+  const [selectedEntity, setSelectedEntity] = createSignal<string | null>(null);
+  const [schemaFilter, setSchemaFilter] = createSignal("");
 
   // Schema-level entity graph state
   const [schemaGraph, setSchemaGraph] = createSignal<any>(null);
-  const [schemaGraphLoading, setSchemaGraphLoading] = createSignal(false);
-  const [schemaGraphSelectedEntity, setSchemaGraphSelectedEntity] = createSignal<string | null>(null);
-  const [schemaGraphSearch, setSchemaGraphSearch] = createSignal("");
   const [schemaGraphGroupBy, setSchemaGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
   const [schemaGraphHopDepth, setSchemaGraphHopDepth] = createSignal(1);
 
@@ -223,6 +219,23 @@ function App() {
           setDefinitions(await defRes.json());
           setSchemaRoutes(await routesRes.json());
           setSchemaGraph(await graphRes.json());
+        } catch {
+          // ignore
+        }
+      })();
+    }
+  });
+
+  createEffect(() => {
+    if (page() === "endpoints" && Object.keys(definitions()).length === 0) {
+      (async () => {
+        try {
+          const [defRes, routesRes] = await Promise.all([
+            fetch("/_api/admin/definitions"),
+            fetch("/_api/admin/routes"),
+          ]);
+          setDefinitions(await defRes.json());
+          setSchemaRoutes(await routesRes.json());
         } catch {
           // ignore
         }
@@ -743,13 +756,66 @@ function App() {
     setExpandedDefs(next);
   };
 
-  const selectDef = (name: string) => {
-    setSelectedDef(name);
+  const selectEntity = (name: string) => {
+    setSelectedEntity(name);
     if (!expandedDefs().has(name)) toggleDef(name);
   };
 
   const endpointsForDef = (defName: string) =>
     schemaRoutes().filter(r => r.definition === defName);
+
+  const examplePayload = (ep: Endpoint): string => {
+    const route = schemaRoutes().find(
+      (r) => r.method.toLowerCase() === ep.method.toLowerCase() && r.path === ep.path
+    );
+    if (!route) return "{}";
+    const def = definitions()[route.definition];
+    if (!def) return "{}";
+
+    const buildExample = (defName: string, depth: number): Record<string, unknown> => {
+      if (depth > 2) return {};
+      const d = definitions()[defName];
+      if (!d) return {};
+
+      let obj: Record<string, unknown> = {};
+      if (d.extends) {
+        obj = buildExample(d.extends, depth + 1);
+      }
+
+      for (const [name, prop] of Object.entries(d.properties)) {
+        if (name === "id") continue;
+
+        if (prop.enum_values && prop.enum_values.length > 0) {
+          obj[name] = prop.enum_values[0];
+        } else if (prop.is_array) {
+          if (prop.items_ref) {
+            obj[name] = [buildExample(prop.items_ref, depth + 1)];
+          } else {
+            obj[name] = [];
+          }
+        } else if (prop.ref_name) {
+          obj[name] = buildExample(prop.ref_name, depth + 1);
+        } else {
+          switch (prop.type) {
+            case "string":
+              if (prop.format === "date-time") obj[name] = "2026-01-01T00:00:00Z";
+              else if (prop.format === "date") obj[name] = "2026-01-01";
+              else if (prop.format === "email") obj[name] = "user@example.com";
+              else if (prop.format === "uri" || prop.format === "url") obj[name] = "https://example.com";
+              else obj[name] = "string";
+              break;
+            case "integer": obj[name] = 0; break;
+            case "number": obj[name] = 0.0; break;
+            case "boolean": obj[name] = true; break;
+            default: obj[name] = "string"; break;
+          }
+        }
+      }
+      return obj;
+    };
+
+    return JSON.stringify(buildExample(route.definition, 0), null, 2);
+  };
 
   const typeBadgeClass = (type: string, isRef: boolean, isEnum: boolean) => {
     if (isEnum) return "bg-pink-500/10 text-pink-400";
@@ -1037,7 +1103,7 @@ function App() {
                             } else {
                               setTryEndpoint(key());
                               setTryParams({});
-                              setTryBody("{}");
+                              setTryBody(["post", "put", "patch"].includes(ep.method.toLowerCase()) ? examplePayload(ep) : "{}");
                               setTryResponse(null);
                             }
                           }}
@@ -1216,494 +1282,490 @@ function App() {
 
           {/* === Schemas === */}
           <Show when={page() === "schemas"}>
-            <div class="flex items-center justify-between mb-6">
-              <h2 class="text-2xl font-semibold">Schemas</h2>
-              <div class="flex gap-1 bg-gray-900/50 rounded-lg p-0.5">
-                <button
-                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${schemaTab() === "definitions" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                  onClick={() => setSchemaTab("definitions")}
-                >Definitions</button>
-                <button
-                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${schemaTab() === "graph" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                  onClick={() => { if (selectedDef()) setSchemaGraphSelectedEntity(selectedDef()); setSchemaTab("graph"); }}
-                >Entity Graph</button>
-              </div>
-            </div>
-            <Show when={Object.keys(definitions()).length === 0}>
-              <p class="text-gray-500">No definitions available. Import a spec first.</p>
-            </Show>
-            <Show when={Object.keys(definitions()).length > 0 && schemaTab() === "definitions"}>
-              <div class="flex gap-6" style="max-width: 100%; min-height: 400px;">
-                {/* Left panel - Definition list */}
-                <div class="w-72 shrink-0">
-                  <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
-                    <div class="px-4 py-3 border-b border-[#141b28] space-y-2">
-                      <div class="flex items-center justify-between">
-                        <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
-                        <span class="text-xs text-gray-600 tabular-nums">{Object.keys(definitions()).length}</span>
-                      </div>
-                      <input
-                        type="text"
-                        placeholder="Filter..."
-                        value={defFilter()}
-                        onInput={(e) => setDefFilter(e.currentTarget.value)}
-                        class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
-                      />
-                    </div>
-                    <div class="max-h-[calc(100vh-240px)] overflow-y-auto">
-                      <For each={Object.keys(definitions()).sort().filter(n => !defFilter() || n.toLowerCase().includes(defFilter().toLowerCase()))}>
-                        {(defName) => {
-                          const def = () => definitions()[defName];
-                          const epCount = () => endpointsForDef(defName).length;
-                          const isSelected = () => selectedDef() === defName;
-                          const isExpanded = () => expandedDefs().has(defName);
-                          return (
-                            <div>
-                              <button
-                                class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
-                                  isSelected()
-                                    ? "bg-blue-600/15 text-blue-400 font-medium"
-                                    : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
-                                }`}
-                                onClick={() => selectDef(defName)}
-                              >
-                                <svg
-                                  class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
-                                  fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
-                                  onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
-                                >
-                                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
-                                </svg>
-                                <span class="truncate flex-1 text-left">{defName}</span>
-                                <Show when={epCount() > 0}>
-                                  <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
-                                </Show>
-                              </button>
-                              <Show when={def()?.extends}>
-                                <div class="px-3 pl-8 pb-1">
-                                  <span class="text-xs text-gray-600">extends </span>
-                                  <span
-                                    class="text-xs text-purple-400 cursor-pointer hover:underline"
-                                    onClick={() => selectDef(def()!.extends!)}
-                                  >{def()!.extends}</span>
-                                </div>
-                              </Show>
-                              <Show when={isExpanded()}>
-                                <div class="pb-1">
-                                  <For each={Object.entries(def()?.properties || {})}>
-                                    {([propName, prop]) => (
-                                      <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
-                                        <span class="text-gray-400 truncate">
-                                          {propName}
-                                          <Show when={prop.required}><span class="text-red-400">*</span></Show>
-                                        </span>
-                                        <Show when={prop.ref_name}>
-                                          <span
-                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                            onClick={() => selectDef(prop.ref_name!)}
-                                          >{prop.ref_name}</span>
-                                        </Show>
-                                        <Show when={prop.is_array && prop.items_ref}>
-                                          <span
-                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                            onClick={() => selectDef(prop.items_ref!)}
-                                          >[{prop.items_ref}]</span>
-                                        </Show>
-                                        <Show when={prop.is_array && !prop.items_ref}>
-                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                        </Show>
-                                        <Show when={prop.enum_values}>
-                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                        </Show>
-                                        <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                          <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
-                                        </Show>
-                                      </div>
-                                    )}
-                                  </For>
-                                </div>
-                              </Show>
-                            </div>
-                          );
-                        }}
-                      </For>
-                    </div>
-                  </div>
-                </div>
+            {(() => {
+              const graph = () => schemaGraph();
+              const nodes = () => (graph()?.nodes || []) as string[];
+              const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
+              const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
+              const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
 
-                {/* Right panel - Detail view */}
-                <div class="flex-1 min-w-0">
-                  <Show when={!selectedDef()}>
-                    <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
-                      <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
-                    </div>
-                  </Show>
-                  <Show when={selectedDef() && definitions()[selectedDef()!]}>
-                    {(() => {
-                      const defName = () => selectedDef()!;
-                      const def = () => definitions()[defName()];
-                      const eps = () => endpointsForDef(defName());
-                      return (
-                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
-                          <div class="px-6 py-5 border-b border-[#141b28]">
-                            <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
-                            <Show when={def()?.description}>
-                              <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
-                            </Show>
-                            <Show when={def()?.extends}>
-                              <p class="text-sm text-gray-500 mt-1">
-                                Extends:{" "}
-                                <span
-                                  class="text-purple-400 cursor-pointer hover:underline"
-                                  onClick={() => selectDef(def()!.extends!)}
-                                >{def()!.extends}</span>
-                              </p>
-                            </Show>
-                          </div>
+              const filteredNodes = () => {
+                const q = schemaFilter().toLowerCase();
+                const allNodes = nodes();
+                const defKeys = Object.keys(definitions());
+                const merged = [...new Set([...allNodes, ...defKeys])];
+                const filtered = q ? merged.filter((n: string) => n.toLowerCase().includes(q)) : merged;
+                if (schemaGraphGroupBy() === "alpha") return filtered.sort();
+                return filtered;
+              };
 
-                          {/* Properties table */}
-                          <div class="px-6 py-4">
-                            <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
-                            <Show when={Object.keys(def()?.properties || {}).length === 0}>
-                              <p class="text-sm text-gray-600">No properties defined.</p>
-                            </Show>
-                            <Show when={Object.keys(def()?.properties || {}).length > 0}>
-                              <div class="rounded-lg border border-[#141b28] overflow-hidden">
-                                <table class="w-full text-left">
-                                  <thead>
-                                    <tr class="bg-[#090e1a]">
-                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
-                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
-                                      <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    <For each={Object.entries(def()?.properties || {})}>
-                                      {([propName, prop]) => (
-                                        <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
-                                          <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
-                                            {propName}
-                                            <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
-                                          </td>
-                                          <td class="py-2.5 px-4">
-                                            <Show when={prop.ref_name}>
-                                              <span
-                                                class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                                onClick={() => selectDef(prop.ref_name!)}
-                                              >{prop.ref_name}</span>
-                                            </Show>
-                                            <Show when={prop.is_array && prop.items_ref}>
-                                              <span
-                                                class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                                onClick={() => selectDef(prop.items_ref!)}
-                                              >[{prop.items_ref}]</span>
-                                            </Show>
-                                            <Show when={prop.is_array && !prop.items_ref}>
-                                              <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                            </Show>
-                                            <Show when={prop.enum_values}>
-                                              <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                            </Show>
-                                            <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                              <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
-                                                {prop.type}{prop.format ? ` (${prop.format})` : ""}
-                                              </span>
-                                            </Show>
-                                            <Show when={prop.enum_values}>
-                                              <div class="flex flex-wrap gap-1 mt-1">
-                                                <For each={prop.enum_values!}>
-                                                  {(val) => (
-                                                    <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
-                                                  )}
-                                                </For>
-                                              </div>
-                                            </Show>
-                                          </td>
-                                          <td class="py-2.5 px-4 text-center">
-                                            <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
-                                              {prop.required ? "\u2713" : "\u2014"}
-                                            </span>
-                                          </td>
-                                          <td class="py-2.5 px-4 text-sm text-gray-500">
-                                            {prop.description || "\u2014"}
-                                          </td>
-                                        </tr>
-                                      )}
-                                    </For>
-                                  </tbody>
-                                </table>
-                              </div>
-                            </Show>
-                          </div>
+              const endpointGroups = () => {
+                if (schemaGraphGroupBy() !== "endpoint") return {};
+                const groups: Record<string, string[]> = {};
+                const r = roots();
+                const assigned = new Set<string>();
+                for (const node of filteredNodes()) {
+                  if (r[node]) {
+                    for (const ep of r[node]) {
+                      const key = `${ep.method.toUpperCase()} ${ep.path}`;
+                      if (!groups[key]) groups[key] = [];
+                      groups[key].push(node);
+                      assigned.add(node);
+                    }
+                  }
+                }
+                const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
+                if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
+                return groups;
+              };
 
-                          {/* Used by endpoints */}
-                          <Show when={eps().length > 0}>
-                            <div class="px-6 py-4 border-t border-[#141b28]">
-                              <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
-                              <div class="space-y-1.5">
-                                <For each={eps()}>
-                                  {(route) => (
-                                    <div class="flex items-center gap-2">
-                                      <MethodBadge method={route.method} />
-                                      <span class="font-mono text-sm text-gray-400">{route.path}</span>
-                                    </div>
-                                  )}
-                                </For>
-                              </div>
-                            </div>
-                          </Show>
-                        </div>
-                      );
-                    })()}
-                  </Show>
-                </div>
-              </div>
-            </Show>
+              const neighborhood = createMemo(() => {
+                const sel = selectedEntity();
+                const depth = schemaGraphHopDepth();
+                if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
+                const e = edges();
 
-            {/* Entity Graph tab */}
-            <Show when={Object.keys(definitions()).length > 0 && schemaTab() === "graph"}>
-              {(() => {
-                const graph = () => schemaGraph();
-                const nodes = () => (graph()?.nodes || []) as string[];
-                const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
-                const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
-                const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
+                // Role map: focused node + two directional BFS passes
+                const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
+                roleMap[sel] = { role: 'focused', hop: 0 };
 
-                const filteredNodes = () => {
-                  const q = schemaGraphSearch().toLowerCase();
-                  const filtered = q ? nodes().filter((n: string) => n.toLowerCase().includes(q)) : nodes();
-                  if (schemaGraphGroupBy() === "alpha") return filtered.sort();
-                  return filtered;
-                };
-
-                const endpointGroups = () => {
-                  if (schemaGraphGroupBy() !== "endpoint") return {};
-                  const groups: Record<string, string[]> = {};
-                  const r = roots();
-                  const assigned = new Set<string>();
-                  for (const node of filteredNodes()) {
-                    if (r[node]) {
-                      for (const ep of r[node]) {
-                        const key = `${ep.method.toUpperCase()} ${ep.path}`;
-                        if (!groups[key]) groups[key] = [];
-                        groups[key].push(node);
-                        assigned.add(node);
+                // Outbound BFS (children): follow e[n] → targets
+                const outVisited = new Set<string>([sel]);
+                let outFrontier = new Set<string>([sel]);
+                for (let hop = 1; hop <= depth; hop++) {
+                  const next = new Set<string>();
+                  for (const n of outFrontier) {
+                    for (const t of (e[n] || [])) {
+                      if (!outVisited.has(t)) {
+                        outVisited.add(t);
+                        next.add(t);
+                        roleMap[t] = { role: 'child', hop };
                       }
                     }
                   }
-                  const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
-                  if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
-                  return groups;
-                };
+                  outFrontier = next;
+                }
 
-                const neighborhood = () => {
-                  const sel = schemaGraphSelectedEntity();
-                  const depth = schemaGraphHopDepth();
-                  if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
-                  const e = edges();
-
-                  // Role map: focused node + two directional BFS passes
-                  const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
-                  roleMap[sel] = { role: 'focused', hop: 0 };
-
-                  // Outbound BFS (children): follow e[n] → targets
-                  const outVisited = new Set<string>([sel]);
-                  let outFrontier = new Set<string>([sel]);
-                  for (let hop = 1; hop <= depth; hop++) {
-                    const next = new Set<string>();
-                    for (const n of outFrontier) {
-                      for (const t of (e[n] || [])) {
-                        if (!outVisited.has(t)) {
-                          outVisited.add(t);
-                          next.add(t);
-                          roleMap[t] = { role: 'child', hop };
-                        }
-                      }
-                    }
-                    outFrontier = next;
-                  }
-
-                  // Inbound BFS (parents): find src where e[src] includes n
-                  const inVisited = new Set<string>([sel]);
-                  let inFrontier = new Set<string>([sel]);
-                  for (let hop = 1; hop <= depth; hop++) {
-                    const next = new Set<string>();
-                    for (const n of inFrontier) {
-                      for (const [src, targets] of Object.entries(e)) {
-                        if (targets.includes(n) && !inVisited.has(src)) {
-                          inVisited.add(src);
-                          next.add(src);
-                          // Tie-break: outbound (child) wins at same hop; otherwise closer hop wins
-                          const existing = roleMap[src];
-                          if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
-                            // Only overwrite if inbound is strictly closer
-                            if (!existing) {
-                              roleMap[src] = { role: 'parent', hop };
-                            } else if (hop < existing.hop) {
-                              roleMap[src] = { role: 'parent', hop };
-                            }
-                            // At same hop, child (outbound) wins — don't overwrite
+                // Inbound BFS (parents): find src where e[src] includes n
+                const inVisited = new Set<string>([sel]);
+                let inFrontier = new Set<string>([sel]);
+                for (let hop = 1; hop <= depth; hop++) {
+                  const next = new Set<string>();
+                  for (const n of inFrontier) {
+                    for (const [src, targets] of Object.entries(e)) {
+                      if (targets.includes(n) && !inVisited.has(src)) {
+                        inVisited.add(src);
+                        next.add(src);
+                        const existing = roleMap[src];
+                        if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
+                          if (!existing) {
+                            roleMap[src] = { role: 'parent', hop };
+                          } else if (hop < existing.hop) {
+                            roleMap[src] = { role: 'parent', hop };
                           }
                         }
                       }
                     }
-                    inFrontier = next;
                   }
+                  inFrontier = next;
+                }
 
-                  // Collect all visited nodes
-                  const visited = new Set<string>([...outVisited, ...inVisited]);
-                  const allNodes = Array.from(visited);
-                  const nbEdges: Record<string, string[]> = {};
-                  for (const n of allNodes) {
-                    const targets = (e[n] || []).filter(t => visited.has(t));
-                    if (targets.length > 0) nbEdges[n] = targets;
-                  }
-                  return { nodes: allNodes, edges: nbEdges, roleMap };
-                };
+                // Collect all visited nodes
+                const visited = new Set<string>([...outVisited, ...inVisited]);
+                const allNodes = Array.from(visited);
+                const nbEdges: Record<string, string[]> = {};
+                for (const n of allNodes) {
+                  const targets = (e[n] || []).filter(t => visited.has(t));
+                  if (targets.length > 0) nbEdges[n] = targets;
+                }
+                return { nodes: allNodes, edges: nbEdges, roleMap };
+              });
 
-                const entityDetail = (node: string) => {
-                  const isSelected = () => schemaGraphSelectedEntity() === node;
-                  const isParent = () => Object.keys(roots()).includes(node);
-                  return (
-                    <div data-entity={node}>
-                      <button
-                        class={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors flex items-center gap-2 ${
-                          isSelected()
-                            ? "bg-blue-600/20 text-blue-300 ring-1 ring-blue-500/30"
-                            : isParent()
-                            ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border border-yellow-800/40"
-                            : "text-gray-300 hover:bg-white/5"
-                        }`}
-                        onClick={() => setSchemaGraphSelectedEntity(isSelected() ? null : node)}
-                      >
-                        <span class="flex-1">{node}</span>
-                        {isParent() && <span class="text-[10px] text-yellow-500 shrink-0">parent</span>}
-                        {(edges()[node]?.length || 0) > 0 && (
-                          <span class="text-[10px] text-gray-600 shrink-0">{edges()[node].length}</span>
-                        )}
-                      </button>
-                      <Show when={isSelected()}>
-                        <div class="ml-3 pl-3 border-l-2 border-blue-500/30 py-1.5 space-y-1">
-                          {roots()[node] && (
-                            <div class="text-[11px] text-gray-400">
-                              <span class="text-gray-600">Root for</span>
-                              <div class="mt-0.5 space-y-0.5">
-                                <For each={roots()[node]}>
-                                  {(e) => <div class="text-gray-400">{e.method.toUpperCase()} {e.path}</div>}
-                                </For>
-                              </div>
-                            </div>
-                          )}
-                          {edges()[node]?.length > 0 && (
-                            <div class="text-[11px]">
-                              <span class="text-gray-600">References</span>
-                              <div class="mt-0.5 space-y-0.5">
-                                <For each={edges()[node]}>
-                                  {(ref_) => (
-                                    <button
-                                      class="block text-blue-400 hover:text-blue-300"
-                                      onClick={(ev) => { ev.stopPropagation(); setSchemaGraphSelectedEntity(ref_); }}
-                                    >{ref_}</button>
-                                  )}
-                                </For>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </Show>
-                    </div>
-                  );
-                };
-
-                createEffect(() => {
-                  const sel = schemaGraphSelectedEntity();
-                  if (!sel) return;
-                  requestAnimationFrame(() => {
-                    const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
-                    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                  });
+              createEffect(() => {
+                const sel = selectedEntity();
+                if (!sel) return;
+                const id = requestAnimationFrame(() => {
+                  const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
+                  if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
                 });
+                onCleanup(() => cancelAnimationFrame(id));
+              });
 
-                return (
-                  <div>
-                    <div class="flex items-center justify-between mb-3">
-                      <p class="text-sm text-gray-500">{nodes().length} entities · {Object.keys(roots()).length} parents</p>
-                      <div class="flex items-center gap-3">
-                        <div class="flex items-center gap-1.5">
-                          <span class="text-[10px] text-gray-500">Depth</span>
-                          <input
-                            type="range" min="1" max="3" step="1"
-                            value={schemaGraphHopDepth()}
-                            onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
-                            class="w-14 h-1 accent-blue-500"
-                          />
-                          <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
-                        </div>
-                        <button
-                          class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                          onClick={() => setSchemaGraphGroupBy("alpha")}
-                        >A–Z</button>
-                        <button
-                          class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                          onClick={() => setSchemaGraphGroupBy("endpoint")}
-                        >By endpoint</button>
-                      </div>
-                    </div>
-
-                    <div class="flex gap-4" style="height: calc(100vh - 180px); min-height: 400px;">
+              return (
+                <>
+                  <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-2xl font-semibold">Schemas</h2>
+                  </div>
+                  <Show when={Object.keys(definitions()).length === 0}>
+                    <p class="text-gray-500">No definitions available. Import a spec first.</p>
+                  </Show>
+                  <Show when={Object.keys(definitions()).length > 0}>
+                    <div class="flex gap-6" style="max-width: 100%; height: calc(100vh - 140px); min-height: 400px;">
+                      {/* Left panel - Hybrid entity list */}
                       <div class="w-72 shrink-0 flex flex-col">
-                        <input
-                          type="text"
-                          placeholder="Search entities..."
-                          value={schemaGraphSearch()}
-                          onInput={(e) => setSchemaGraphSearch(e.currentTarget.value)}
-                          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-2"
-                        />
-                        <div class="flex-1 overflow-y-auto pr-1 space-y-0.5" style="scrollbar-width: thin;">
-                          <Show when={schemaGraphGroupBy() === "alpha"}>
-                            <For each={filteredNodes()}>
-                              {(node: string) => entityDetail(node)}
-                            </For>
-                          </Show>
-                          <Show when={schemaGraphGroupBy() === "endpoint"}>
-                            <For each={Object.entries(endpointGroups())}>
-                              {([endpoint, groupNodes]) => (
-                                <div class="mb-2">
-                                  <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a0f1e] z-10">{endpoint}</div>
-                                  <For each={groupNodes as string[]}>
-                                    {(node: string) => entityDetail(node)}
-                                  </For>
-                                </div>
-                              )}
-                            </For>
-                          </Show>
-                        </div>
-                      </div>
-
-                      <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
-                        <Show when={schemaGraphSelectedEntity()} fallback={
-                          <div class="w-full h-full flex items-center justify-center">
-                            <div class="text-gray-600 text-sm text-center px-4">
-                              Select an entity to see its relationship graph
+                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden flex flex-col h-full">
+                          <div class="px-4 py-3 border-b border-[#141b28] space-y-2">
+                            <div class="flex items-center justify-between">
+                              <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
+                              <span class="text-xs text-gray-600 tabular-nums">{filteredNodes().length}</span>
+                            </div>
+                            <input
+                              type="text"
+                              placeholder="Filter..."
+                              value={schemaFilter()}
+                              onInput={(e) => setSchemaFilter(e.currentTarget.value)}
+                              class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
+                            />
+                            <div class="flex gap-1">
+                              <button
+                                class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                                onClick={() => setSchemaGraphGroupBy("alpha")}
+                              >A--Z</button>
+                              <button
+                                class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                                onClick={() => setSchemaGraphGroupBy("endpoint")}
+                              >By endpoint</button>
                             </div>
                           </div>
-                        }>
-                          <ForceGraph
-                            nodes={neighborhood().nodes}
-                            edges={neighborhood().edges}
-                            roleMap={neighborhood().roleMap}
-                            arrayTargets={arrayTargets()}
-                            selectedEntity={schemaGraphSelectedEntity()}
-                            onSelectEntity={setSchemaGraphSelectedEntity}
-                          />
+                          <div class="flex-1 overflow-y-auto" style="scrollbar-width: thin;">
+                            <Show when={schemaGraphGroupBy() === "alpha"}>
+                              <For each={filteredNodes()}>
+                                {(defName: string) => {
+                                  const def = () => definitions()[defName];
+                                  const epCount = () => endpointsForDef(defName).length;
+                                  const isSelected = () => selectedEntity() === defName;
+                                  const isExpanded = () => expandedDefs().has(defName);
+                                  const isParent = () => Object.keys(roots()).includes(defName);
+                                  return (
+                                    <div data-entity={defName}>
+                                      <button
+                                        class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
+                                          isSelected()
+                                            ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
+                                            : isParent()
+                                            ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
+                                            : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                                        }`}
+                                        onClick={() => selectEntity(defName)}
+                                      >
+                                        <svg
+                                          class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
+                                          fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                                          onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
+                                        >
+                                          <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                                        </svg>
+                                        <span class="truncate flex-1 text-left">{defName}</span>
+                                        <Show when={epCount() > 0}>
+                                          <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                                        </Show>
+                                        {(edges()[defName]?.length || 0) > 0 && (
+                                          <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
+                                        )}
+                                      </button>
+                                      <Show when={def()?.extends}>
+                                        <div class="px-3 pl-8 pb-1">
+                                          <span class="text-xs text-gray-600">extends </span>
+                                          <span
+                                            class="text-xs text-purple-400 cursor-pointer hover:underline"
+                                            onClick={() => selectEntity(def()!.extends!)}
+                                          >{def()!.extends}</span>
+                                        </div>
+                                      </Show>
+                                      <Show when={isExpanded() && def()}>
+                                        <div class="pb-1">
+                                          <For each={Object.entries(def()?.properties || {})}>
+                                            {([propName, prop]) => (
+                                              <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
+                                                <span class="text-gray-400 truncate">
+                                                  {propName}
+                                                  <Show when={prop.required}><span class="text-red-400">*</span></Show>
+                                                </span>
+                                                <Show when={prop.ref_name}>
+                                                  <span
+                                                    class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                                    onClick={() => selectEntity(prop.ref_name!)}
+                                                  >{prop.ref_name}</span>
+                                                </Show>
+                                                <Show when={prop.is_array && prop.items_ref}>
+                                                  <span
+                                                    class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                                    onClick={() => selectEntity(prop.items_ref!)}
+                                                  >[{prop.items_ref}]</span>
+                                                </Show>
+                                                <Show when={prop.is_array && !prop.items_ref}>
+                                                  <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                                </Show>
+                                                <Show when={prop.enum_values}>
+                                                  <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                                </Show>
+                                                <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                                  <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
+                                                </Show>
+                                              </div>
+                                            )}
+                                          </For>
+                                        </div>
+                                      </Show>
+                                    </div>
+                                  );
+                                }}
+                              </For>
+                            </Show>
+                            <Show when={schemaGraphGroupBy() === "endpoint"}>
+                              <For each={Object.entries(endpointGroups())}>
+                                {([endpoint, groupNodes]) => (
+                                  <div class="mb-2">
+                                    <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a101d] z-10">{endpoint}</div>
+                                    <For each={groupNodes as string[]}>
+                                      {(defName: string) => {
+                                        const def = () => definitions()[defName];
+                                        const epCount = () => endpointsForDef(defName).length;
+                                        const isSelected = () => selectedEntity() === defName;
+                                        const isExpanded = () => expandedDefs().has(defName);
+                                        const isParent = () => Object.keys(roots()).includes(defName);
+                                        return (
+                                          <div data-entity={defName}>
+                                            <button
+                                              class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
+                                                isSelected()
+                                                  ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
+                                                  : isParent()
+                                                  ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
+                                                  : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                                              }`}
+                                              onClick={() => selectEntity(defName)}
+                                            >
+                                              <svg
+                                                class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
+                                                fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                                                onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
+                                              >
+                                                <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                                              </svg>
+                                              <span class="truncate flex-1 text-left">{defName}</span>
+                                              <Show when={epCount() > 0}>
+                                                <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                                              </Show>
+                                              {(edges()[defName]?.length || 0) > 0 && (
+                                                <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
+                                              )}
+                                            </button>
+                                            <Show when={def()?.extends}>
+                                              <div class="px-3 pl-8 pb-1">
+                                                <span class="text-xs text-gray-600">extends </span>
+                                                <span
+                                                  class="text-xs text-purple-400 cursor-pointer hover:underline"
+                                                  onClick={() => selectEntity(def()!.extends!)}
+                                                >{def()!.extends}</span>
+                                              </div>
+                                            </Show>
+                                            <Show when={isExpanded() && def()}>
+                                              <div class="pb-1">
+                                                <For each={Object.entries(def()?.properties || {})}>
+                                                  {([propName, prop]) => (
+                                                    <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
+                                                      <span class="text-gray-400 truncate">
+                                                        {propName}
+                                                        <Show when={prop.required}><span class="text-red-400">*</span></Show>
+                                                      </span>
+                                                      <Show when={prop.ref_name}>
+                                                        <span
+                                                          class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                                          onClick={() => selectEntity(prop.ref_name!)}
+                                                        >{prop.ref_name}</span>
+                                                      </Show>
+                                                      <Show when={prop.is_array && prop.items_ref}>
+                                                        <span
+                                                          class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                                          onClick={() => selectEntity(prop.items_ref!)}
+                                                        >[{prop.items_ref}]</span>
+                                                      </Show>
+                                                      <Show when={prop.is_array && !prop.items_ref}>
+                                                        <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                                      </Show>
+                                                      <Show when={prop.enum_values}>
+                                                        <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                                      </Show>
+                                                      <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                                        <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
+                                                      </Show>
+                                                    </div>
+                                                  )}
+                                                </For>
+                                              </div>
+                                            </Show>
+                                          </div>
+                                        );
+                                      }}
+                                    </For>
+                                  </div>
+                                )}
+                              </For>
+                            </Show>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Right panel - Detail + ForceGraph */}
+                      <div class="flex-1 min-w-0 flex flex-col gap-4 overflow-y-auto">
+                        <Show when={!selectedEntity()}>
+                          <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
+                            <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
+                          </div>
+                        </Show>
+                        <Show when={selectedEntity() && definitions()[selectedEntity()!]}>
+                          {(() => {
+                            const defName = () => selectedEntity()!;
+                            const def = () => definitions()[defName()];
+                            const eps = () => endpointsForDef(defName());
+                            return (
+                              <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
+                                <div class="px-6 py-5 border-b border-[#141b28]">
+                                  <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
+                                  <Show when={def()?.description}>
+                                    <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
+                                  </Show>
+                                  <Show when={def()?.extends}>
+                                    <p class="text-sm text-gray-500 mt-1">
+                                      Extends:{" "}
+                                      <span
+                                        class="text-purple-400 cursor-pointer hover:underline"
+                                        onClick={() => selectEntity(def()!.extends!)}
+                                      >{def()!.extends}</span>
+                                    </p>
+                                  </Show>
+                                </div>
+
+                                {/* Properties table */}
+                                <div class="px-6 py-4">
+                                  <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
+                                  <Show when={Object.keys(def()?.properties || {}).length === 0}>
+                                    <p class="text-sm text-gray-600">No properties defined.</p>
+                                  </Show>
+                                  <Show when={Object.keys(def()?.properties || {}).length > 0}>
+                                    <div class="rounded-lg border border-[#141b28] overflow-hidden">
+                                      <table class="w-full text-left">
+                                        <thead>
+                                          <tr class="bg-[#090e1a]">
+                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
+                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          <For each={Object.entries(def()?.properties || {})}>
+                                            {([propName, prop]) => (
+                                              <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
+                                                <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
+                                                  {propName}
+                                                  <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
+                                                </td>
+                                                <td class="py-2.5 px-4">
+                                                  <Show when={prop.ref_name}>
+                                                    <span
+                                                      class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                                      onClick={() => selectEntity(prop.ref_name!)}
+                                                    >{prop.ref_name}</span>
+                                                  </Show>
+                                                  <Show when={prop.is_array && prop.items_ref}>
+                                                    <span
+                                                      class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                                      onClick={() => selectEntity(prop.items_ref!)}
+                                                    >[{prop.items_ref}]</span>
+                                                  </Show>
+                                                  <Show when={prop.is_array && !prop.items_ref}>
+                                                    <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                                  </Show>
+                                                  <Show when={prop.enum_values}>
+                                                    <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                                  </Show>
+                                                  <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                                    <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
+                                                      {prop.type}{prop.format ? ` (${prop.format})` : ""}
+                                                    </span>
+                                                  </Show>
+                                                  <Show when={prop.enum_values}>
+                                                    <div class="flex flex-wrap gap-1 mt-1">
+                                                      <For each={prop.enum_values!}>
+                                                        {(val) => (
+                                                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
+                                                        )}
+                                                      </For>
+                                                    </div>
+                                                  </Show>
+                                                </td>
+                                                <td class="py-2.5 px-4 text-center">
+                                                  <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
+                                                    {prop.required ? "\u2713" : "\u2014"}
+                                                  </span>
+                                                </td>
+                                                <td class="py-2.5 px-4 text-sm text-gray-500">
+                                                  {prop.description || "\u2014"}
+                                                </td>
+                                              </tr>
+                                            )}
+                                          </For>
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </Show>
+                                </div>
+
+                                {/* Used by endpoints */}
+                                <Show when={eps().length > 0}>
+                                  <div class="px-6 py-4 border-t border-[#141b28]">
+                                    <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
+                                    <div class="space-y-1.5">
+                                      <For each={eps()}>
+                                        {(route) => (
+                                          <div class="flex items-center gap-2">
+                                            <MethodBadge method={route.method} />
+                                            <span class="font-mono text-sm text-gray-400">{route.path}</span>
+                                          </div>
+                                        )}
+                                      </For>
+                                    </div>
+                                  </div>
+                                </Show>
+                              </div>
+                            );
+                          })()}
+                        </Show>
+
+                        {/* ForceGraph */}
+                        <Show when={selectedEntity()}>
+                          <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
+                            <div class="flex items-center gap-1.5">
+                              <span class="text-[10px] text-gray-500">Depth</span>
+                              <input
+                                type="range" min="1" max="3" step="1"
+                                value={schemaGraphHopDepth()}
+                                onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
+                                class="w-14 h-1 accent-blue-500"
+                              />
+                              <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
+                            </div>
+                          </div>
+                          <div class="bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
+                            <ForceGraph
+                              nodes={neighborhood().nodes}
+                              edges={neighborhood().edges}
+                              roleMap={neighborhood().roleMap}
+                              arrayTargets={arrayTargets()}
+                              selectedEntity={selectedEntity()}
+                              onSelectEntity={setSelectedEntity}
+                            />
+                          </div>
                         </Show>
                       </div>
                     </div>
-                  </div>
-                );
-              })()}
-            </Show>
+                  </Show>
+                </>
+              );
+            })()}
           </Show>
 
           {/* === Recipes === */}
