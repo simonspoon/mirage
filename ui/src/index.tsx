@@ -103,6 +103,7 @@ function App() {
   const [graphLoading, setGraphLoading] = createSignal(false);
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
+  const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
 
   // Schema state
   const [definitions, setDefinitions] = createSignal<Record<string, DefinitionInfo>>({});
@@ -378,6 +379,54 @@ function App() {
     }
     setError(null);
     setLoading(true);
+
+    const editId = editingRecipeId();
+    if (editId !== null) {
+      // Edit mode: PUT to update, no activation
+      setSaveActivatePhase("saving");
+      try {
+        const res = await fetch(`/_api/admin/recipes/${editId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            spec_source: recipeSpecText().trim(),
+            endpoints,
+            seed_count: recipeSeedCount(),
+            shared_pools: recipeSharedPools(),
+            quantity_configs: recipeQuantityConfigs(),
+          }),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+          setLoading(false);
+          setSaveActivatePhase("idle");
+          return;
+        }
+        // Reset wizard state
+        setRecipeCreating(false);
+        setRecipeSpecText("");
+        setRecipeName("");
+        setRecipeSeedCount(10);
+        setRecipeAvailableEndpoints([]);
+        setRecipeSelectedEndpoints([]);
+        setRecipeStep("paste");
+        setEntityGraph(null);
+        setRecipeSharedPools({});
+        setRecipeQuantityConfigs({});
+        setEditingRecipeId(null);
+        setSaveActivatePhase("idle");
+        await refreshRecipes();
+      } catch (e: any) {
+        setError(String(e?.message || e));
+        setSaveActivatePhase("idle");
+      }
+      setLoading(false);
+      return;
+    }
+
+    // Create mode: POST then activate
     setSaveActivatePhase("saving");
     setSavedRecipeId(null);
 
@@ -504,6 +553,56 @@ function App() {
     }
   };
 
+  const handleRecipeEdit = async (recipe: Recipe) => {
+    setError(null);
+    setLoading(true);
+    try {
+      // Import the spec to get available endpoints
+      const res = await fetch("/_api/admin/import", {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: recipe.spec_source,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        setLoading(false);
+        return;
+      }
+      const data = await res.json();
+      const availableEps: Endpoint[] = data.endpoints;
+
+      // Parse selected endpoints from recipe
+      let selectedEps: Endpoint[] = [];
+      try { selectedEps = JSON.parse(recipe.selected_endpoints); } catch { /* empty */ }
+
+      // Map to boolean array: true if the available endpoint is in the selected list
+      const selectedFlags = availableEps.map((ep) =>
+        selectedEps.some((sel) => sel.method === ep.method && sel.path === ep.path)
+      );
+
+      // Parse shared_pools and quantity_configs
+      let sharedPools: Record<string, {is_shared: boolean, pool_size: number}> = {};
+      try { sharedPools = JSON.parse(recipe.shared_pools); } catch { /* empty */ }
+      let quantityConfigs: Record<string, {min: number, max: number}> = {};
+      try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
+
+      setRecipeSpecText(recipe.spec_source);
+      setRecipeAvailableEndpoints(availableEps);
+      setRecipeSelectedEndpoints(selectedFlags);
+      setRecipeName(recipe.name);
+      setRecipeSeedCount(recipe.seed_count);
+      setRecipeSharedPools(sharedPools);
+      setRecipeQuantityConfigs(quantityConfigs);
+      setEditingRecipeId(recipe.id);
+      setRecipeStep("select");
+      setRecipeCreating(true);
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+    setLoading(false);
+  };
+
   const handleRecipeCancelCreate = () => {
     setRecipeCreating(false);
     setRecipeSpecText("");
@@ -515,6 +614,7 @@ function App() {
     setEntityGraph(null);
     setRecipeSharedPools({});
     setRecipeQuantityConfigs({});
+    setEditingRecipeId(null);
     setError(null);
   };
 
@@ -1321,7 +1421,9 @@ function App() {
                         ? saveActivatePhase() === "saving"
                           ? "Saving..."
                           : "Activating..."
-                        : "Save & Activate"}
+                        : editingRecipeId() !== null
+                          ? "Save"
+                          : "Save & Activate"}
                     </button>
                     <button
                       class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-50"
@@ -1362,6 +1464,13 @@ function App() {
                               disabled={loading()}
                             >
                               Activate
+                            </button>
+                            <button
+                              class="px-3 py-1.5 text-xs font-medium text-blue-400 hover:text-blue-300 border border-blue-500/20 hover:border-blue-500/40 rounded-md transition-colors disabled:opacity-50"
+                              onClick={() => handleRecipeEdit(recipe)}
+                              disabled={loading()}
+                            >
+                              Edit
                             </button>
                             <button
                               class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"
