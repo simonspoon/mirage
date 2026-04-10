@@ -912,7 +912,7 @@ function App() {
 
       {/* Main */}
       <main class="flex-1 h-screen flex flex-col overflow-hidden">
-        <div class="flex-1 min-h-0 flex flex-col px-8 pt-8 pb-3">
+        <div class="flex-1 min-h-0 flex flex-col px-8 pt-8 pb-3 overflow-y-auto">
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error()}
