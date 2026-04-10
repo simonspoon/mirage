@@ -1288,6 +1288,7 @@ function App() {
               const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
               const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
               const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
+              const [rightTab, setRightTab] = createSignal<"details" | "graph">("details");
 
               const filteredNodes = () => {
                 const q = schemaFilter().toLowerCase();
@@ -1607,158 +1608,184 @@ function App() {
                         </div>
                       </div>
 
-                      {/* Right panel - Detail + ForceGraph */}
-                      <div class="flex-1 min-w-0 flex flex-col gap-4 overflow-y-auto">
+                      {/* Right panel - Detail / Graph tabs */}
+                      <div class="flex-1 min-w-0 flex flex-col overflow-y-auto">
+                        {/* Empty state — no tabs */}
                         <Show when={!selectedEntity()}>
                           <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
                             <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
                           </div>
                         </Show>
-                        <Show when={selectedEntity() && definitions()[selectedEntity()!]}>
-                          {(() => {
-                            const defName = () => selectedEntity()!;
-                            const def = () => definitions()[defName()];
-                            const eps = () => endpointsForDef(defName());
-                            return (
-                              <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
-                                <div class="px-6 py-5 border-b border-[#141b28]">
-                                  <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
-                                  <Show when={def()?.description}>
-                                    <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
-                                  </Show>
-                                  <Show when={def()?.extends}>
-                                    <p class="text-sm text-gray-500 mt-1">
-                                      Extends:{" "}
-                                      <span
-                                        class="text-purple-400 cursor-pointer hover:underline"
-                                        onClick={() => selectEntity(def()!.extends!)}
-                                      >{def()!.extends}</span>
-                                    </p>
-                                  </Show>
-                                </div>
 
-                                {/* Properties table */}
-                                <div class="px-6 py-4">
-                                  <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
-                                  <Show when={Object.keys(def()?.properties || {}).length === 0}>
-                                    <p class="text-sm text-gray-600">No properties defined.</p>
-                                  </Show>
-                                  <Show when={Object.keys(def()?.properties || {}).length > 0}>
-                                    <div class="rounded-lg border border-[#141b28] overflow-hidden">
-                                      <table class="w-full text-left">
-                                        <thead>
-                                          <tr class="bg-[#090e1a]">
-                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
-                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
-                                            <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody>
-                                          <For each={Object.entries(def()?.properties || {})}>
-                                            {([propName, prop]) => (
-                                              <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
-                                                <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
-                                                  {propName}
-                                                  <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
-                                                </td>
-                                                <td class="py-2.5 px-4">
-                                                  <Show when={prop.ref_name}>
-                                                    <span
-                                                      class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                                      onClick={() => selectEntity(prop.ref_name!)}
-                                                    >{prop.ref_name}</span>
-                                                  </Show>
-                                                  <Show when={prop.is_array && prop.items_ref}>
-                                                    <span
-                                                      class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                                      onClick={() => selectEntity(prop.items_ref!)}
-                                                    >[{prop.items_ref}]</span>
-                                                  </Show>
-                                                  <Show when={prop.is_array && !prop.items_ref}>
-                                                    <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                                  </Show>
-                                                  <Show when={prop.enum_values}>
-                                                    <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                                  </Show>
-                                                  <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                                    <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
-                                                      {prop.type}{prop.format ? ` (${prop.format})` : ""}
-                                                    </span>
-                                                  </Show>
-                                                  <Show when={prop.enum_values}>
-                                                    <div class="flex flex-wrap gap-1 mt-1">
-                                                      <For each={prop.enum_values!}>
-                                                        {(val) => (
-                                                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
-                                                        )}
-                                                      </For>
-                                                    </div>
-                                                  </Show>
-                                                </td>
-                                                <td class="py-2.5 px-4 text-center">
-                                                  <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
-                                                    {prop.required ? "\u2713" : "\u2014"}
-                                                  </span>
-                                                </td>
-                                                <td class="py-2.5 px-4 text-sm text-gray-500">
-                                                  {prop.description || "\u2014"}
-                                                </td>
-                                              </tr>
-                                            )}
-                                          </For>
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                  </Show>
-                                </div>
-
-                                {/* Used by endpoints */}
-                                <Show when={eps().length > 0}>
-                                  <div class="px-6 py-4 border-t border-[#141b28]">
-                                    <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
-                                    <div class="space-y-1.5">
-                                      <For each={eps()}>
-                                        {(route) => (
-                                          <div class="flex items-center gap-2">
-                                            <MethodBadge method={route.method} />
-                                            <span class="font-mono text-sm text-gray-400">{route.path}</span>
-                                          </div>
-                                        )}
-                                      </For>
-                                    </div>
-                                  </div>
-                                </Show>
-                              </div>
-                            );
-                          })()}
-                        </Show>
-
-                        {/* ForceGraph */}
+                        {/* Tabbed content — only when entity selected */}
                         <Show when={selectedEntity()}>
-                          <div class="flex items-center justify-between mb-1">
-                            <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
-                            <div class="flex items-center gap-1.5">
-                              <span class="text-[10px] text-gray-500">Depth</span>
-                              <input
-                                type="range" min="1" max="3" step="1"
-                                value={schemaGraphHopDepth()}
-                                onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
-                                class="w-14 h-1 accent-blue-500"
-                              />
-                              <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
+                          {/* Tab bar */}
+                          <div class="flex items-center gap-1 mb-3 shrink-0">
+                            <button
+                              class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                                rightTab() === "details"
+                                  ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                                  : "text-gray-400 hover:text-gray-200"
+                              }`}
+                              onClick={() => setRightTab("details")}
+                            >Details</button>
+                            <button
+                              class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                                rightTab() === "graph"
+                                  ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                                  : "text-gray-400 hover:text-gray-200"
+                              }`}
+                              onClick={() => setRightTab("graph")}
+                            >Graph</button>
+                          </div>
+
+                          {/* Details tab content */}
+                          <Show when={rightTab() === "details" && definitions()[selectedEntity()!]}>
+                            {(() => {
+                              const defName = () => selectedEntity()!;
+                              const def = () => definitions()[defName()];
+                              const eps = () => endpointsForDef(defName());
+                              return (
+                                <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
+                                  <div class="px-6 py-5 border-b border-[#141b28]">
+                                    <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
+                                    <Show when={def()?.description}>
+                                      <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
+                                    </Show>
+                                    <Show when={def()?.extends}>
+                                      <p class="text-sm text-gray-500 mt-1">
+                                        Extends:{" "}
+                                        <span
+                                          class="text-purple-400 cursor-pointer hover:underline"
+                                          onClick={() => selectEntity(def()!.extends!)}
+                                        >{def()!.extends}</span>
+                                      </p>
+                                    </Show>
+                                  </div>
+
+                                  {/* Properties table */}
+                                  <div class="px-6 py-4">
+                                    <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
+                                    <Show when={Object.keys(def()?.properties || {}).length === 0}>
+                                      <p class="text-sm text-gray-600">No properties defined.</p>
+                                    </Show>
+                                    <Show when={Object.keys(def()?.properties || {}).length > 0}>
+                                      <div class="rounded-lg border border-[#141b28] overflow-hidden">
+                                        <table class="w-full text-left">
+                                          <thead>
+                                            <tr class="bg-[#090e1a]">
+                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
+                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            <For each={Object.entries(def()?.properties || {})}>
+                                              {([propName, prop]) => (
+                                                <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
+                                                  <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
+                                                    {propName}
+                                                    <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
+                                                  </td>
+                                                  <td class="py-2.5 px-4">
+                                                    <Show when={prop.ref_name}>
+                                                      <span
+                                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                                        onClick={() => selectEntity(prop.ref_name!)}
+                                                      >{prop.ref_name}</span>
+                                                    </Show>
+                                                    <Show when={prop.is_array && prop.items_ref}>
+                                                      <span
+                                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                                        onClick={() => selectEntity(prop.items_ref!)}
+                                                      >[{prop.items_ref}]</span>
+                                                    </Show>
+                                                    <Show when={prop.is_array && !prop.items_ref}>
+                                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                                    </Show>
+                                                    <Show when={prop.enum_values}>
+                                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                                    </Show>
+                                                    <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                                      <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
+                                                        {prop.type}{prop.format ? ` (${prop.format})` : ""}
+                                                      </span>
+                                                    </Show>
+                                                    <Show when={prop.enum_values}>
+                                                      <div class="flex flex-wrap gap-1 mt-1">
+                                                        <For each={prop.enum_values!}>
+                                                          {(val) => (
+                                                            <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
+                                                          )}
+                                                        </For>
+                                                      </div>
+                                                    </Show>
+                                                  </td>
+                                                  <td class="py-2.5 px-4 text-center">
+                                                    <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
+                                                      {prop.required ? "\u2713" : "\u2014"}
+                                                    </span>
+                                                  </td>
+                                                  <td class="py-2.5 px-4 text-sm text-gray-500">
+                                                    {prop.description || "\u2014"}
+                                                  </td>
+                                                </tr>
+                                              )}
+                                            </For>
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    </Show>
+                                  </div>
+
+                                  {/* Used by endpoints */}
+                                  <Show when={eps().length > 0}>
+                                    <div class="px-6 py-4 border-t border-[#141b28]">
+                                      <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
+                                      <div class="space-y-1.5">
+                                        <For each={eps()}>
+                                          {(route) => (
+                                            <div class="flex items-center gap-2">
+                                              <MethodBadge method={route.method} />
+                                              <span class="font-mono text-sm text-gray-400">{route.path}</span>
+                                            </div>
+                                          )}
+                                        </For>
+                                      </div>
+                                    </div>
+                                  </Show>
+                                </div>
+                              );
+                            })()}
+                          </Show>
+
+                          {/* Graph tab content */}
+                          <Show when={rightTab() === "graph"}>
+                            <div class="flex items-center justify-between mb-1">
+                              <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
+                              <div class="flex items-center gap-1.5">
+                                <span class="text-[10px] text-gray-500">Depth</span>
+                                <input
+                                  type="range" min="1" max="3" step="1"
+                                  value={schemaGraphHopDepth()}
+                                  onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
+                                  class="w-14 h-1 accent-blue-500"
+                                />
+                                <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
+                              </div>
                             </div>
-                          </div>
-                          <div class="bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
-                            <ForceGraph
-                              nodes={neighborhood().nodes}
-                              edges={neighborhood().edges}
-                              roleMap={neighborhood().roleMap}
-                              arrayTargets={arrayTargets()}
-                              selectedEntity={selectedEntity()}
-                              onSelectEntity={setSelectedEntity}
-                            />
-                          </div>
+                            <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
+                              <ForceGraph
+                                nodes={neighborhood().nodes}
+                                edges={neighborhood().edges}
+                                roleMap={neighborhood().roleMap}
+                                arrayTargets={arrayTargets()}
+                                selectedEntity={selectedEntity()}
+                                onSelectEntity={setSelectedEntity}
+                              />
+                            </div>
+                          </Show>
                         </Show>
                       </div>
                     </div>
