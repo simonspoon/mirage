@@ -12,7 +12,8 @@ interface SimNode {
   fy: number | null;
   hw: number; // half-width of pill
   hh: number; // half-height of pill
-  isRoot: boolean;
+  role: 'focused' | 'parent' | 'child';
+  hop: number;
   isArray: boolean;
 }
 
@@ -23,7 +24,8 @@ interface RenderNode {
   y: number;
   hw: number;
   hh: number;
-  isRoot: boolean;
+  role: 'focused' | 'parent' | 'child';
+  hop: number;
   isArray: boolean;
   pinned: boolean;
 }
@@ -43,7 +45,7 @@ interface Particle {
 interface ForceGraphProps {
   nodes: string[];
   edges: Record<string, string[]>;
-  roots: Record<string, { method: string; path: string }[]>;
+  roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }>;
   arrayTargets: string[];
   selectedEntity: string | null;
   onSelectEntity: (name: string | null) => void;
@@ -114,17 +116,19 @@ export default function ForceGraph(props: ForceGraphProps) {
     }
 
     const existing = new Map(simNodes.map(n => [n.id, n]));
-    const rootSet = new Set(Object.keys(props.roots));
+    const roleMap = props.roleMap;
     const arraySet = new Set(props.arrayTargets);
 
     simNodes = nodeNames.map((name, i) => {
       const prev = existing.get(name);
-      const fontSize = rootSet.has(name) ? 12 : 11;
+      const info = roleMap[name] || { role: 'child' as const, hop: 99 };
+      const fontSize = info.role === 'parent' ? 12 : 11;
       const hw = estimateLabelWidth(name, fontSize) / 2;
       if (prev) {
         prev.hw = hw;
         prev.hh = PILL_HH;
-        prev.isRoot = rootSet.has(name);
+        prev.role = info.role;
+        prev.hop = info.hop;
         prev.isArray = arraySet.has(name);
         return prev;
       }
@@ -137,7 +141,8 @@ export default function ForceGraph(props: ForceGraphProps) {
         vx: 0, vy: 0,
         fx: null, fy: null,
         hw, hh: PILL_HH,
-        isRoot: rootSet.has(name),
+        role: info.role,
+        hop: info.hop,
         isArray: arraySet.has(name),
       };
     });
@@ -202,6 +207,16 @@ export default function ForceGraph(props: ForceGraphProps) {
       n.vy += (cy - n.y) * 0.004 * alpha;
     }
 
+    // Vertical bias: parents drift up, children drift down
+    for (const n of nodes) {
+      if (n.fx != null) continue;
+      if (n.role === 'parent') {
+        n.vy -= 0.003 * alpha;
+      } else if (n.role === 'child') {
+        n.vy += 0.003 * alpha;
+      }
+    }
+
     // All pairs: repulsion (1/r) + spring for connected pairs
     // ALL forces × alpha so equilibrium never shifts
     for (let i = 0; i < nodes.length; i++) {
@@ -261,7 +276,7 @@ export default function ForceGraph(props: ForceGraphProps) {
     // --- Build render snapshots (new objects so SolidJS detects changes) ---
     const nodeSnaps: RenderNode[] = nodes.map(n => ({
       id: n.id, x: n.x, y: n.y, hw: n.hw, hh: n.hh,
-      isRoot: n.isRoot, isArray: n.isArray, pinned: n.fx != null,
+      role: n.role, hop: n.hop, isArray: n.isArray, pinned: n.fx != null,
     }));
 
     const edgeSnaps: RenderEdge[] = linkList.map(l => {
@@ -512,30 +527,37 @@ export default function ForceGraph(props: ForceGraphProps) {
           {/* Nodes */}
           <Index each={renderNodes()}>
             {(node) => {
-              const isSel = () => node().id === sel();
-              const isConnected = () => {
-                if (!sel()) return false;
-                const e = props.edges;
-                return (e[sel()!] || []).includes(node().id) ||
-                  (e[node().id] || []).includes(sel()!);
-              };
-              const dimmed = () => sel() != null && !isSel() && !isConnected();
+              const nodeRole = () => node().role;
+              const nodeHop = () => node().hop;
 
-              const fillColor = () =>
-                isSel() ? "#1e3a5f" :
-                node().isRoot ? "#2d1f0e" : "#0f1d33";
-              const strokeColor = () =>
-                isSel() ? "#3b82f6" :
-                node().isRoot ? "#a16207" : "#1d4ed8";
-              const textColor = () =>
-                isSel() ? "#93c5fd" :
-                node().isRoot ? "#fbbf24" : "#60a5fa";
+              const fillColor = () => {
+                switch (nodeRole()) {
+                  case 'focused': return "#1e3a5f";
+                  case 'parent': return "#2d1f0e";
+                  case 'child': return "#0f1d33";
+                }
+              };
+              const strokeColor = () => {
+                switch (nodeRole()) {
+                  case 'focused': return "#3b82f6";
+                  case 'parent': return "#a16207";
+                  case 'child': return "#1d4ed8";
+                }
+              };
+              const textColor = () => {
+                switch (nodeRole()) {
+                  case 'focused': return "#93c5fd";
+                  case 'parent': return "#fbbf24";
+                  case 'child': return "#60a5fa";
+                }
+              };
+              const nodeOpacity = () => nodeHop() >= 2 ? 0.45 : 1;
 
               return (
                 <g
                   style={{ cursor: "pointer", "pointer-events": "all" }}
-                  opacity={dimmed() ? 0.25 : 1}
-                  filter={isSel() ? "url(#glow-strong)" : undefined}
+                  opacity={nodeOpacity()}
+                  filter={nodeRole() === 'focused' ? "url(#glow-strong)" : undefined}
                 >
                   {/* Outer border for array nodes (double-line effect) */}
                   <Show when={node().isArray}>
@@ -546,7 +568,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                       fill="none"
                       stroke={strokeColor()}
                       stroke-width={0.8}
-                      opacity={isSel() ? 1 : 0.7}
+                      opacity={nodeRole() === 'focused' ? 1 : 0.7}
                     />
                   </Show>
                   <rect
@@ -555,7 +577,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                     rx={6} ry={6}
                     fill={fillColor()}
                     stroke={strokeColor()}
-                    stroke-width={isSel() ? 1.8 : 0.8}
+                    stroke-width={nodeRole() === 'focused' ? 1.8 : 0.8}
                   />
                   <circle
                     cx={node().x - node().hw + 9} cy={node().y}
@@ -565,7 +587,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                     x={node().x + 4} y={node().y + 4}
                     text-anchor="middle"
                     fill={textColor()}
-                    font-size={node().isRoot ? 12 : 11}
+                    font-size={node().role === 'parent' ? 12 : 11}
                     font-family="ui-monospace, SFMono-Regular, monospace"
                     style="pointer-events: none; user-select: none;"
                   >{node().id}</text>

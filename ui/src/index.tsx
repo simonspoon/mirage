@@ -1500,29 +1500,66 @@ function App() {
                 const neighborhood = () => {
                   const sel = schemaGraphSelectedEntity();
                   const depth = schemaGraphHopDepth();
-                  if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]> };
+                  if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
                   const e = edges();
-                  const visited = new Set<string>([sel]);
-                  let frontier = new Set<string>([sel]);
-                  for (let hop = 0; hop < depth; hop++) {
+
+                  // Role map: focused node + two directional BFS passes
+                  const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
+                  roleMap[sel] = { role: 'focused', hop: 0 };
+
+                  // Outbound BFS (children): follow e[n] → targets
+                  const outVisited = new Set<string>([sel]);
+                  let outFrontier = new Set<string>([sel]);
+                  for (let hop = 1; hop <= depth; hop++) {
                     const next = new Set<string>();
-                    for (const n of frontier) {
+                    for (const n of outFrontier) {
                       for (const t of (e[n] || [])) {
-                        if (!visited.has(t)) { visited.add(t); next.add(t); }
-                      }
-                      for (const [src, targets] of Object.entries(e)) {
-                        if (targets.includes(n) && !visited.has(src)) { visited.add(src); next.add(src); }
+                        if (!outVisited.has(t)) {
+                          outVisited.add(t);
+                          next.add(t);
+                          roleMap[t] = { role: 'child', hop };
+                        }
                       }
                     }
-                    frontier = next;
+                    outFrontier = next;
                   }
+
+                  // Inbound BFS (parents): find src where e[src] includes n
+                  const inVisited = new Set<string>([sel]);
+                  let inFrontier = new Set<string>([sel]);
+                  for (let hop = 1; hop <= depth; hop++) {
+                    const next = new Set<string>();
+                    for (const n of inFrontier) {
+                      for (const [src, targets] of Object.entries(e)) {
+                        if (targets.includes(n) && !inVisited.has(src)) {
+                          inVisited.add(src);
+                          next.add(src);
+                          // Tie-break: outbound (child) wins at same hop; otherwise closer hop wins
+                          const existing = roleMap[src];
+                          if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
+                            // Only overwrite if inbound is strictly closer
+                            if (!existing) {
+                              roleMap[src] = { role: 'parent', hop };
+                            } else if (hop < existing.hop) {
+                              roleMap[src] = { role: 'parent', hop };
+                            }
+                            // At same hop, child (outbound) wins — don't overwrite
+                          }
+                        }
+                      }
+                    }
+                    inFrontier = next;
+                  }
+
+                  // Collect all visited nodes
+                  const visited = new Set<string>([...outVisited, ...inVisited]);
                   const allNodes = Array.from(visited);
                   const nbEdges: Record<string, string[]> = {};
                   for (const n of allNodes) {
                     const targets = (e[n] || []).filter(t => visited.has(t));
                     if (targets.length > 0) nbEdges[n] = targets;
                   }
-                  return { nodes: allNodes, edges: nbEdges };
+                  return { nodes: allNodes, edges: nbEdges, roleMap };
                 };
 
                 const entityDetail = (node: string) => {
@@ -1655,7 +1692,7 @@ function App() {
                           <ForceGraph
                             nodes={neighborhood().nodes}
                             edges={neighborhood().edges}
-                            roots={roots()}
+                            roleMap={neighborhood().roleMap}
                             arrayTargets={arrayTargets()}
                             selectedEntity={schemaGraphSelectedEntity()}
                             onSelectEntity={setSchemaGraphSelectedEntity}
