@@ -911,8 +911,8 @@ function App() {
       </nav>
 
       {/* Main */}
-      <main class="flex-1 h-screen overflow-y-auto">
-        <div class="p-8 pb-2">
+      <main class="flex-1 h-screen flex flex-col overflow-hidden">
+        <div class="flex-1 min-h-0 flex flex-col px-8 pt-8 pb-3">
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error()}
@@ -1393,15 +1393,15 @@ function App() {
               });
 
               return (
-                <>
-                  <div class="flex items-center justify-between mb-6">
+                <div class="flex flex-col flex-1 min-h-0">
+                  <div class="flex items-center justify-between mb-6 shrink-0">
                     <h2 class="text-2xl font-semibold">Schemas</h2>
                   </div>
                   <Show when={Object.keys(definitions()).length === 0}>
                     <p class="text-gray-500">No definitions available. Import a spec first.</p>
                   </Show>
                   <Show when={Object.keys(definitions()).length > 0}>
-                    <div class="flex gap-6" style="max-width: 100%; height: calc(100vh - 140px); min-height: 400px;">
+                    <div class="flex gap-6 flex-1 min-h-0">
                       {/* Left panel - Hybrid entity list */}
                       <div class="w-72 shrink-0 flex flex-col">
                         <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden flex flex-col h-full">
@@ -1646,7 +1646,7 @@ function App() {
                               const def = () => definitions()[defName()];
                               const eps = () => endpointsForDef(defName());
                               return (
-                                <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
+                                <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-y-auto">
                                   <div class="px-6 py-5 border-b border-[#141b28]">
                                     <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
                                     <Show when={def()?.description}>
@@ -1790,7 +1790,7 @@ function App() {
                       </div>
                     </div>
                   </Show>
-                </>
+                </div>
               );
             })()}
           </Show>
