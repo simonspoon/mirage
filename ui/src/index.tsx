@@ -1,6 +1,7 @@
 import { render } from "solid-js/web";
 import { createSignal, onMount, onCleanup, For, Show, createEffect } from "solid-js";
 import "./index.css";
+import ForceGraph from "./ForceGraph";
 
 interface Endpoint {
   method: string;
@@ -724,7 +725,38 @@ function App() {
       {/* Sidebar */}
       <nav class="w-52 shrink-0 bg-gray-900 border-r border-gray-800 flex flex-col sticky top-0 h-screen">
         <div class="p-5 pb-6">
-          <h1 class="text-lg font-semibold tracking-tight">Mirage</h1>
+          <h1 class="text-2xl font-semibold tracking-tight flex items-center gap-2.5">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges" class="w-9 h-9 shrink-0">
+              <rect width="16" height="16" fill="#0d1117" rx="3"/>
+              <rect x="7" y="1" width="1" height="1" fill="#fde68a"/>
+              <rect x="6" y="2" width="1" height="1" fill="#fbbf24"/>
+              <rect x="7" y="2" width="1" height="1" fill="#f59e0b"/>
+              <rect x="5" y="3" width="1" height="1" fill="#fbbf24"/>
+              <rect x="6" y="3" width="2" height="1" fill="#f59e0b"/>
+              <rect x="5" y="4" width="4" height="1" fill="#f59e0b"/>
+              <rect x="5" y="4" width="1" height="1" fill="#fbbf24"/>
+              <rect x="6" y="5" width="4" height="1" fill="#f59e0b"/>
+              <rect x="7" y="5" width="1" height="1" fill="#fbbf24"/>
+              <rect x="7" y="6" width="4" height="1" fill="#f59e0b"/>
+              <rect x="6" y="7" width="4" height="1" fill="#f59e0b"/>
+              <rect x="6" y="7" width="1" height="1" fill="#92400e"/>
+              <rect x="5" y="8" width="5" height="1" fill="#f59e0b"/>
+              <rect x="5" y="8" width="1" height="1" fill="#92400e"/>
+              <rect x="4" y="9" width="5" height="1" fill="#f59e0b"/>
+              <rect x="4" y="9" width="1" height="1" fill="#92400e"/>
+              <rect x="8" y="9" width="1" height="1" fill="#92400e"/>
+              <rect x="5" y="10" width="5" height="1" fill="#f59e0b"/>
+              <rect x="9" y="10" width="1" height="1" fill="#92400e"/>
+              <rect x="6" y="11" width="4" height="1" fill="#f59e0b"/>
+              <rect x="7" y="12" width="2" height="1" fill="#92400e"/>
+              <rect x="8" y="13" width="1" height="1" fill="#92400e"/>
+              <rect x="9" y="1" width="1" height="1" fill="#fde68a"/>
+              <rect x="3" y="6" width="1" height="1" fill="#fde68a"/>
+              <rect x="12" y="8" width="1" height="1" fill="#fde68a"/>
+              <rect x="5" y="14" width="1" height="1" fill="#fde68a"/>
+            </svg>
+            Mirage
+          </h1>
           <Show when={specInfo() && state() === "running"}>
             <p class="text-xs text-gray-500 mt-0.5">{specInfo()?.title} v{specInfo()?.version}</p>
           </Show>
@@ -1393,70 +1425,25 @@ function App() {
                     return groups;
                   };
 
-                  // Neighborhood graph: selected entity + 2 hops
+                  // 1-hop neighborhood for force graph (direct connections only)
                   const neighborhood = () => {
                     const sel = graphSelectedEntity();
-                    if (!sel) return { nodes: [] as string[], links: [] as {source: string, target: string}[] };
+                    if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]> };
                     const e = edges();
-                    const hop1 = new Set(e[sel] || []);
-                    const hop2 = new Set<string>();
-                    for (const n of hop1) {
-                      for (const n2 of (e[n] || [])) {
-                        if (n2 !== sel) hop2.add(n2);
-                      }
-                    }
-                    // Also include nodes that reference the selected entity (reverse edges)
+                    const neighbors = new Set<string>();
+                    // Outbound from selected
+                    for (const t of (e[sel] || [])) neighbors.add(t);
+                    // Inbound to selected
                     for (const [src, targets] of Object.entries(e)) {
-                      if (targets.includes(sel) && src !== sel) hop1.add(src);
+                      if (targets.includes(sel) && src !== sel) neighbors.add(src);
                     }
-                    const allNodes = [sel, ...Array.from(hop1), ...Array.from(hop2).filter(n => !hop1.has(n))];
-                    const links: {source: string, target: string}[] = [];
+                    const allNodes = [sel, ...Array.from(neighbors)];
+                    const nbEdges: Record<string, string[]> = {};
                     for (const n of allNodes) {
-                      for (const t of (e[n] || [])) {
-                        if (allNodes.includes(t)) links.push({source: n, target: t});
-                      }
+                      const targets = (e[n] || []).filter(t => allNodes.includes(t));
+                      if (targets.length > 0) nbEdges[n] = targets;
                     }
-                    return { nodes: allNodes, links };
-                  };
-
-                  // Radial layout for neighborhood
-                  const layoutNodes = () => {
-                    const nb = neighborhood();
-                    if (nb.nodes.length === 0) return [];
-                    const sel = graphSelectedEntity()!;
-                    const e = edges();
-                    const hop1 = new Set([...(e[sel] || [])]);
-                    // Also reverse edges
-                    for (const [src, targets] of Object.entries(e)) {
-                      if (targets.includes(sel)) hop1.add(src);
-                    }
-                    const cx = 250, cy = 200;
-                    const positioned: {name: string, x: number, y: number, hop: number}[] = [];
-                    positioned.push({name: sel, x: cx, y: cy, hop: 0});
-                    const ring1 = nb.nodes.filter(n => n !== sel && hop1.has(n));
-                    const ring2 = nb.nodes.filter(n => n !== sel && !hop1.has(n));
-                    const r1 = Math.min(150, 60 + ring1.length * 8);
-                    const r2 = Math.min(220, 100 + ring2.length * 6);
-                    ring1.forEach((n, i) => {
-                      const angle = (2 * Math.PI * i) / ring1.length - Math.PI / 2;
-                      positioned.push({name: n, x: cx + r1 * Math.cos(angle), y: cy + r1 * Math.sin(angle), hop: 1});
-                    });
-                    ring2.forEach((n, i) => {
-                      const angle = (2 * Math.PI * i) / ring2.length - Math.PI / 4;
-                      positioned.push({name: n, x: cx + r2 * Math.cos(angle), y: cy + r2 * Math.sin(angle), hop: 2});
-                    });
-                    return positioned;
-                  };
-
-                  const layoutLinks = () => {
-                    const nb = neighborhood();
-                    const lnodes = layoutNodes();
-                    const pos = Object.fromEntries(lnodes.map(n => [n.name, {x: n.x, y: n.y}]));
-                    return nb.links.map(l => ({
-                      x1: pos[l.source]?.x || 0, y1: pos[l.source]?.y || 0,
-                      x2: pos[l.target]?.x || 0, y2: pos[l.target]?.y || 0,
-                      source: l.source, target: l.target,
-                    }));
+                    return { nodes: allNodes, edges: nbEdges };
                   };
 
                   // Inline entity detail renderer
@@ -1564,70 +1551,23 @@ function App() {
                           </div>
                         </div>
 
-                        {/* Right panel: neighborhood graph — fills remaining space */}
-                        <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center overflow-hidden">
+                        {/* Right panel: force-directed neighborhood graph */}
+                        <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
                           <Show when={graphSelectedEntity()} fallback={
-                            <div class="text-gray-600 text-sm text-center px-4">
-                              Select an entity to see its relationship graph
+                            <div class="w-full h-full flex items-center justify-center">
+                              <div class="text-gray-600 text-sm text-center px-4">
+                                Select an entity to see its relationship graph
+                              </div>
                             </div>
                           }>
-                            <svg viewBox="0 0 500 400" class="w-full h-full" preserveAspectRatio="xMidYMid meet">
-                              <defs>
-                                <marker id="arrow" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
-                                  <path d="M0,0 L6,2 L0,4" fill="#4b5563" />
-                                </marker>
-                              </defs>
-                              {/* Links */}
-                              <For each={layoutLinks()}>
-                                {(link) => {
-                                  const sel = graphSelectedEntity();
-                                  const isFromSelected = link.source === sel;
-                                  const isToSelected = link.target === sel;
-                                  return (
-                                    <line
-                                      x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
-                                      stroke={isFromSelected || isToSelected ? "#3b82f6" : "#374151"}
-                                      stroke-width={isFromSelected || isToSelected ? 1.5 : 0.8}
-                                      stroke-dasharray={isToSelected && !isFromSelected ? "4,3" : undefined}
-                                      marker-end="url(#arrow)"
-                                      opacity={isFromSelected || isToSelected ? 0.8 : 0.4}
-                                    />
-                                  );
-                                }}
-                              </For>
-                              {/* Nodes */}
-                              <For each={layoutNodes()}>
-                                {(node) => {
-                                  const isCenter = node.hop === 0;
-                                  const isShared = shared().includes(node.name);
-                                  const fillColor = isCenter ? "#1d4ed8" : isShared ? "#854d0e" : "#1f2937";
-                                  const strokeColor = isCenter ? "#3b82f6" : isShared ? "#a16207" : "#374151";
-                                  const textColor = isCenter ? "#93c5fd" : isShared ? "#fbbf24" : "#d1d5db";
-                                  const label = node.name.length > 22 ? node.name.slice(0, 20) + "…" : node.name;
-                                  return (
-                                    <g
-                                      style="cursor: pointer;"
-                                      onClick={() => setGraphSelectedEntity(node.name)}
-                                    >
-                                      <circle
-                                        cx={node.x} cy={node.y}
-                                        r={isCenter ? 8 : 6}
-                                        fill={fillColor}
-                                        stroke={strokeColor}
-                                        stroke-width={isCenter ? 2 : 1}
-                                      />
-                                      <text
-                                        x={node.x} y={node.y + (isCenter ? -14 : -10)}
-                                        text-anchor="middle"
-                                        fill={textColor}
-                                        font-size={isCenter ? "11" : "9"}
-                                        font-family="monospace"
-                                      >{label}</text>
-                                    </g>
-                                  );
-                                }}
-                              </For>
-                            </svg>
+                            <ForceGraph
+                              nodes={neighborhood().nodes}
+                              edges={neighborhood().edges}
+                              roots={roots()}
+                              shared={shared()}
+                              selectedEntity={graphSelectedEntity()}
+                              onSelectEntity={setGraphSelectedEntity}
+                            />
                           </Show>
                         </div>
                       </div>
