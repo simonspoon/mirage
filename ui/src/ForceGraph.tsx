@@ -435,7 +435,7 @@ export default function ForceGraph(props: ForceGraphProps) {
           <span class="text-[9px] text-gray-400">Parent (property)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border-2 border-yellow-700" />
+          <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border border-yellow-700 outline outline-1 outline-offset-[2px] outline-yellow-700/70" />
           <span class="text-[9px] text-gray-400">Parent (array)</span>
         </div>
         <div class="flex items-center gap-2">
@@ -443,7 +443,7 @@ export default function ForceGraph(props: ForceGraphProps) {
           <span class="text-[9px] text-gray-400">Child (property)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border-2 border-blue-700" />
+          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-blue-700 outline outline-1 outline-offset-[2px] outline-blue-700/70" />
           <span class="text-[9px] text-gray-400">Child (array)</span>
         </div>
       </div>
@@ -537,13 +537,25 @@ export default function ForceGraph(props: ForceGraphProps) {
                   opacity={dimmed() ? 0.25 : 1}
                   filter={isSel() ? "url(#glow-strong)" : undefined}
                 >
+                  {/* Outer border for array nodes (double-line effect) */}
+                  <Show when={node().isArray}>
+                    <rect
+                      x={node().x - node().hw - 3} y={node().y - PILL_HH - 3}
+                      width={node().hw * 2 + 6} height={PILL_H + 6}
+                      rx={8} ry={8}
+                      fill="none"
+                      stroke={strokeColor()}
+                      stroke-width={0.8}
+                      opacity={isSel() ? 1 : 0.7}
+                    />
+                  </Show>
                   <rect
                     x={node().x - node().hw} y={node().y - PILL_HH}
                     width={node().hw * 2} height={PILL_H}
                     rx={6} ry={6}
                     fill={fillColor()}
                     stroke={strokeColor()}
-                    stroke-width={isSel() ? 1.8 : node().isArray ? 2.5 : 0.8}
+                    stroke-width={isSel() ? 1.8 : 0.8}
                   />
                   <circle
                     cx={node().x - node().hw + 9} cy={node().y}
