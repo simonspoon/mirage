@@ -2369,44 +2369,46 @@ function App() {
 
           {/* === Log === */}
           <Show when={page() === "log"}>
-            <div class="flex items-center justify-between mb-6">
-              <h2 class="text-2xl font-semibold">Request Log</h2>
-              <span class="text-xs text-gray-500">{logEntries().length} entries &middot; auto-refreshing</span>
-            </div>
-            <Show when={logEntries().length === 0}>
-              <p class="text-gray-500">No requests logged yet. Make some API calls to see them here.</p>
-            </Show>
-            <Show when={logEntries().length > 0}>
-              <div class="rounded-xl border border-[#141b28] overflow-hidden">
-                <table class="w-full text-left">
-                  <thead>
-                    <tr class="bg-[#090e1a]">
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-48">Time</th>
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-24">Method</th>
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Path</th>
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={[...logEntries()].reverse()}>
-                      {(entry) => (
-                        <tr
-                          class={`border-t border-[#0e1521] cursor-pointer transition-colors ${
-                            selectedLog() === entry ? "bg-[#111827]" : "hover:bg-[#0c1220]"
-                          }`}
-                          onClick={() => setSelectedLog(selectedLog() === entry ? null : entry)}
-                        >
-                          <td class="py-2 px-4 font-mono text-xs text-gray-500">{formatTime(entry.timestamp)}</td>
-                          <td class="py-2 px-4"><MethodBadge method={entry.method} /></td>
-                          <td class="py-2 px-4 font-mono text-sm text-gray-300">{entry.path}</td>
-                          <td class="py-2 px-4"><StatusBadge status={entry.status} /></td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
+            <div class="flex flex-col flex-1 min-h-0">
+              <div class="flex items-center justify-between mb-6 shrink-0">
+                <h2 class="text-2xl font-semibold">Request Log</h2>
+                <span class="text-xs text-gray-500">{logEntries().length} entries &middot; auto-refreshing</span>
               </div>
-            </Show>
+              <Show when={logEntries().length === 0}>
+                <p class="text-gray-500">No requests logged yet. Make some API calls to see them here.</p>
+              </Show>
+              <Show when={logEntries().length > 0}>
+                <div class="rounded-xl border border-[#141b28] overflow-hidden flex-1 min-h-0 overflow-y-auto">
+                  <table class="w-full text-left">
+                    <thead>
+                      <tr class="bg-[#090e1a]">
+                        <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-48">Time</th>
+                        <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-24">Method</th>
+                        <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Path</th>
+                        <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={[...logEntries()].reverse()}>
+                        {(entry) => (
+                          <tr
+                            class={`border-t border-[#0e1521] cursor-pointer transition-colors ${
+                              selectedLog() === entry ? "bg-[#111827]" : "hover:bg-[#0c1220]"
+                            }`}
+                            onClick={() => setSelectedLog(selectedLog() === entry ? null : entry)}
+                          >
+                            <td class="py-2 px-4 font-mono text-xs text-gray-500">{formatTime(entry.timestamp)}</td>
+                            <td class="py-2 px-4"><MethodBadge method={entry.method} /></td>
+                            <td class="py-2 px-4 font-mono text-sm text-gray-300">{entry.path}</td>
+                            <td class="py-2 px-4"><StatusBadge status={entry.status} /></td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </div>
+              </Show>
+            </div>
           </Show>
           <Show when={selectedLog()}>
             {(entry) => (
