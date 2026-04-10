@@ -72,6 +72,8 @@ pub struct SchemaObject {
     pub additional_properties: Option<Box<SchemaObject>>,
     #[serde(rename = "allOf")]
     pub all_of: Option<Vec<SchemaObject>>,
+    #[serde(rename = "x-faker")]
+    pub x_faker: Option<String>,
 }
 
 impl SwaggerSpec {
@@ -303,6 +305,7 @@ fn resolve_schema(
             schema.description = resolved.description.clone();
             schema.additional_properties = resolved.additional_properties.clone();
             schema.all_of = resolved.all_of.clone();
+            schema.x_faker = resolved.x_faker.clone();
             // Clear the ref now that it's resolved
             schema.ref_path = None;
         }
@@ -334,6 +337,7 @@ fn resolve_schema(
                     member.description = resolved.description.clone();
                     member.additional_properties = resolved.additional_properties.clone();
                     member.all_of = resolved.all_of.clone();
+                    member.x_faker = resolved.x_faker.clone();
                     member.ref_path = None;
 
                     // Recursively resolve allOf within the resolved member
