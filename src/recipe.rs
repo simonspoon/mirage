@@ -56,6 +56,7 @@ pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_recipe(
     conn: &Connection,
     name: &str,
@@ -147,6 +148,7 @@ pub fn update_recipe_config(
     Ok(changes > 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_recipe(
     conn: &Connection,
     id: i64,

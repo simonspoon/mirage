@@ -316,13 +316,7 @@ fn generate_for_format(format: &str) -> Option<serde_json::Value> {
                 .collect();
             Some(serde_json::Value::String(hex))
         }
-        other => {
-            if let Some(strategy) = strategy_from_format(other) {
-                Some(generate_for_strategy(&strategy))
-            } else {
-                None
-            }
-        }
+        other => strategy_from_format(other).map(|s| generate_for_strategy(&s)),
     }
 }
 
@@ -601,17 +595,17 @@ pub fn fake_value_for_field(name: &str, schema: &SchemaObject) -> serde_json::Va
     }
 
     // Layer 1: x-faker
-    if let Some(ref faker_hint) = schema.x_faker {
-        if let Some(strategy) = parse_strategy_string(faker_hint) {
-            return generate_for_strategy(&strategy);
-        }
+    if let Some(ref faker_hint) = schema.x_faker
+        && let Some(strategy) = parse_strategy_string(faker_hint)
+    {
+        return generate_for_strategy(&strategy);
     }
 
     // Layer 2: format
-    if let Some(ref fmt) = schema.format {
-        if let Some(value) = generate_for_format(fmt) {
-            return value;
-        }
+    if let Some(ref fmt) = schema.format
+        && let Some(value) = generate_for_format(fmt)
+    {
+        return value;
     }
 
     // Layer 3: name heuristic (only for string types or untyped)
@@ -635,7 +629,7 @@ pub fn fake_value_for_field(name: &str, schema: &SchemaObject) -> serde_json::Va
             serde_json::json!(n)
         }
         Some("boolean") => serde_json::Value::Bool(rng.random::<bool>()),
-        Some("string") | _ => {
+        _ => {
             let w: String = Word().fake();
             serde_json::Value::String(w)
         }
