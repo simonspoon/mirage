@@ -911,7 +911,7 @@ function App() {
       </nav>
 
       {/* Main */}
-      <main class="flex-1 min-h-screen">
+      <main class="flex-1 h-screen overflow-y-auto">
         <div class="p-8 pb-2">
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
@@ -1609,7 +1609,7 @@ function App() {
                       </div>
 
                       {/* Right panel - Detail / Graph tabs */}
-                      <div class="flex-1 min-w-0 flex flex-col overflow-y-auto">
+                      <div class="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto">
                         {/* Empty state — no tabs */}
                         <Show when={!selectedEntity()}>
                           <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
