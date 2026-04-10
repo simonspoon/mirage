@@ -33,6 +33,8 @@ interface LogEntry {
   method: string;
   path: string;
   status: number;
+  request_body?: string;
+  response_body?: string;
 }
 
 interface Recipe {
@@ -83,13 +85,36 @@ function App() {
   const [error, setError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
 
+  // Try-it-out state
+  const [tryEndpoint, setTryEndpoint] = createSignal<string | null>(null);
+  const [tryParams, setTryParams] = createSignal<Record<string, string>>({});
+  const [tryBody, setTryBody] = createSignal("{}");
+  const [tryResponse, setTryResponse] = createSignal<{ status: number; body: string } | null>(null);
+  const [trySending, setTrySending] = createSignal(false);
+  const [endpointFilter, setEndpointFilter] = createSignal("");
+  const [endpointMethodFilter, setEndpointMethodFilter] = createSignal<string | null>(null);
+  const filteredEndpoints = () => {
+    const q = endpointFilter().toLowerCase();
+    const m = endpointMethodFilter();
+    return activeEndpoints().filter((ep) =>
+      (!q || ep.path.toLowerCase().includes(q)) &&
+      (!m || ep.method.toLowerCase() === m)
+    );
+  };
+
   const [tables, setTables] = createSignal<TableInfo[]>([]);
   const [selectedTable, setSelectedTable] = createSignal<string | null>(null);
   const [tableData, setTableData] = createSignal<TableData | null>(null);
   const [tableLoading, setTableLoading] = createSignal(false);
+  const [tableFilter, setTableFilter] = createSignal("");
+  const filteredTables = () => {
+    const q = tableFilter().toLowerCase();
+    return q ? tables().filter((t) => t.name.toLowerCase().includes(q)) : tables();
+  };
 
   // Log state
   const [logEntries, setLogEntries] = createSignal<LogEntry[]>([]);
+  const [selectedLog, setSelectedLog] = createSignal<LogEntry | null>(null);
 
   // Recipe state
   const [recipes, setRecipes] = createSignal<Recipe[]>([]);
@@ -99,12 +124,9 @@ function App() {
   const [recipeSeedCount, setRecipeSeedCount] = createSignal(10);
   const [recipeAvailableEndpoints, setRecipeAvailableEndpoints] = createSignal<Endpoint[]>([]);
   const [recipeSelectedEndpoints, setRecipeSelectedEndpoints] = createSignal<boolean[]>([]);
-  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "graph" | "config" | "name">("paste");
+  const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "config" | "name">("paste");
   const [entityGraph, setEntityGraph] = createSignal<any>(null);
   const [graphLoading, setGraphLoading] = createSignal(false);
-  const [graphSelectedEntity, setGraphSelectedEntity] = createSignal<string | null>(null);
-  const [graphSearch, setGraphSearch] = createSignal("");
-  const [graphGroupBy, setGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
   const [configSearch, setConfigSearch] = createSignal("");
@@ -116,6 +138,16 @@ function App() {
   const [schemaRoutes, setSchemaRoutes] = createSignal<RouteInfo[]>([]);
   const [expandedDefs, setExpandedDefs] = createSignal<Set<string>>(new Set());
   const [selectedDef, setSelectedDef] = createSignal<string | null>(null);
+  const [defFilter, setDefFilter] = createSignal("");
+  const [schemaTab, setSchemaTab] = createSignal<"definitions" | "graph">("definitions");
+
+  // Schema-level entity graph state
+  const [schemaGraph, setSchemaGraph] = createSignal<any>(null);
+  const [schemaGraphLoading, setSchemaGraphLoading] = createSignal(false);
+  const [schemaGraphSelectedEntity, setSchemaGraphSelectedEntity] = createSignal<string | null>(null);
+  const [schemaGraphSearch, setSchemaGraphSearch] = createSignal("");
+  const [schemaGraphGroupBy, setSchemaGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
+  const [schemaGraphHopDepth, setSchemaGraphHopDepth] = createSignal(1);
 
   onMount(async () => {
     try {
@@ -181,12 +213,14 @@ function App() {
     if (page() === "schemas") {
       (async () => {
         try {
-          const [defRes, routesRes] = await Promise.all([
+          const [defRes, routesRes, graphRes] = await Promise.all([
             fetch("/_api/admin/definitions"),
             fetch("/_api/admin/routes"),
+            fetch("/_api/admin/graph"),
           ]);
           setDefinitions(await defRes.json());
           setSchemaRoutes(await routesRes.json());
+          setSchemaGraph(await graphRes.json());
         } catch {
           // ignore
         }
@@ -342,7 +376,7 @@ function App() {
       });
       if (!resp.ok) throw new Error("Failed to compute graph");
       setEntityGraph(await resp.json());
-      setRecipeStep("graph");
+      handleGoToConfig();
     } catch (e: any) {
       setError(String(e?.message || e));
     } finally {
@@ -909,28 +943,156 @@ function App() {
             </Show>
 
             <Show when={state() === "running"}>
-              <h2 class="text-2xl font-semibold mb-6">Active Endpoints</h2>
-              <div class="rounded-xl border border-[#141b28] overflow-hidden">
-                <table class="w-full text-left">
-                  <thead>
-                    <tr class="bg-[#090e1a]">
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-28">Method</th>
-                      <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Path</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={activeEndpoints()}>
-                      {(ep) => (
-                        <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
-                          <td class="py-2.5 px-4">
-                            <MethodBadge method={ep.method} />
-                          </td>
-                          <td class="py-2.5 px-4 font-mono text-sm text-gray-300">{ep.path}</td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
+              <div class="flex items-center justify-between mb-4">
+                <h2 class="text-2xl font-semibold">Active Endpoints</h2>
+                <span class="text-xs text-gray-500">{filteredEndpoints().length} / {activeEndpoints().length}</span>
+              </div>
+              <div class="flex items-center gap-2 mb-4">
+                <input
+                  type="text"
+                  placeholder="Filter by path..."
+                  value={endpointFilter()}
+                  onInput={(e) => setEndpointFilter(e.currentTarget.value)}
+                  class="flex-1 bg-[#070c17] border border-gray-800 rounded-md px-3 py-1.5 text-sm text-gray-100 font-mono placeholder:text-gray-600 focus:outline-none focus:border-gray-600"
+                />
+                <For each={["get", "post", "put", "delete", "patch"]}>
+                  {(m) => {
+                    const active = () => endpointMethodFilter() === m;
+                    return (
+                      <button
+                        class={`px-2 py-1 text-xs font-mono rounded-md border transition-colors ${active() ? "border-gray-600 bg-white/[0.06] text-gray-200" : "border-gray-800 text-gray-500 hover:text-gray-400 hover:border-gray-700"}`}
+                        onClick={() => setEndpointMethodFilter(active() ? null : m)}
+                      >
+                        {m.toUpperCase()}
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+              <div class="space-y-1">
+                <For each={filteredEndpoints()}>
+                  {(ep) => {
+                    const key = () => `${ep.method}:${ep.path}`;
+                    const isOpen = () => tryEndpoint() === key();
+                    const pathParams = () => {
+                      const matches = ep.path.match(/\{(\w+)\}/g);
+                      return matches ? matches.map((m) => m.slice(1, -1)) : [];
+                    };
+                    const needsBody = () => ["post", "put", "patch"].includes(ep.method.toLowerCase());
+
+                    const resolvedPath = () => {
+                      let p = ep.path;
+                      const params = tryParams();
+                      for (const param of pathParams()) {
+                        p = p.replace(`{${param}}`, params[param] || `{${param}}`);
+                      }
+                      return p;
+                    };
+
+                    const sendRequest = async () => {
+                      setTrySending(true);
+                      setTryResponse(null);
+                      try {
+                        const opts: RequestInit = { method: ep.method.toUpperCase() };
+                        if (needsBody()) {
+                          opts.headers = { "Content-Type": "application/json" };
+                          opts.body = tryBody();
+                        }
+                        const res = await fetch(resolvedPath(), opts);
+                        const text = await res.text();
+                        let formatted = text;
+                        try { formatted = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+                        setTryResponse({ status: res.status, body: formatted });
+                      } catch (e: any) {
+                        setTryResponse({ status: 0, body: e.message || "Request failed" });
+                      }
+                      setTrySending(false);
+                    };
+
+                    return (
+                      <div class="rounded-lg border border-[#141b28] overflow-hidden">
+                        <button
+                          class={`w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-white/[0.03] transition-colors ${isOpen() ? "bg-white/[0.02]" : ""}`}
+                          onClick={() => {
+                            if (isOpen()) {
+                              setTryEndpoint(null);
+                            } else {
+                              setTryEndpoint(key());
+                              setTryParams({});
+                              setTryBody("{}");
+                              setTryResponse(null);
+                            }
+                          }}
+                        >
+                          <svg class={`w-3 h-3 text-gray-500 transition-transform ${isOpen() ? "rotate-90" : ""}`} fill="currentColor" viewBox="0 0 8 12"><path d="M1.5 0L0 1.5 4.5 6 0 10.5 1.5 12l6-6z"/></svg>
+                          <MethodBadge method={ep.method} />
+                          <span class="font-mono text-sm text-gray-300">{ep.path}</span>
+                        </button>
+
+                        <Show when={isOpen()}>
+                          <div class="px-4 pb-4 pt-2 border-t border-[#141b28] space-y-3">
+                            <Show when={pathParams().length > 0}>
+                              <div class="space-y-2">
+                                <For each={pathParams()}>
+                                  {(param) => (
+                                    <div class="flex items-center gap-2">
+                                      <label class="text-xs text-gray-500 w-24 text-right font-mono">{`{${param}}`}</label>
+                                      <input
+                                        type="text"
+                                        placeholder={param}
+                                        value={tryParams()[param] || ""}
+                                        onInput={(e) => setTryParams({ ...tryParams(), [param]: e.currentTarget.value })}
+                                        class="flex-1 bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-sm text-gray-100 font-mono focus:outline-none focus:border-gray-600"
+                                      />
+                                    </div>
+                                  )}
+                                </For>
+                              </div>
+                            </Show>
+
+                            <Show when={needsBody()}>
+                              <div>
+                                <label class="text-xs text-gray-500 block mb-1">Request Body</label>
+                                <textarea
+                                  value={tryBody()}
+                                  onInput={(e) => setTryBody(e.currentTarget.value)}
+                                  rows={5}
+                                  class="w-full bg-[#070c17] border border-gray-800 rounded-md px-3 py-2 text-sm text-gray-100 font-mono focus:outline-none focus:border-gray-600 resize-y"
+                                  spellcheck={false}
+                                />
+                              </div>
+                            </Show>
+
+                            <div class="flex items-center gap-3">
+                              <span class="text-xs text-gray-500 font-mono">{ep.method.toUpperCase()} {resolvedPath()}</span>
+                              <button
+                                class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-md text-xs font-medium transition-colors disabled:opacity-50"
+                                onClick={sendRequest}
+                                disabled={trySending()}
+                              >
+                                {trySending() ? "Sending..." : "Send"}
+                              </button>
+                            </div>
+
+                            <Show when={tryResponse()}>
+                              {(res) => (
+                                <div class="rounded-md border border-[#141b28] overflow-hidden">
+                                  <div class="flex items-center gap-2 px-3 py-1.5 bg-[#090e1a] border-b border-[#141b28]">
+                                    <span class="text-xs text-gray-500">Status</span>
+                                    <span class={`text-xs font-mono font-medium ${res().status >= 200 && res().status < 300 ? "text-emerald-400" : res().status >= 400 ? "text-red-400" : "text-gray-300"}`}>
+                                      {res().status || "ERR"}
+                                    </span>
+                                  </div>
+                                  <pre class="px-3 py-2 text-xs text-gray-300 font-mono overflow-x-auto max-h-72 overflow-y-auto whitespace-pre-wrap">{res().body}</pre>
+                                </div>
+                              )}
+                            </Show>
+                          </div>
+                        </Show>
+                      </div>
+                    );
+                  }}
+                </For>
               </div>
             </Show>
           </Show>
@@ -949,28 +1111,43 @@ function App() {
               </Show>
 
               <Show when={tables().length > 0}>
-                <div class="flex gap-6">
+                <div class="flex gap-0">
                   {/* Table list */}
-                  <div class="w-44 shrink-0 space-y-0.5">
-                    <For each={tables()}>
-                      {(t) => (
-                        <button
-                          class={`w-full flex items-center justify-between px-3 py-2 rounded-md text-sm transition-all ${
-                            selectedTable() === t.name
-                              ? "text-white font-medium"
-                              : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
-                          }`}
-                          onClick={() => loadTableData(t.name)}
-                        >
-                          <span>{t.name}</span>
-                          <span class="text-xs tabular-nums opacity-50">{t.row_count}</span>
-                        </button>
-                      )}
-                    </For>
+                  <div class="shrink-0 border-r border-[#141b28] pr-2 flex flex-col max-h-[calc(100vh-12rem)]">
+                    <div class="pb-2">
+                      <input
+                        type="text"
+                        placeholder="Filter tables..."
+                        value={tableFilter()}
+                        onInput={(e) => setTableFilter(e.currentTarget.value)}
+                        class="w-full px-3 py-1.5 text-sm bg-white/5 border border-[#141b28] rounded-md text-gray-300 placeholder-gray-600 focus:outline-none focus:border-blue-500/40"
+                      />
+                    </div>
+                    <div class="overflow-y-auto space-y-0.5">
+                      <For each={filteredTables()}>
+                        {(t) => (
+                          <button
+                            class={`w-full flex items-center justify-between px-3 py-2 rounded-md text-sm whitespace-nowrap transition-all ${
+                              selectedTable() === t.name
+                                ? "bg-blue-500/15 text-blue-300 font-medium border-l-2 border-blue-400"
+                                : t.row_count === 0
+                                  ? "text-gray-600 hover:text-gray-400 hover:bg-white/5"
+                                  : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                            }`}
+                            onClick={() => loadTableData(t.name)}
+                          >
+                            <span>{t.name}</span>
+                            <span class={`text-xs tabular-nums ml-3 shrink-0 ${
+                              t.row_count === 0 ? "opacity-30" : "opacity-50"
+                            }`}>{t.row_count}</span>
+                          </button>
+                        )}
+                      </For>
+                    </div>
                   </div>
 
                   {/* Table data */}
-                  <div class="flex-1 min-w-0">
+                  <div class="flex-1 min-w-0 pl-6">
                     <Show when={!selectedTable() && !tableLoading()}>
                       <p class="text-gray-600 text-sm py-8 text-center">Select a table to view its data.</p>
                     </Show>
@@ -987,8 +1164,8 @@ function App() {
                               <tr class="bg-[#090e1a]">
                                 <For each={tableData()!.columns}>
                                   {(col) => (
-                                    <th class="py-3 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">
-                                      {col.name}
+                                    <th class="py-3 px-4 text-xs font-medium text-gray-500 whitespace-nowrap" title={col.name}>
+                                      {humanizeColumn(col.name)}
                                     </th>
                                   )}
                                 </For>
@@ -1021,21 +1198,42 @@ function App() {
 
           {/* === Schemas === */}
           <Show when={page() === "schemas"}>
-            <h2 class="text-2xl font-semibold mb-6">Schemas</h2>
+            <div class="flex items-center justify-between mb-6">
+              <h2 class="text-2xl font-semibold">Schemas</h2>
+              <div class="flex gap-1 bg-gray-900/50 rounded-lg p-0.5">
+                <button
+                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${schemaTab() === "definitions" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                  onClick={() => setSchemaTab("definitions")}
+                >Definitions</button>
+                <button
+                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${schemaTab() === "graph" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                  onClick={() => { if (selectedDef()) setSchemaGraphSelectedEntity(selectedDef()); setSchemaTab("graph"); }}
+                >Entity Graph</button>
+              </div>
+            </div>
             <Show when={Object.keys(definitions()).length === 0}>
               <p class="text-gray-500">No definitions available. Import a spec first.</p>
             </Show>
-            <Show when={Object.keys(definitions()).length > 0}>
+            <Show when={Object.keys(definitions()).length > 0 && schemaTab() === "definitions"}>
               <div class="flex gap-6" style="max-width: 100%; min-height: 400px;">
                 {/* Left panel - Definition list */}
                 <div class="w-72 shrink-0">
                   <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden">
-                    <div class="px-4 py-3 border-b border-[#141b28] flex items-center justify-between">
-                      <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
-                      <span class="text-xs text-gray-600 tabular-nums">{Object.keys(definitions()).length}</span>
+                    <div class="px-4 py-3 border-b border-[#141b28] space-y-2">
+                      <div class="flex items-center justify-between">
+                        <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
+                        <span class="text-xs text-gray-600 tabular-nums">{Object.keys(definitions()).length}</span>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Filter..."
+                        value={defFilter()}
+                        onInput={(e) => setDefFilter(e.currentTarget.value)}
+                        class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
+                      />
                     </div>
-                    <div class="max-h-[calc(100vh-200px)] overflow-y-auto">
-                      <For each={Object.keys(definitions()).sort()}>
+                    <div class="max-h-[calc(100vh-240px)] overflow-y-auto">
+                      <For each={Object.keys(definitions()).sort().filter(n => !defFilter() || n.toLowerCase().includes(defFilter().toLowerCase()))}>
                         {(defName) => {
                           const def = () => definitions()[defName];
                           const epCount = () => endpointsForDef(defName).length;
@@ -1244,6 +1442,213 @@ function App() {
                 </div>
               </div>
             </Show>
+
+            {/* Entity Graph tab */}
+            <Show when={Object.keys(definitions()).length > 0 && schemaTab() === "graph"}>
+              {(() => {
+                const graph = () => schemaGraph();
+                const nodes = () => (graph()?.nodes || []) as string[];
+                const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
+                const shared = () => (graph()?.shared_entities || []) as string[];
+                const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
+
+                const filteredNodes = () => {
+                  const q = schemaGraphSearch().toLowerCase();
+                  const filtered = q ? nodes().filter((n: string) => n.toLowerCase().includes(q)) : nodes();
+                  if (schemaGraphGroupBy() === "alpha") return filtered.sort();
+                  return filtered;
+                };
+
+                const endpointGroups = () => {
+                  if (schemaGraphGroupBy() !== "endpoint") return {};
+                  const groups: Record<string, string[]> = {};
+                  const r = roots();
+                  const assigned = new Set<string>();
+                  for (const node of filteredNodes()) {
+                    if (r[node]) {
+                      for (const ep of r[node]) {
+                        const key = `${ep.method.toUpperCase()} ${ep.path}`;
+                        if (!groups[key]) groups[key] = [];
+                        groups[key].push(node);
+                        assigned.add(node);
+                      }
+                    }
+                  }
+                  const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
+                  if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
+                  return groups;
+                };
+
+                const neighborhood = () => {
+                  const sel = schemaGraphSelectedEntity();
+                  const depth = schemaGraphHopDepth();
+                  if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]> };
+                  const e = edges();
+                  const visited = new Set<string>([sel]);
+                  let frontier = new Set<string>([sel]);
+                  for (let hop = 0; hop < depth; hop++) {
+                    const next = new Set<string>();
+                    for (const n of frontier) {
+                      for (const t of (e[n] || [])) {
+                        if (!visited.has(t)) { visited.add(t); next.add(t); }
+                      }
+                      for (const [src, targets] of Object.entries(e)) {
+                        if (targets.includes(n) && !visited.has(src)) { visited.add(src); next.add(src); }
+                      }
+                    }
+                    frontier = next;
+                  }
+                  const allNodes = Array.from(visited);
+                  const nbEdges: Record<string, string[]> = {};
+                  for (const n of allNodes) {
+                    const targets = (e[n] || []).filter(t => visited.has(t));
+                    if (targets.length > 0) nbEdges[n] = targets;
+                  }
+                  return { nodes: allNodes, edges: nbEdges };
+                };
+
+                const entityDetail = (node: string) => {
+                  const isSelected = () => schemaGraphSelectedEntity() === node;
+                  const isShared = () => shared().includes(node);
+                  return (
+                    <div data-entity={node}>
+                      <button
+                        class={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors flex items-center gap-2 ${
+                          isSelected()
+                            ? "bg-blue-600/20 text-blue-300 ring-1 ring-blue-500/30"
+                            : isShared()
+                            ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border border-yellow-800/40"
+                            : "text-gray-300 hover:bg-white/5"
+                        }`}
+                        onClick={() => setSchemaGraphSelectedEntity(isSelected() ? null : node)}
+                      >
+                        <span class="flex-1">{node}</span>
+                        {isShared() && <span class="text-[10px] text-yellow-500 shrink-0">shared</span>}
+                        {(edges()[node]?.length || 0) > 0 && (
+                          <span class="text-[10px] text-gray-600 shrink-0">{edges()[node].length}</span>
+                        )}
+                      </button>
+                      <Show when={isSelected()}>
+                        <div class="ml-3 pl-3 border-l-2 border-blue-500/30 py-1.5 space-y-1">
+                          {roots()[node] && (
+                            <div class="text-[11px] text-gray-400">
+                              <span class="text-gray-600">Root for</span>
+                              <div class="mt-0.5 space-y-0.5">
+                                <For each={roots()[node]}>
+                                  {(e) => <div class="text-gray-400">{e.method.toUpperCase()} {e.path}</div>}
+                                </For>
+                              </div>
+                            </div>
+                          )}
+                          {edges()[node]?.length > 0 && (
+                            <div class="text-[11px]">
+                              <span class="text-gray-600">References</span>
+                              <div class="mt-0.5 space-y-0.5">
+                                <For each={edges()[node]}>
+                                  {(ref_) => (
+                                    <button
+                                      class="block text-blue-400 hover:text-blue-300"
+                                      onClick={(ev) => { ev.stopPropagation(); setSchemaGraphSelectedEntity(ref_); }}
+                                    >{ref_}</button>
+                                  )}
+                                </For>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </Show>
+                    </div>
+                  );
+                };
+
+                createEffect(() => {
+                  const sel = schemaGraphSelectedEntity();
+                  if (!sel) return;
+                  requestAnimationFrame(() => {
+                    const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
+                    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                  });
+                });
+
+                return (
+                  <div>
+                    <div class="flex items-center justify-between mb-3">
+                      <p class="text-sm text-gray-500">{nodes().length} entities · {shared().length} shared</p>
+                      <div class="flex items-center gap-3">
+                        <div class="flex items-center gap-1.5">
+                          <span class="text-[10px] text-gray-500">Depth</span>
+                          <input
+                            type="range" min="1" max="3" step="1"
+                            value={schemaGraphHopDepth()}
+                            onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
+                            class="w-14 h-1 accent-blue-500"
+                          />
+                          <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
+                        </div>
+                        <button
+                          class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                          onClick={() => setSchemaGraphGroupBy("alpha")}
+                        >A–Z</button>
+                        <button
+                          class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                          onClick={() => setSchemaGraphGroupBy("endpoint")}
+                        >By endpoint</button>
+                      </div>
+                    </div>
+
+                    <div class="flex gap-4" style="height: calc(100vh - 220px); min-height: 400px;">
+                      <div class="w-72 shrink-0 flex flex-col">
+                        <input
+                          type="text"
+                          placeholder="Search entities..."
+                          value={schemaGraphSearch()}
+                          onInput={(e) => setSchemaGraphSearch(e.currentTarget.value)}
+                          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-2"
+                        />
+                        <div class="flex-1 overflow-y-auto pr-1 space-y-0.5" style="scrollbar-width: thin;">
+                          <Show when={schemaGraphGroupBy() === "alpha"}>
+                            <For each={filteredNodes()}>
+                              {(node: string) => entityDetail(node)}
+                            </For>
+                          </Show>
+                          <Show when={schemaGraphGroupBy() === "endpoint"}>
+                            <For each={Object.entries(endpointGroups())}>
+                              {([endpoint, groupNodes]) => (
+                                <div class="mb-2">
+                                  <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a0f1e] z-10">{endpoint}</div>
+                                  <For each={groupNodes as string[]}>
+                                    {(node: string) => entityDetail(node)}
+                                  </For>
+                                </div>
+                              )}
+                            </For>
+                          </Show>
+                        </div>
+                      </div>
+
+                      <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
+                        <Show when={schemaGraphSelectedEntity()} fallback={
+                          <div class="w-full h-full flex items-center justify-center">
+                            <div class="text-gray-600 text-sm text-center px-4">
+                              Select an entity to see its relationship graph
+                            </div>
+                          </div>
+                        }>
+                          <ForceGraph
+                            nodes={neighborhood().nodes}
+                            edges={neighborhood().edges}
+                            roots={roots()}
+                            shared={shared()}
+                            selectedEntity={schemaGraphSelectedEntity()}
+                            onSelectEntity={setSchemaGraphSelectedEntity}
+                          />
+                        </Show>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </Show>
           </Show>
 
           {/* === Recipes === */}
@@ -1274,7 +1679,7 @@ function App() {
                       class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors disabled:opacity-50"
                       disabled={loading()}
                       onClick={() => {
-                        const prev: Record<string, "paste" | "select" | "graph" | "config"> = { select: "paste", graph: "select", config: "graph", name: "config" };
+                        const prev: Record<string, "paste" | "select" | "config"> = { select: "paste", config: "select", name: "config" };
                         setRecipeStep(prev[recipeStep()] || "paste");
                       }}
                     >Back</button>
@@ -1287,7 +1692,6 @@ function App() {
                       onClick={() => {
                         if (recipeStep() === "paste") handleRecipeParseSpec();
                         else if (recipeStep() === "select") handleFetchGraph();
-                        else if (recipeStep() === "graph") handleGoToConfig();
                         else if (recipeStep() === "config") setRecipeStep("name");
                       }}
                     >
@@ -1323,13 +1727,10 @@ function App() {
                 editMode={editingRecipeId() !== null}
                 onNavigate={async (s) => {
                   if (saveActivatePhase() !== "idle") return;
-                  if (s === "graph" && !entityGraph()) {
-                    await handleFetchGraph();
-                    return;
-                  }
                   if (s === "config") {
                     if (!entityGraph()) {
                       await handleFetchGraph();
+                      return;
                     }
                     if (Object.keys(recipeSharedPools()).length === 0 && Object.keys(recipeQuantityConfigs()).length === 0) {
                       handleGoToConfig();
@@ -1388,196 +1789,7 @@ function App() {
                 </div>
               </Show>
 
-              {/* Step 3: Entity Graph */}
-              <Show when={recipeStep() === "graph"}>
-                {(() => {
-                  const graph = () => entityGraph();
-                  const nodes = () => (graph()?.nodes || []) as string[];
-                  const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
-                  const shared = () => (graph()?.shared_entities || []) as string[];
-                  const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
-
-                  const filteredNodes = () => {
-                    const q = graphSearch().toLowerCase();
-                    const filtered = q ? nodes().filter((n: string) => n.toLowerCase().includes(q)) : nodes();
-                    if (graphGroupBy() === "alpha") return filtered.sort();
-                    return filtered;
-                  };
-
-                  const endpointGroups = () => {
-                    if (graphGroupBy() !== "endpoint") return {};
-                    const groups: Record<string, string[]> = {};
-                    const r = roots();
-                    const assigned = new Set<string>();
-                    for (const node of filteredNodes()) {
-                      if (r[node]) {
-                        for (const ep of r[node]) {
-                          const key = `${ep.method.toUpperCase()} ${ep.path}`;
-                          if (!groups[key]) groups[key] = [];
-                          groups[key].push(node);
-                          assigned.add(node);
-                        }
-                      }
-                    }
-                    // Entities not rooted to any endpoint
-                    const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
-                    if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
-                    return groups;
-                  };
-
-                  // 1-hop neighborhood for force graph (direct connections only)
-                  const neighborhood = () => {
-                    const sel = graphSelectedEntity();
-                    if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]> };
-                    const e = edges();
-                    const neighbors = new Set<string>();
-                    // Outbound from selected
-                    for (const t of (e[sel] || [])) neighbors.add(t);
-                    // Inbound to selected
-                    for (const [src, targets] of Object.entries(e)) {
-                      if (targets.includes(sel) && src !== sel) neighbors.add(src);
-                    }
-                    const allNodes = [sel, ...Array.from(neighbors)];
-                    const nbEdges: Record<string, string[]> = {};
-                    for (const n of allNodes) {
-                      const targets = (e[n] || []).filter(t => allNodes.includes(t));
-                      if (targets.length > 0) nbEdges[n] = targets;
-                    }
-                    return { nodes: allNodes, edges: nbEdges };
-                  };
-
-                  // Inline entity detail renderer
-                  const entityDetail = (node: string) => {
-                    const isSelected = () => graphSelectedEntity() === node;
-                    const isShared = () => shared().includes(node);
-                    return (
-                      <div>
-                        <button
-                          class={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors flex items-center gap-2 ${
-                            isSelected()
-                              ? "bg-blue-600/20 text-blue-300 ring-1 ring-blue-500/30"
-                              : isShared()
-                              ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border border-yellow-800/40"
-                              : "text-gray-300 hover:bg-white/5"
-                          }`}
-                          onClick={() => setGraphSelectedEntity(isSelected() ? null : node)}
-                        >
-                          <span class="flex-1">{node}</span>
-                          {isShared() && <span class="text-[10px] text-yellow-500 shrink-0">shared</span>}
-                          {(edges()[node]?.length || 0) > 0 && (
-                            <span class="text-[10px] text-gray-600 shrink-0">{edges()[node].length}</span>
-                          )}
-                        </button>
-                        <Show when={isSelected()}>
-                          <div class="ml-3 pl-3 border-l-2 border-blue-500/30 py-1.5 space-y-1">
-                            {roots()[node] && (
-                              <div class="text-[11px] text-gray-400">
-                                <span class="text-gray-600">Root for</span>
-                                <div class="mt-0.5 space-y-0.5">
-                                  <For each={roots()[node]}>
-                                    {(e) => <div class="text-gray-400">{e.method.toUpperCase()} {e.path}</div>}
-                                  </For>
-                                </div>
-                              </div>
-                            )}
-                            {edges()[node]?.length > 0 && (
-                              <div class="text-[11px]">
-                                <span class="text-gray-600">References</span>
-                                <div class="mt-0.5 space-y-0.5">
-                                  <For each={edges()[node]}>
-                                    {(ref) => (
-                                      <button
-                                        class="block text-blue-400 hover:text-blue-300"
-                                        onClick={(ev) => { ev.stopPropagation(); setGraphSelectedEntity(ref); }}
-                                      >{ref}</button>
-                                    )}
-                                  </For>
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </Show>
-                      </div>
-                    );
-                  };
-
-                  return (
-                    <div>
-                      <div class="flex items-center justify-between mb-3">
-                        <div>
-                          <h3 class="text-lg font-semibold">Entity Graph</h3>
-                          <p class="text-sm text-gray-500">{nodes().length} entities · {shared().length} shared</p>
-                        </div>
-                        <div class="flex items-center gap-2">
-                          <button
-                            class={`px-2.5 py-1 text-xs rounded-md transition-colors ${graphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                            onClick={() => setGraphGroupBy("alpha")}
-                          >A–Z</button>
-                          <button
-                            class={`px-2.5 py-1 text-xs rounded-md transition-colors ${graphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                            onClick={() => setGraphGroupBy("endpoint")}
-                          >By endpoint</button>
-                        </div>
-                      </div>
-
-                      <div class="flex gap-4" style="height: calc(100vh - 220px); min-height: 400px;">
-                        {/* Left panel: entity list */}
-                        <div class="w-72 shrink-0 flex flex-col">
-                          <input
-                            type="text"
-                            placeholder="Search entities..."
-                            value={graphSearch()}
-                            onInput={(e) => setGraphSearch(e.currentTarget.value)}
-                            class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-2"
-                          />
-                          <div class="flex-1 overflow-y-auto pr-1 space-y-0.5" style="scrollbar-width: thin;">
-                            <Show when={graphGroupBy() === "alpha"}>
-                              <For each={filteredNodes()}>
-                                {(node: string) => entityDetail(node)}
-                              </For>
-                            </Show>
-                            <Show when={graphGroupBy() === "endpoint"}>
-                              <For each={Object.entries(endpointGroups())}>
-                                {([endpoint, groupNodes]) => (
-                                  <div class="mb-2">
-                                    <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a0f1e] z-10">{endpoint}</div>
-                                    <For each={groupNodes as string[]}>
-                                      {(node: string) => entityDetail(node)}
-                                    </For>
-                                  </div>
-                                )}
-                              </For>
-                            </Show>
-                          </div>
-                        </div>
-
-                        {/* Right panel: force-directed neighborhood graph */}
-                        <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
-                          <Show when={graphSelectedEntity()} fallback={
-                            <div class="w-full h-full flex items-center justify-center">
-                              <div class="text-gray-600 text-sm text-center px-4">
-                                Select an entity to see its relationship graph
-                              </div>
-                            </div>
-                          }>
-                            <ForceGraph
-                              nodes={neighborhood().nodes}
-                              edges={neighborhood().edges}
-                              roots={roots()}
-                              shared={shared()}
-                              selectedEntity={graphSelectedEntity()}
-                              onSelectEntity={setGraphSelectedEntity}
-                            />
-                          </Show>
-                        </div>
-                      </div>
-
-                    </div>
-                  );
-                })()}
-              </Show>
-
-              {/* Step 4: Configure data generation */}
+              {/* Step 3: Configure data generation */}
               <Show when={recipeStep() === "config"}>
                 {(() => {
                   const hasPools = () => Object.keys(recipeSharedPools()).length > 0;
@@ -1928,7 +2140,12 @@ function App() {
                   <tbody>
                     <For each={[...logEntries()].reverse()}>
                       {(entry) => (
-                        <tr class="border-t border-[#0e1521]">
+                        <tr
+                          class={`border-t border-[#0e1521] cursor-pointer transition-colors ${
+                            selectedLog() === entry ? "bg-[#111827]" : "hover:bg-[#0c1220]"
+                          }`}
+                          onClick={() => setSelectedLog(selectedLog() === entry ? null : entry)}
+                        >
                           <td class="py-2 px-4 font-mono text-xs text-gray-500">{formatTime(entry.timestamp)}</td>
                           <td class="py-2 px-4"><MethodBadge method={entry.method} /></td>
                           <td class="py-2 px-4 font-mono text-sm text-gray-300">{entry.path}</td>
@@ -1940,6 +2157,38 @@ function App() {
                 </table>
               </div>
             </Show>
+          </Show>
+          <Show when={selectedLog()}>
+            {(entry) => (
+              <div class="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setSelectedLog(null)}>
+                <div class="absolute inset-0 bg-black/60" />
+                <div class="relative bg-[#0a1020] border border-[#141b28] rounded-xl shadow-2xl w-[90vw] max-w-4xl max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                  <div class="flex items-center justify-between px-5 py-4 border-b border-[#141b28] shrink-0">
+                    <div class="flex items-center gap-3">
+                      <MethodBadge method={entry().method} />
+                      <span class="font-mono text-sm text-gray-300">{entry().path}</span>
+                      <StatusBadge status={entry().status} />
+                      <span class="font-mono text-xs text-gray-500">{formatTime(entry().timestamp)}</span>
+                    </div>
+                    <button class="text-gray-500 hover:text-gray-300 text-lg leading-none px-1" onClick={() => setSelectedLog(null)}>&times;</button>
+                  </div>
+                  <div class="grid grid-cols-2 gap-4 p-5 overflow-auto min-h-0">
+                    <div class="flex flex-col min-h-0">
+                      <h4 class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2 shrink-0">Request Body</h4>
+                      <pre class="bg-[#070c17] rounded-lg p-3 text-xs text-gray-300 font-mono overflow-auto whitespace-pre-wrap flex-1">
+                        {entry().request_body ? tryFormatJson(entry().request_body!) : <span class="text-gray-600 italic">No body</span>}
+                      </pre>
+                    </div>
+                    <div class="flex flex-col min-h-0">
+                      <h4 class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2 shrink-0">Response Body</h4>
+                      <pre class="bg-[#070c17] rounded-lg p-3 text-xs text-gray-300 font-mono overflow-auto whitespace-pre-wrap flex-1">
+                        {entry().response_body ? tryFormatJson(entry().response_body!) : <span class="text-gray-600 italic">No body</span>}
+                      </pre>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </Show>
         </div>
       </main>
@@ -1985,6 +2234,24 @@ function formatTime(iso: string): string {
   }
 }
 
+function tryFormatJson(s: string): string {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return s;
+  }
+}
+
+function humanizeColumn(name: string): string {
+  return name
+    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/_/g, " ")
+    .split(" ")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
 function rawValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "object") return JSON.stringify(value, null, 2);
@@ -2017,14 +2284,13 @@ function formatCell(value: unknown): string {
 }
 
 function StepIndicator(props: {
-  current: "paste" | "select" | "graph" | "config" | "name";
-  onNavigate: (step: "paste" | "select" | "graph" | "config" | "name") => void;
+  current: "paste" | "select" | "config" | "name";
+  onNavigate: (step: "paste" | "select" | "config" | "name") => void;
   editMode?: boolean;
 }) {
-  const steps: { key: "paste" | "select" | "graph" | "config" | "name"; label: string; editLabel?: string }[] = [
+  const steps: { key: "paste" | "select" | "config" | "name"; label: string; editLabel?: string }[] = [
     { key: "paste", label: "Import" },
     { key: "select", label: "Endpoints" },
-    { key: "graph", label: "Entity Graph" },
     { key: "config", label: "Configure" },
     { key: "name", label: "Generate", editLabel: "Save" },
   ];

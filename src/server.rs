@@ -61,6 +61,10 @@ pub struct LogEntry {
     pub method: String,
     pub path: String,
     pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
 }
 
 pub type RequestLog = Arc<Mutex<Vec<LogEntry>>>;
@@ -507,12 +511,21 @@ async fn catch_all_handler(
     }
 }
 
-fn log_request(log: &RequestLog, method: &str, path: &str, status: u16) {
+fn log_request(
+    log: &RequestLog,
+    method: &str,
+    path: &str,
+    status: u16,
+    request_body: Option<String>,
+    response_body: Option<String>,
+) {
     let entry = LogEntry {
         timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         method: method.to_uppercase(),
         path: path.to_string(),
         status,
+        request_body,
+        response_body,
     };
     let mut log = log.lock().unwrap();
     log.push(entry);
@@ -1139,6 +1152,158 @@ async fn admin_update_recipe(
     }
 }
 
+async fn admin_export_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::get_recipe(&conn, id) {
+        Ok(Some(recipe)) => {
+            let endpoints: serde_json::Value =
+                serde_json::from_str(&recipe.selected_endpoints).unwrap_or(serde_json::json!([]));
+            let shared_pools: serde_json::Value =
+                serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
+            let quantity_configs: serde_json::Value =
+                serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
+
+            let export = serde_json::json!({
+                "mirage_recipe": 1,
+                "name": recipe.name,
+                "spec_source": recipe.spec_source,
+                "selected_endpoints": endpoints,
+                "seed_count": recipe.seed_count,
+                "shared_pools": shared_pools,
+                "quantity_configs": quantity_configs,
+            });
+
+            let filename = format!(
+                "{}.mirage.json",
+                recipe.name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-")
+            );
+
+            (
+                StatusCode::OK,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/json".to_string(),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                serde_json::to_string_pretty(&export).unwrap(),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to export recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_import_recipe(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // Validate format marker
+    match body.get("mirage_recipe").and_then(|v| v.as_i64()) {
+        Some(1) => {}
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Not a valid Mirage recipe file (missing or unsupported mirage_recipe version)"})),
+            )
+                .into_response();
+        }
+    }
+
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing recipe name"})),
+            )
+                .into_response();
+        }
+    };
+
+    let spec_source = match body.get("spec_source").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing spec_source"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate the spec is parseable
+    let _spec: SwaggerSpec = match serde_yaml::from_str(&spec_source) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid spec in recipe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let endpoints = match body.get("selected_endpoints") {
+        Some(v) => match serde_json::to_string(v) {
+            Ok(j) => j,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid selected_endpoints: {e}")})),
+                )
+                    .into_response();
+            }
+        },
+        None => "[]".to_string(),
+    };
+
+    let seed_count = body
+        .get("seed_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10);
+    let shared_pools_str = body
+        .get("shared_pools")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let quantity_configs_str = body
+        .get("quantity_configs")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::create_recipe(
+        &conn,
+        &name,
+        &spec_source,
+        &endpoints,
+        seed_count,
+        shared_pools_str.as_deref(),
+        quantity_configs_str.as_deref(),
+    ) {
+        Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to import recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 async fn admin_activate_recipe(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -1435,6 +1600,23 @@ struct GraphRequest {
     endpoints: Vec<EndpointInfo>,
 }
 
+async fn admin_graph_current(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.registry.read().unwrap();
+    let raw_spec = match &reg.raw_spec {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({"nodes":[],"edges":{},"shared_entities":[],"roots":{},"array_properties":[]})).into_response();
+        }
+    };
+    let selected: Vec<(String, String)> = if reg.endpoints.is_empty() {
+        raw_spec.path_operations().iter().map(|(path, method, _)| (path.to_string(), method.to_string())).collect()
+    } else {
+        reg.endpoints.iter().map(|e| (e.path.clone(), e.method.to_lowercase())).collect()
+    };
+    let graph = crate::entity_graph::build_entity_graph(raw_spec, &selected);
+    Json(serde_json::json!(graph)).into_response()
+}
+
 async fn admin_graph(Json(req): Json<GraphRequest>) -> impl IntoResponse {
     let spec: SwaggerSpec = match serde_yaml::from_str(&req.spec_source) {
         Ok(s) => s,
@@ -1564,13 +1746,39 @@ async fn logging_middleware(
         && path != "/_api/admin/endpoints"
         && path != "/_api/admin/tables";
 
-    let response = next.run(req).await;
-
-    if should_log {
-        log_request(&state.log, &method, &path, response.status().as_u16());
+    if !should_log {
+        return next.run(req).await;
     }
 
-    response
+    // Buffer request body
+    let (parts, body) = req.into_parts();
+    let req_bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let request_body = if req_bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&req_bytes).into_owned())
+    };
+    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(req_bytes));
+
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    // Buffer response body
+    let (parts, body) = response.into_parts();
+    let res_bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let response_body = if res_bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&res_bytes).into_owned())
+    };
+
+    log_request(&state.log, &method, &path, status, request_body, response_body);
+
+    Response::from_parts(parts, axum::body::Body::from(res_bytes))
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -1584,7 +1792,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/log", get(admin_log))
         .route("/import", post(admin_import))
         .route("/configure", post(admin_configure))
-        .route("/graph", post(admin_graph))
+        .route("/graph", get(admin_graph_current).post(admin_graph))
         .route(
             "/recipes",
             post(admin_create_recipe).get(admin_list_recipes),
@@ -1595,6 +1803,8 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(admin_delete_recipe)
                 .put(admin_update_recipe),
         )
+        .route("/recipes/{id}/export", get(admin_export_recipe))
+        .route("/recipes/import", post(admin_import_recipe))
         .route("/recipes/{id}/activate", post(admin_activate_recipe))
         .route(
             "/recipes/{id}/config",
