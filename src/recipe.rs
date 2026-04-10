@@ -131,6 +131,23 @@ pub fn update_recipe_config(
     Ok(changes > 0)
 }
 
+pub fn update_recipe(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    spec_source: &str,
+    selected_endpoints_json: &str,
+    seed_count: i64,
+    shared_pools: &str,
+    quantity_configs: &str,
+) -> Result<bool, rusqlite::Error> {
+    let changes = conn.execute(
+        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"shared_pools\" = ?5, \"quantity_configs\" = ?6 WHERE \"id\" = ?7",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, shared_pools, quantity_configs, id],
+    )?;
+    Ok(changes > 0)
+}
+
 pub fn delete_recipe(conn: &Connection, id: i64) -> Result<bool, rusqlite::Error> {
     let changes = conn.execute("DELETE FROM \"recipes\" WHERE \"id\" = ?1", [id])?;
     Ok(changes > 0)

@@ -947,6 +947,16 @@ struct CreateRecipeRequest {
     quantity_configs: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+struct UpdateRecipeRequest {
+    name: String,
+    spec_source: String,
+    endpoints: Vec<EndpointInfo>,
+    seed_count: Option<i64>,
+    shared_pools: Option<serde_json::Value>,
+    quantity_configs: Option<serde_json::Value>,
+}
+
 async fn admin_create_recipe(
     State(state): State<AppState>,
     Json(body): Json<CreateRecipeRequest>,
@@ -1056,6 +1066,74 @@ async fn admin_delete_recipe(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to delete recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_update_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(body): Json<UpdateRecipeRequest>,
+) -> Response {
+    // Validate the spec_source is valid swagger
+    let _spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid spec: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let endpoints_json = match serde_json::to_string(&body.endpoints) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to serialize endpoints: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let seed_count = body.seed_count.unwrap_or(10);
+    let shared_pools_str = body
+        .shared_pools
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
+    let quantity_configs_str = body
+        .quantity_configs
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
+
+    let conn = state.recipe_db.lock().unwrap();
+    match crate::recipe::update_recipe(
+        &conn,
+        id,
+        &body.name,
+        &body.spec_source,
+        &endpoints_json,
+        seed_count,
+        &shared_pools_str,
+        &quantity_configs_str,
+    ) {
+        Ok(true) => match crate::recipe::get_recipe(&conn, id) {
+            Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipe not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update recipe: {e}")})),
         )
             .into_response(),
     }
@@ -1513,7 +1591,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/recipes/{id}",
-            get(admin_get_recipe).delete(admin_delete_recipe),
+            get(admin_get_recipe)
+                .delete(admin_delete_recipe)
+                .put(admin_update_recipe),
         )
         .route("/recipes/{id}/activate", post(admin_activate_recipe))
         .route(
