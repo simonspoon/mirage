@@ -1,9 +1,31 @@
 // Mock data seeder
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
+use serde::Deserialize;
+
 use crate::parser::{SchemaObject, SwaggerSpec};
 use rand::RngExt;
 use rusqlite::Connection;
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FakerStrategy {
+    Auto,
+    Word,
+    Name,
+    Email,
+    Phone,
+    Url,
+    Sentence,
+    Paragraph,
+    Uuid,
+    Date,
+    Integer,
+    Float,
+    Boolean,
+}
 
 const NAMES: &[&str] = &[
     "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Hank", "Ivy", "Jack",
@@ -99,6 +121,68 @@ pub fn fake_value_for_field(name: &str, schema: &SchemaObject) -> serde_json::Va
     }
 }
 
+pub fn fake_value_for_field_with_rule(
+    name: &str,
+    schema: &SchemaObject,
+    rule: Option<&FakerStrategy>,
+) -> serde_json::Value {
+    let mut rng = rand::rng();
+
+    match rule {
+        None | Some(FakerStrategy::Auto) => fake_value_for_field(name, schema),
+        Some(FakerStrategy::Word) => {
+            let idx = rng.random_range(0..WORDS.len());
+            serde_json::Value::String(WORDS[idx].to_string())
+        }
+        Some(FakerStrategy::Name) => {
+            let idx = rng.random_range(0..NAMES.len());
+            serde_json::Value::String(NAMES[idx].to_string())
+        }
+        Some(FakerStrategy::Email) => {
+            let n: u32 = rng.random_range(0..10000);
+            serde_json::Value::String(format!("user{n}@example.com"))
+        }
+        Some(FakerStrategy::Phone) => {
+            let n: u32 = rng.random_range(1000000..9999999);
+            serde_json::Value::String(format!("555-{n}"))
+        }
+        Some(FakerStrategy::Url) => {
+            let n: u32 = rng.random_range(0..10000);
+            serde_json::Value::String(format!("https://example.com/{n}"))
+        }
+        Some(FakerStrategy::Sentence) => {
+            let idx = rng.random_range(0..LOREM.len());
+            serde_json::Value::String(LOREM[idx].to_string())
+        }
+        Some(FakerStrategy::Paragraph) => {
+            let count = rng.random_range(2..=3usize);
+            let sentences: Vec<&str> = (0..count)
+                .map(|_| {
+                    let idx = rng.random_range(0..LOREM.len());
+                    LOREM[idx]
+                })
+                .collect();
+            serde_json::Value::String(sentences.join(" "))
+        }
+        Some(FakerStrategy::Uuid) => serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        Some(FakerStrategy::Date) => {
+            let year = rng.random_range(2020..=2025);
+            let month = rng.random_range(1..=12u32);
+            let day = rng.random_range(1..=28u32);
+            serde_json::Value::String(format!("{year:04}-{month:02}-{day:02}"))
+        }
+        Some(FakerStrategy::Integer) => {
+            let n: i64 = rng.random_range(1..10000);
+            serde_json::Value::Number(serde_json::Number::from(n))
+        }
+        Some(FakerStrategy::Float) => {
+            let n: f64 = rng.random_range(0.0..10000.0);
+            serde_json::json!(n)
+        }
+        Some(FakerStrategy::Boolean) => serde_json::Value::Bool(rng.random::<bool>()),
+    }
+}
+
 fn map_type(schema: &SchemaObject) -> &str {
     match schema.schema_type.as_deref() {
         Some("integer") => "INTEGER",
@@ -135,6 +219,7 @@ pub fn seed_table(
     table_name: &str,
     schema: &SchemaObject,
     count: usize,
+    faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
 ) -> Result<(), rusqlite::Error> {
     let props = match effective_props(schema) {
         Some(p) => p,
@@ -161,7 +246,10 @@ pub fn seed_table(
 
         for col_name in &col_names {
             let col_schema = &props[col_name.as_str()];
-            let value = fake_value_for_field(col_name, col_schema);
+            let rule = faker_rules
+                .and_then(|r| r.get(table_name))
+                .and_then(|m| m.get(col_name.as_str()));
+            let value = fake_value_for_field_with_rule(col_name, col_schema, rule);
             let sqlite_type = map_type(col_schema);
 
             match sqlite_type {
@@ -210,7 +298,7 @@ pub fn seed_tables(
     spec: &SwaggerSpec,
     rows_per_table: usize,
 ) -> Result<(), rusqlite::Error> {
-    seed_tables_filtered(conn, spec, rows_per_table, None)
+    seed_tables_filtered(conn, spec, rows_per_table, None, None)
 }
 
 pub fn seed_tables_filtered(
@@ -218,6 +306,7 @@ pub fn seed_tables_filtered(
     spec: &SwaggerSpec,
     rows_per_table: usize,
     only: Option<&std::collections::HashSet<String>>,
+    faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
 ) -> Result<(), rusqlite::Error> {
     if let Some(ref definitions) = spec.definitions {
         for (name, schema) in definitions {
@@ -226,7 +315,7 @@ pub fn seed_tables_filtered(
             {
                 continue;
             }
-            seed_table(conn, name, schema, rows_per_table)?;
+            seed_table(conn, name, schema, rows_per_table, faker_rules)?;
         }
     }
     Ok(())

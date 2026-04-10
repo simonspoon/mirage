@@ -920,7 +920,9 @@ async fn admin_configure(
             )
                 .into_response();
         }
-        if let Err(e) = seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs)) {
+        if let Err(e) =
+            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs), None)
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
@@ -958,6 +960,7 @@ struct CreateRecipeRequest {
     seed_count: Option<i64>,
     shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
+    faker_rules: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -968,6 +971,7 @@ struct UpdateRecipeRequest {
     seed_count: Option<i64>,
     shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
+    faker_rules: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -1006,6 +1010,10 @@ async fn admin_create_recipe(
         .quantity_configs
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let faker_rules_str = body
+        .faker_rules
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     let recipe = {
         let conn = state.recipe_db.lock().unwrap();
@@ -1017,6 +1025,7 @@ async fn admin_create_recipe(
             seed_count,
             shared_pools_str.as_deref(),
             quantity_configs_str.as_deref(),
+            faker_rules_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1123,6 +1132,11 @@ async fn admin_update_recipe(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|| "{}".to_string());
+    let faker_rules_str = body
+        .faker_rules
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
 
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::update_recipe(
@@ -1134,6 +1148,7 @@ async fn admin_update_recipe(
         seed_count,
         &shared_pools_str,
         &quantity_configs_str,
+        &faker_rules_str,
     ) {
         Ok(true) => match crate::recipe::get_recipe(&conn, id) {
             Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
@@ -1165,6 +1180,8 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
             let quantity_configs: serde_json::Value =
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
+            let faker_rules: serde_json::Value =
+                serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
 
             let export = serde_json::json!({
                 "mirage_recipe": 1,
@@ -1174,11 +1191,15 @@ async fn admin_export_recipe(
                 "seed_count": recipe.seed_count,
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
+                "faker_rules": faker_rules,
             });
 
             let filename = format!(
                 "{}.mirage.json",
-                recipe.name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-")
+                recipe
+                    .name
+                    .to_lowercase()
+                    .replace(|c: char| !c.is_alphanumeric(), "-")
             );
 
             (
@@ -1284,6 +1305,9 @@ async fn admin_import_recipe(
     let quantity_configs_str = body
         .get("quantity_configs")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let faker_rules_str = body
+        .get("faker_rules")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::create_recipe(
@@ -1294,6 +1318,7 @@ async fn admin_import_recipe(
         seed_count,
         shared_pools_str.as_deref(),
         quantity_configs_str.as_deref(),
+        faker_rules_str.as_deref(),
     ) {
         Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
         Err(e) => (
@@ -1361,6 +1386,7 @@ async fn admin_activate_recipe(
     // Parse shared_pools and quantity_configs from recipe
     let pool_config = crate::composer::parse_shared_pools(&recipe.shared_pools);
     let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
+    let faker_rules = crate::composer::parse_faker_rules(&recipe.faker_rules);
 
     // Store spec in registry (same as admin_import)
     {
@@ -1465,7 +1491,13 @@ async fn admin_activate_recipe(
             )
                 .into_response();
         }
-        if let Err(e) = seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs)) {
+        if let Err(e) = seeder::seed_tables_filtered(
+            &conn,
+            &spec,
+            seed_count,
+            Some(&needed_defs),
+            Some(&faker_rules),
+        ) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
@@ -1476,7 +1508,7 @@ async fn admin_activate_recipe(
 
     // Generate document store using composer
     let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
-    let pools = crate::composer::generate_pools(&spec, &pool_config);
+    let pools = crate::composer::generate_pools(&spec, &pool_config, &faker_rules);
 
     // Build quantity configs: use recipe quantity_configs, with seed_count as default
     let mut effective_quantities = quantity_configs;
@@ -1497,6 +1529,7 @@ async fn admin_activate_recipe(
         &pools,
         &effective_quantities,
         &endpoints,
+        &faker_rules,
     );
 
     // Store composed documents
@@ -1540,9 +1573,12 @@ async fn admin_get_recipe_config(
                 serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
             let quantity_configs: serde_json::Value =
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
+            let faker_rules: serde_json::Value =
+                serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
             Json(serde_json::json!({
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
+                "faker_rules": faker_rules,
             }))
             .into_response()
         }
@@ -1563,6 +1599,7 @@ async fn admin_get_recipe_config(
 struct UpdateRecipeConfigRequest {
     shared_pools: serde_json::Value,
     quantity_configs: serde_json::Value,
+    faker_rules: serde_json::Value,
 }
 
 async fn admin_put_recipe_config(
@@ -1574,11 +1611,20 @@ async fn admin_put_recipe_config(
         serde_json::to_string(&body.shared_pools).unwrap_or_else(|_| "{}".to_string());
     let quantity_configs_str =
         serde_json::to_string(&body.quantity_configs).unwrap_or_else(|_| "{}".to_string());
+    let faker_rules_str =
+        serde_json::to_string(&body.faker_rules).unwrap_or_else(|_| "{}".to_string());
     let conn = state.recipe_db.lock().unwrap();
-    match crate::recipe::update_recipe_config(&conn, id, &shared_pools_str, &quantity_configs_str) {
+    match crate::recipe::update_recipe_config(
+        &conn,
+        id,
+        &shared_pools_str,
+        &quantity_configs_str,
+        &faker_rules_str,
+    ) {
         Ok(true) => Json(serde_json::json!({
             "shared_pools": body.shared_pools,
             "quantity_configs": body.quantity_configs,
+            "faker_rules": body.faker_rules,
         }))
         .into_response(),
         Ok(false) => (
@@ -1609,9 +1655,16 @@ async fn admin_graph_current(State(state): State<AppState>) -> impl IntoResponse
         }
     };
     let selected: Vec<(String, String)> = if reg.endpoints.is_empty() {
-        raw_spec.path_operations().iter().map(|(path, method, _)| (path.to_string(), method.to_string())).collect()
+        raw_spec
+            .path_operations()
+            .iter()
+            .map(|(path, method, _)| (path.to_string(), method.to_string()))
+            .collect()
     } else {
-        reg.endpoints.iter().map(|e| (e.path.clone(), e.method.to_lowercase())).collect()
+        reg.endpoints
+            .iter()
+            .map(|e| (e.path.clone(), e.method.to_lowercase()))
+            .collect()
     };
     let graph = crate::entity_graph::build_entity_graph(raw_spec, &selected);
     Json(serde_json::json!(graph)).into_response()
@@ -1776,7 +1829,14 @@ async fn logging_middleware(
         Some(String::from_utf8_lossy(&res_bytes).into_owned())
     };
 
-    log_request(&state.log, &method, &path, status, request_body, response_body);
+    log_request(
+        &state.log,
+        &method,
+        &path,
+        status,
+        request_body,
+        response_body,
+    );
 
     Response::from_parts(parts, axum::body::Body::from(res_bytes))
 }
@@ -2500,6 +2560,7 @@ mod tests {
         let config = serde_json::json!({
             "shared_pools": {"Pet": {"is_shared": true, "pool_size": 5}},
             "quantity_configs": {"Pet.tags": {"min": 1, "max": 3}},
+            "faker_rules": {},
         });
         let req = Request::builder()
             .method("PUT")
@@ -2537,6 +2598,7 @@ mod tests {
         let config = serde_json::json!({
             "shared_pools": {},
             "quantity_configs": {},
+            "faker_rules": {},
         });
         let req = Request::builder()
             .method("PUT")

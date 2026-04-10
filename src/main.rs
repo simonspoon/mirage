@@ -290,7 +290,8 @@ async fn main() {
             .collect();
         let entity_graph = entity_graph::build_entity_graph(&raw_spec, &all_ops);
         let pool_config = composer::SharedPoolConfig::new();
-        let pools = composer::generate_pools(&spec, &pool_config);
+        let no_faker_rules = composer::FakerRules::new();
+        let pools = composer::generate_pools(&spec, &pool_config, &no_faker_rules);
         let mut quantities = composer::QuantityConfigs::new();
         if let Some(defs) = &spec.definitions {
             for def_name in defs.keys() {
@@ -315,6 +316,7 @@ async fn main() {
             &pools,
             &quantities,
             &all_endpoints,
+            &no_faker_rules,
         );
         *documents.write().unwrap() = composed;
     }

@@ -6,8 +6,10 @@ use rand::RngExt;
 
 use crate::entity_graph::EntityGraph;
 use crate::parser::{SchemaObject, SwaggerSpec};
-use crate::seeder::fake_value_for_field;
+use crate::seeder::{FakerStrategy, fake_value_for_field, fake_value_for_field_with_rule};
 use crate::server::EndpointInfo;
+
+pub type FakerRules = HashMap<String, HashMap<String, FakerStrategy>>;
 
 pub type SharedPoolConfig = HashMap<String, usize>;
 
@@ -22,7 +24,11 @@ pub type DocumentStore = HashMap<String, Vec<serde_json::Value>>;
 
 /// Generate pools of shared entities according to pool_config.
 /// Each pool entry maps a definition name to N generated instances.
-pub fn generate_pools(spec: &SwaggerSpec, pool_config: &SharedPoolConfig) -> DocumentStore {
+pub fn generate_pools(
+    spec: &SwaggerSpec,
+    pool_config: &SharedPoolConfig,
+    faker_rules: &FakerRules,
+) -> DocumentStore {
     let defs = match &spec.definitions {
         Some(d) => d,
         None => return DocumentStore::new(),
@@ -38,7 +44,8 @@ pub fn generate_pools(spec: &SwaggerSpec, pool_config: &SharedPoolConfig) -> Doc
 
         let mut instances = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
-            let mut doc = generate_document_from_schema(def_name, schema, &DocumentStore::new());
+            let mut doc =
+                generate_document_from_schema(def_name, schema, &DocumentStore::new(), faker_rules);
             // Assign a stable id to each pool entity
             if let serde_json::Value::Object(ref mut map) = doc {
                 map.insert(
@@ -65,6 +72,7 @@ pub fn compose_documents(
     pools: &DocumentStore,
     quantities: &QuantityConfigs,
     selected_endpoints: &[EndpointInfo],
+    faker_rules: &FakerRules,
 ) -> DocumentStore {
     let defs = match &spec.definitions {
         Some(d) => d,
@@ -113,7 +121,7 @@ pub fn compose_documents(
 
         let mut docs = Vec::with_capacity(count);
         for i in 0..count {
-            let mut doc = generate_document_from_schema(&def_name, schema, pools);
+            let mut doc = generate_document_from_schema(&def_name, schema, pools, faker_rules);
             // Assign incremental id
             if let serde_json::Value::Object(ref mut map) = doc {
                 map.insert(
@@ -134,6 +142,7 @@ fn generate_document_from_schema(
     _def_name: &str,
     schema: &SchemaObject,
     pools: &DocumentStore,
+    faker_rules: &FakerRules,
 ) -> serde_json::Value {
     let props = match &schema.properties {
         Some(p) => p,
@@ -144,7 +153,14 @@ fn generate_document_from_schema(
     let mut rng = rand::rng();
 
     for (prop_name, prop_schema) in props {
-        let value = generate_property_value(prop_name, prop_schema, pools, &mut rng);
+        let value = generate_property_value(
+            prop_name,
+            prop_schema,
+            pools,
+            &mut rng,
+            _def_name,
+            faker_rules,
+        );
         map.insert(prop_name.clone(), value);
     }
 
@@ -157,6 +173,8 @@ fn generate_property_value(
     prop_schema: &SchemaObject,
     pools: &DocumentStore,
     rng: &mut impl rand::Rng,
+    def_name: &str,
+    faker_rules: &FakerRules,
 ) -> serde_json::Value {
     // Check if this is an array with $ref items pointing to a pool
     if prop_schema.schema_type.as_deref() == Some("array")
@@ -189,8 +207,9 @@ fn generate_property_value(
         return pool[idx].clone();
     }
 
-    // Default: generate a fresh fake value
-    fake_value_for_field(prop_name, prop_schema)
+    // Check for faker rule
+    let rule = faker_rules.get(def_name).and_then(|m| m.get(prop_name));
+    fake_value_for_field_with_rule(prop_name, prop_schema, rule)
 }
 
 /// Extract the definition name from a schema if it has a $ref.
@@ -263,6 +282,51 @@ pub fn parse_quantity_configs(json_str: &str) -> QuantityConfigs {
     configs
 }
 
+/// Parse FakerRules from a JSON string.
+/// Input format: {"DefName.propName": "strategy", ...}
+/// Splits on first dot to get (def_name, prop_name). Strategy strings map to FakerStrategy via serde.
+/// Unknown strategies or "auto" are skipped (not inserted).
+pub fn parse_faker_rules(json_str: &str) -> FakerRules {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return FakerRules::new(),
+    };
+
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return FakerRules::new(),
+    };
+
+    let mut rules = FakerRules::new();
+    for (key, val) in obj {
+        let strategy_str = match val.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Skip "auto" -- it means use the default heuristic
+        if strategy_str == "auto" {
+            continue;
+        }
+        let strategy: FakerStrategy = match serde_json::from_value(serde_json::json!(strategy_str))
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Split on first dot
+        let dot = match key.find('.') {
+            Some(d) => d,
+            None => continue,
+        };
+        let def_name = &key[..dot];
+        let prop_name = &key[dot + 1..];
+        rules
+            .entry(def_name.to_string())
+            .or_default()
+            .insert(prop_name.to_string(), strategy);
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +350,7 @@ mod tests {
         pool_config.insert("Category".to_string(), 5);
         pool_config.insert("Tag".to_string(), 3);
 
-        let pools = generate_pools(&spec, &pool_config);
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
 
         assert_eq!(pools.get("Category").unwrap().len(), 5);
         assert_eq!(pools.get("Tag").unwrap().len(), 3);
@@ -304,7 +368,7 @@ mod tests {
         let spec = load_petstore_resolved();
         let pool_config = SharedPoolConfig::new();
 
-        let pools = generate_pools(&spec, &pool_config);
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
 
         assert!(pools.is_empty(), "empty config should produce empty pools");
     }
@@ -325,7 +389,15 @@ mod tests {
             path: "/pet/{petId}".to_string(),
         }];
 
-        let docs = compose_documents(&spec, &raw_spec, &graph, &pools, &quantities, &endpoints);
+        let docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+        );
 
         assert!(docs.contains_key("Pet"), "should have Pet documents");
         assert_eq!(
@@ -393,7 +465,7 @@ mod tests {
         // Create a Category pool
         let mut pool_config = SharedPoolConfig::new();
         pool_config.insert("Category".to_string(), 3);
-        let pools = generate_pools(&spec, &pool_config);
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
 
         let mut quantities = QuantityConfigs::new();
         quantities.insert("Pet".to_string(), QuantityConfig { min: 5, max: 5 });
@@ -403,7 +475,15 @@ mod tests {
             path: "/pet/{petId}".to_string(),
         }];
 
-        let docs = compose_documents(&spec, &raw_spec, &graph, &pools, &quantities, &endpoints);
+        let docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+        );
 
         let pets = docs.get("Pet").unwrap();
         assert_eq!(pets.len(), 5);

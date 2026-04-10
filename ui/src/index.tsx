@@ -46,6 +46,7 @@ interface Recipe {
   created_at: string;
   shared_pools: string;
   quantity_configs: string;
+  faker_rules: string;
 }
 
 interface PropertyInfo {
@@ -129,6 +130,7 @@ function App() {
   const [graphLoading, setGraphLoading] = createSignal(false);
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
+  const [recipeFakerRules, setRecipeFakerRules] = createSignal<Record<string, string>>({});
   const [configSearch, setConfigSearch] = createSignal("");
   const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
   const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
@@ -405,6 +407,14 @@ function App() {
       setRecipeQuantityConfigs(configs);
     }
 
+    if (Object.keys(recipeFakerRules()).length === 0) {
+      const rules: Record<string, string> = {};
+      for (const sp of graph.scalar_properties || []) {
+        rules[`${sp.def_name}.${sp.prop_name}`] = "auto";
+      }
+      setRecipeFakerRules(rules);
+    }
+
     setRecipeStep("config");
   };
 
@@ -440,6 +450,7 @@ function App() {
             seed_count: recipeSeedCount(),
             shared_pools: recipeSharedPools(),
             quantity_configs: recipeQuantityConfigs(),
+            faker_rules: recipeFakerRules(),
           }),
         });
         if (!res.ok) {
@@ -460,6 +471,7 @@ function App() {
         setEntityGraph(null);
         setRecipeSharedPools({});
         setRecipeQuantityConfigs({});
+        setRecipeFakerRules({});
         setEditingRecipeId(null);
         setSaveActivatePhase("idle");
         await refreshRecipes();
@@ -488,6 +500,7 @@ function App() {
           seed_count: recipeSeedCount(),
           shared_pools: recipeSharedPools(),
           quantity_configs: recipeQuantityConfigs(),
+          faker_rules: recipeFakerRules(),
         }),
       });
       if (!res.ok) {
@@ -543,6 +556,7 @@ function App() {
       setRecipeStep("paste");
       setRecipeSharedPools({});
       setRecipeQuantityConfigs({});
+      setRecipeFakerRules({});
       setEntityGraph(null);
       setSavedRecipeId(null);
       setSaveActivatePhase("idle");
@@ -626,11 +640,13 @@ function App() {
         selectedEps.some((sel) => sel.method === ep.method && sel.path === ep.path)
       );
 
-      // Parse shared_pools and quantity_configs
+      // Parse shared_pools, quantity_configs, and faker_rules
       let sharedPools: Record<string, {is_shared: boolean, pool_size: number}> = {};
       try { sharedPools = JSON.parse(recipe.shared_pools); } catch { /* empty */ }
       let quantityConfigs: Record<string, {min: number, max: number}> = {};
       try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
+      let fakerRules: Record<string, string> = {};
+      try { fakerRules = JSON.parse(recipe.faker_rules); } catch { /* empty */ }
 
       setRecipeSpecText(recipe.spec_source);
       setRecipeAvailableEndpoints(availableEps);
@@ -639,6 +655,7 @@ function App() {
       setRecipeSeedCount(recipe.seed_count);
       setRecipeSharedPools(sharedPools);
       setRecipeQuantityConfigs(quantityConfigs);
+      setRecipeFakerRules(fakerRules);
       setEditingRecipeId(recipe.id);
       setRecipeStep("select");
       setRecipeCreating(true);
@@ -659,6 +676,7 @@ function App() {
     setEntityGraph(null);
     setRecipeSharedPools({});
     setRecipeQuantityConfigs({});
+    setRecipeFakerRules({});
     setEditingRecipeId(null);
     setError(null);
   };
@@ -1794,7 +1812,8 @@ function App() {
                 {(() => {
                   const hasPools = () => Object.keys(recipeSharedPools()).length > 0;
                   const hasConfigs = () => Object.keys(recipeQuantityConfigs()).length > 0;
-                  const hasAnything = () => hasPools() || hasConfigs();
+                  const hasRules = () => Object.keys(recipeFakerRules()).length > 0;
+                  const hasAnything = () => hasPools() || hasConfigs() || hasRules();
 
                   // Group array quantity configs by entity (part before the dot)
                   const groupedConfigs = () => {
@@ -1829,6 +1848,37 @@ function App() {
                     return result;
                   };
 
+                  const FAKER_STRATEGIES = ["auto","word","name","email","phone","url","sentence","paragraph","uuid","date","integer","float","boolean"];
+
+                  const groupedRules = () => {
+                    const groups: Record<string, {key: string, strategy: string, propType: string, format: string | null}[]> = {};
+                    const graph = entityGraph();
+                    const scalarMap: Record<string, {prop_type: string, format: string | null}> = {};
+                    for (const sp of graph?.scalar_properties || []) {
+                      scalarMap[`${sp.def_name}.${sp.prop_name}`] = {prop_type: sp.prop_type, format: sp.format};
+                    }
+                    for (const [key, strategy] of Object.entries(recipeFakerRules())) {
+                      const dot = key.indexOf(".");
+                      const entity = dot >= 0 ? key.slice(0, dot) : key;
+                      if (!groups[entity]) groups[entity] = [];
+                      const meta = scalarMap[key] || {prop_type: "string", format: null};
+                      groups[entity].push({key, strategy, propType: meta.prop_type, format: meta.format});
+                    }
+                    return groups;
+                  };
+
+                  const filteredRuleGroups = () => {
+                    const q = configSearch().toLowerCase();
+                    const groups = groupedRules();
+                    const result: typeof groups = {};
+                    for (const [entity, items] of Object.entries(groups)) {
+                      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+                      const visible = configShowNonDefault() ? matching.filter(i => i.strategy !== "auto") : matching;
+                      if (visible.length > 0) result[entity] = visible;
+                    }
+                    return result;
+                  };
+
                   // Collapsed state for entity groups
                   const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
                   const toggleGroup = (entity: string) => {
@@ -1843,7 +1893,7 @@ function App() {
                         <div>
                           <h3 class="text-lg font-semibold">Configure Data Generation</h3>
                           <p class="text-sm text-gray-500">
-                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties
+                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties · {Object.keys(recipeFakerRules()).length} field rules
                           </p>
                         </div>
                         <Show when={hasAnything()}>
@@ -1859,7 +1909,7 @@ function App() {
                       <Show when={hasAnything()}>
                         <input
                           type="text"
-                          placeholder="Search pools and properties..."
+                          placeholder="Search pools, properties, and rules..."
                           value={configSearch()}
                           onInput={(e) => setConfigSearch(e.currentTarget.value)}
                           class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
@@ -2003,8 +2053,82 @@ function App() {
                         </div>
                       </Show>
 
+                      {/* Field Generation Rules — grouped by entity */}
+                      <Show when={hasRules() && Object.keys(filteredRuleGroups()).length > 0}>
+                        <div class="mb-6">
+                          <div class="flex items-center justify-between mb-2">
+                            <h4 class="text-sm font-medium text-gray-300">Field Generation Rules</h4>
+                            <div class="flex items-center gap-2">
+                              <span class="text-[10px] text-gray-600">Set all to</span>
+                              <select
+                                class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  if (!val) return;
+                                  const rules = {...recipeFakerRules()};
+                                  for (const key of Object.keys(rules)) {
+                                    rules[key] = val;
+                                  }
+                                  setRecipeFakerRules(rules);
+                                  e.target.value = "";
+                                }}
+                              >
+                                <option value="">--</option>
+                                <For each={FAKER_STRATEGIES}>
+                                  {(s) => <option value={s}>{s}</option>}
+                                </For>
+                              </select>
+                            </div>
+                          </div>
+                          <div class="space-y-1">
+                            <For each={Object.entries(filteredRuleGroups()).sort(([a], [b]) => a.localeCompare(b))}>
+                              {([entity, items]) => (
+                                <div class="rounded-md overflow-hidden">
+                                  <button
+                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                                    onClick={() => toggleGroup(entity + "_rules")}
+                                  >
+                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
+                                    <span class="font-medium">{entity}</span>
+                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
+                                  </button>
+                                  <Show when={!collapsedGroups().has(entity + "_rules")}>
+                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                      <For each={items}>
+                                        {(item) => {
+                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                          return (
+                                            <div class="flex items-center gap-3 px-3 py-1.5">
+                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
+                                              <select
+                                                value={item.strategy}
+                                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                                onChange={(e) => {
+                                                  const rules = {...recipeFakerRules()};
+                                                  rules[item.key] = e.target.value;
+                                                  setRecipeFakerRules(rules);
+                                                }}
+                                              >
+                                                <For each={FAKER_STRATEGIES}>
+                                                  {(s) => <option value={s}>{s}</option>}
+                                                </For>
+                                              </select>
+                                            </div>
+                                          );
+                                        }}
+                                      </For>
+                                    </div>
+                                  </Show>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+
                       {!hasAnything() && (
-                        <p class="text-gray-400 mb-4">No shared entities or array properties detected. You can proceed to name your recipe.</p>
+                        <p class="text-gray-400 mb-4">No shared entities, array properties, or scalar fields detected. You can proceed to name your recipe.</p>
                       )}
 
                     </div>

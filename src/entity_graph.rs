@@ -13,12 +13,21 @@ pub struct ArrayPropInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ScalarPropInfo {
+    pub def_name: String,
+    pub prop_name: String,
+    pub prop_type: String,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityGraph {
     pub nodes: Vec<String>,
     pub roots: HashMap<String, Vec<EndpointInfo>>,
     pub edges: HashMap<String, Vec<String>>,
     pub shared_entities: Vec<String>,
     pub array_properties: Vec<ArrayPropInfo>,
+    pub scalar_properties: Vec<ScalarPropInfo>,
 }
 
 /// Extract the root definition name from a schema's $ref (or items.$ref for arrays).
@@ -109,6 +118,43 @@ fn find_array_properties(
                         target_def: target.to_string(),
                     });
                 }
+            }
+        }
+    }
+    result.sort_by(|a, b| (&a.def_name, &a.prop_name).cmp(&(&b.def_name, &b.prop_name)));
+    result
+}
+
+fn find_scalar_properties(
+    nodes: &HashSet<String>,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Vec<ScalarPropInfo> {
+    let mut result = Vec::new();
+    let defs = match spec_defs {
+        Some(d) => d,
+        None => return result,
+    };
+    for node in nodes {
+        if let Some(def) = defs.get(node)
+            && let Some(props) = &def.properties
+        {
+            for (prop_name, prop_schema) in props {
+                // Skip if it has a $ref
+                if prop_schema.ref_path.is_some() {
+                    continue;
+                }
+                let schema_type = match prop_schema.schema_type.as_deref() {
+                    Some("string") | Some("integer") | Some("number") | Some("boolean") => {
+                        prop_schema.schema_type.as_deref().unwrap()
+                    }
+                    _ => continue,
+                };
+                result.push(ScalarPropInfo {
+                    def_name: node.clone(),
+                    prop_name: prop_name.clone(),
+                    prop_type: schema_type.to_string(),
+                    format: prop_schema.format.clone(),
+                });
             }
         }
     }
@@ -243,6 +289,9 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
     // Compute array properties before consuming all_nodes
     let array_properties = find_array_properties(&all_nodes, spec_defs);
 
+    // Compute scalar properties
+    let scalar_properties = find_scalar_properties(&all_nodes, spec_defs);
+
     // Sort nodes
     let mut nodes: Vec<String> = all_nodes.into_iter().collect();
     nodes.sort();
@@ -258,6 +307,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         edges,
         shared_entities,
         array_properties,
+        scalar_properties,
     }
 }
 
