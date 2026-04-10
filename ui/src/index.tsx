@@ -101,8 +101,13 @@ function App() {
   const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "graph" | "config" | "name">("paste");
   const [entityGraph, setEntityGraph] = createSignal<any>(null);
   const [graphLoading, setGraphLoading] = createSignal(false);
+  const [graphSelectedEntity, setGraphSelectedEntity] = createSignal<string | null>(null);
+  const [graphSearch, setGraphSearch] = createSignal("");
+  const [graphGroupBy, setGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
+  const [configSearch, setConfigSearch] = createSignal("");
+  const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
   const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
 
   // Schema state
@@ -348,17 +353,22 @@ function App() {
     const graph = entityGraph();
     if (!graph) return;
 
-    const pools: Record<string, {is_shared: boolean, pool_size: number}> = {};
-    for (const entity of graph.shared_entities || []) {
-      pools[entity] = { is_shared: true, pool_size: 10 };
+    // Preserve existing config if already populated (edit mode tab switching)
+    if (Object.keys(recipeSharedPools()).length === 0) {
+      const pools: Record<string, {is_shared: boolean, pool_size: number}> = {};
+      for (const entity of graph.shared_entities || []) {
+        pools[entity] = { is_shared: true, pool_size: 10 };
+      }
+      setRecipeSharedPools(pools);
     }
-    setRecipeSharedPools(pools);
 
-    const configs: Record<string, {min: number, max: number}> = {};
-    for (const ap of graph.array_properties || []) {
-      configs[`${ap.def_name}.${ap.prop_name}`] = { min: 1, max: 3 };
+    if (Object.keys(recipeQuantityConfigs()).length === 0) {
+      const configs: Record<string, {min: number, max: number}> = {};
+      for (const ap of graph.array_properties || []) {
+        configs[`${ap.def_name}.${ap.prop_name}`] = { min: 1, max: 3 };
+      }
+      setRecipeQuantityConfigs(configs);
     }
-    setRecipeQuantityConfigs(configs);
 
     setRecipeStep("config");
   };
@@ -618,6 +628,61 @@ function App() {
     setError(null);
   };
 
+  const handleRecipeExport = async (id: number) => {
+    try {
+      const res = await fetch(`/_api/admin/recipes/${id}/export`);
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        return;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="(.+)"/);
+      const filename = match ? match[1] : "recipe.mirage.json";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+  };
+
+  const handleRecipeImport = async () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,.mirage.json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        const res = await fetch("/_api/admin/recipes/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok) {
+          const rtext = await res.text();
+          try { setError(JSON.parse(rtext).error || rtext); } catch { setError(`${res.status}: ${rtext}`); }
+          setLoading(false);
+          return;
+        }
+        await refreshRecipes();
+      } catch (e: any) {
+        setError(String(e?.message || e));
+      }
+      setLoading(false);
+    };
+    input.click();
+  };
+
   const toggleDef = (name: string) => {
     const next = new Set(expandedDefs());
     if (next.has(name)) next.delete(name);
@@ -697,7 +762,7 @@ function App() {
 
       {/* Main */}
       <main class="flex-1 min-h-screen">
-        <div class={`p-8 ${page() === "schemas" ? "max-w-7xl" : "max-w-5xl"}`}>
+        <div class="p-8">
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error()}
@@ -1154,25 +1219,94 @@ function App() {
             <div class="flex items-center justify-between mb-6">
               <h2 class="text-2xl font-semibold">Recipes</h2>
               <Show when={!recipeCreating()}>
-                <button
-                  class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
-                  onClick={() => setRecipeCreating(true)}
-                >
-                  Create Recipe
-                </button>
+                <div class="flex gap-2">
+                  <button
+                    class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
+                    onClick={() => setRecipeCreating(true)}
+                  >
+                    Create Recipe
+                  </button>
+                  <button
+                    class="px-4 py-2 text-sm font-medium text-gray-300 hover:text-gray-100 border border-gray-700 hover:border-gray-600 rounded-lg transition-colors"
+                    onClick={handleRecipeImport}
+                  >
+                    Import
+                  </button>
+                </div>
               </Show>
               <Show when={recipeCreating()}>
-                <button
-                  class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
-                  onClick={handleRecipeCancelCreate}
-                >
-                  Cancel
-                </button>
+                <div class="flex items-center gap-2">
+                  {/* Back button */}
+                  <Show when={recipeStep() !== "paste"}>
+                    <button
+                      class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors disabled:opacity-50"
+                      disabled={loading()}
+                      onClick={() => {
+                        const prev: Record<string, "paste" | "select" | "graph" | "config"> = { select: "paste", graph: "select", config: "graph", name: "config" };
+                        setRecipeStep(prev[recipeStep()] || "paste");
+                      }}
+                    >Back</button>
+                  </Show>
+                  {/* Next button */}
+                  <Show when={recipeStep() !== "name"}>
+                    <button
+                      class="px-3.5 py-1.5 text-xs font-medium bg-blue-600 hover:bg-blue-500 rounded-md transition-colors disabled:opacity-50"
+                      disabled={loading() || graphLoading()}
+                      onClick={() => {
+                        if (recipeStep() === "paste") handleRecipeParseSpec();
+                        else if (recipeStep() === "select") handleFetchGraph();
+                        else if (recipeStep() === "graph") handleGoToConfig();
+                        else if (recipeStep() === "config") setRecipeStep("name");
+                      }}
+                    >
+                      {recipeStep() === "paste" ? (loading() ? "Parsing..." : "Next")
+                        : recipeStep() === "select" ? (graphLoading() ? "Computing..." : "Next")
+                        : "Next"}
+                    </button>
+                  </Show>
+                  {/* Save button on last step */}
+                  <Show when={recipeStep() === "name"}>
+                    <button
+                      class="px-3.5 py-1.5 text-xs font-medium bg-green-600 hover:bg-green-500 rounded-md transition-colors disabled:opacity-50"
+                      onClick={handleRecipeSaveAndActivate}
+                      disabled={loading()}
+                    >
+                      {loading()
+                        ? saveActivatePhase() === "saving" ? "Saving..." : "Activating..."
+                        : editingRecipeId() !== null ? "Save" : "Save & Activate"}
+                    </button>
+                  </Show>
+                  <div class="w-px h-5 bg-gray-800 mx-1" />
+                  <button
+                    class="px-3.5 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                    onClick={handleRecipeCancelCreate}
+                  >Cancel</button>
+                </div>
               </Show>
             </div>
 
             <Show when={recipeCreating()}>
-              <StepIndicator current={recipeStep()} onNavigate={(s) => { if (saveActivatePhase() === "idle") setRecipeStep(s); }} />
+              <StepIndicator
+                current={recipeStep()}
+                editMode={editingRecipeId() !== null}
+                onNavigate={async (s) => {
+                  if (saveActivatePhase() !== "idle") return;
+                  if (s === "graph" && !entityGraph()) {
+                    await handleFetchGraph();
+                    return;
+                  }
+                  if (s === "config") {
+                    if (!entityGraph()) {
+                      await handleFetchGraph();
+                    }
+                    if (Object.keys(recipeSharedPools()).length === 0 && Object.keys(recipeQuantityConfigs()).length === 0) {
+                      handleGoToConfig();
+                      return;
+                    }
+                  }
+                  setRecipeStep(s);
+                }}
+              />
 
               {/* Step 1: Paste spec */}
               <Show when={recipeStep() === "paste"}>
@@ -1183,13 +1317,6 @@ function App() {
                   value={recipeSpecText()}
                   onInput={(e) => setRecipeSpecText(e.currentTarget.value)}
                 />
-                <button
-                  class="mt-4 px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                  onClick={handleRecipeParseSpec}
-                  disabled={loading()}
-                >
-                  {loading() ? "Parsing..." : "Next: Select Endpoints"}
-                </button>
               </Show>
 
               {/* Step 2: Select endpoints */}
@@ -1227,144 +1354,510 @@ function App() {
                     )}
                   </For>
                 </div>
-                <button
-                  class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                  onClick={handleFetchGraph}
-                  disabled={graphLoading()}
-                >
-                  {graphLoading() ? "Computing graph..." : "Next: Entity Graph"}
-                </button>
               </Show>
 
               {/* Step 3: Entity Graph */}
               <Show when={recipeStep() === "graph"}>
-                <h3 class="text-lg font-semibold mb-2">Entity Graph</h3>
-                <p class="text-sm text-gray-400 mb-4">Definitions reachable from your selected endpoints. Shared entities are highlighted.</p>
-                <div class="space-y-2">
-                  <For each={entityGraph()?.nodes || []}>
-                    {(node: string) => (
-                      <div class={`p-3 rounded ${entityGraph()?.shared_entities?.includes(node) ? 'bg-yellow-900/30 border border-yellow-700' : 'bg-gray-800'}`}>
-                        <div class="flex items-center justify-between">
-                          <span class="font-medium">{node}</span>
-                          {entityGraph()?.shared_entities?.includes(node) && (
-                            <span class="text-xs bg-yellow-700 px-2 py-0.5 rounded">shared</span>
+                {(() => {
+                  const graph = () => entityGraph();
+                  const nodes = () => (graph()?.nodes || []) as string[];
+                  const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
+                  const shared = () => (graph()?.shared_entities || []) as string[];
+                  const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
+
+                  const filteredNodes = () => {
+                    const q = graphSearch().toLowerCase();
+                    const filtered = q ? nodes().filter((n: string) => n.toLowerCase().includes(q)) : nodes();
+                    if (graphGroupBy() === "alpha") return filtered.sort();
+                    return filtered;
+                  };
+
+                  const endpointGroups = () => {
+                    if (graphGroupBy() !== "endpoint") return {};
+                    const groups: Record<string, string[]> = {};
+                    const r = roots();
+                    const assigned = new Set<string>();
+                    for (const node of filteredNodes()) {
+                      if (r[node]) {
+                        for (const ep of r[node]) {
+                          const key = `${ep.method.toUpperCase()} ${ep.path}`;
+                          if (!groups[key]) groups[key] = [];
+                          groups[key].push(node);
+                          assigned.add(node);
+                        }
+                      }
+                    }
+                    // Entities not rooted to any endpoint
+                    const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
+                    if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
+                    return groups;
+                  };
+
+                  // Neighborhood graph: selected entity + 2 hops
+                  const neighborhood = () => {
+                    const sel = graphSelectedEntity();
+                    if (!sel) return { nodes: [] as string[], links: [] as {source: string, target: string}[] };
+                    const e = edges();
+                    const hop1 = new Set(e[sel] || []);
+                    const hop2 = new Set<string>();
+                    for (const n of hop1) {
+                      for (const n2 of (e[n] || [])) {
+                        if (n2 !== sel) hop2.add(n2);
+                      }
+                    }
+                    // Also include nodes that reference the selected entity (reverse edges)
+                    for (const [src, targets] of Object.entries(e)) {
+                      if (targets.includes(sel) && src !== sel) hop1.add(src);
+                    }
+                    const allNodes = [sel, ...Array.from(hop1), ...Array.from(hop2).filter(n => !hop1.has(n))];
+                    const links: {source: string, target: string}[] = [];
+                    for (const n of allNodes) {
+                      for (const t of (e[n] || [])) {
+                        if (allNodes.includes(t)) links.push({source: n, target: t});
+                      }
+                    }
+                    return { nodes: allNodes, links };
+                  };
+
+                  // Radial layout for neighborhood
+                  const layoutNodes = () => {
+                    const nb = neighborhood();
+                    if (nb.nodes.length === 0) return [];
+                    const sel = graphSelectedEntity()!;
+                    const e = edges();
+                    const hop1 = new Set([...(e[sel] || [])]);
+                    // Also reverse edges
+                    for (const [src, targets] of Object.entries(e)) {
+                      if (targets.includes(sel)) hop1.add(src);
+                    }
+                    const cx = 250, cy = 200;
+                    const positioned: {name: string, x: number, y: number, hop: number}[] = [];
+                    positioned.push({name: sel, x: cx, y: cy, hop: 0});
+                    const ring1 = nb.nodes.filter(n => n !== sel && hop1.has(n));
+                    const ring2 = nb.nodes.filter(n => n !== sel && !hop1.has(n));
+                    const r1 = Math.min(150, 60 + ring1.length * 8);
+                    const r2 = Math.min(220, 100 + ring2.length * 6);
+                    ring1.forEach((n, i) => {
+                      const angle = (2 * Math.PI * i) / ring1.length - Math.PI / 2;
+                      positioned.push({name: n, x: cx + r1 * Math.cos(angle), y: cy + r1 * Math.sin(angle), hop: 1});
+                    });
+                    ring2.forEach((n, i) => {
+                      const angle = (2 * Math.PI * i) / ring2.length - Math.PI / 4;
+                      positioned.push({name: n, x: cx + r2 * Math.cos(angle), y: cy + r2 * Math.sin(angle), hop: 2});
+                    });
+                    return positioned;
+                  };
+
+                  const layoutLinks = () => {
+                    const nb = neighborhood();
+                    const lnodes = layoutNodes();
+                    const pos = Object.fromEntries(lnodes.map(n => [n.name, {x: n.x, y: n.y}]));
+                    return nb.links.map(l => ({
+                      x1: pos[l.source]?.x || 0, y1: pos[l.source]?.y || 0,
+                      x2: pos[l.target]?.x || 0, y2: pos[l.target]?.y || 0,
+                      source: l.source, target: l.target,
+                    }));
+                  };
+
+                  // Inline entity detail renderer
+                  const entityDetail = (node: string) => {
+                    const isSelected = () => graphSelectedEntity() === node;
+                    const isShared = () => shared().includes(node);
+                    return (
+                      <div>
+                        <button
+                          class={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors flex items-center gap-2 ${
+                            isSelected()
+                              ? "bg-blue-600/20 text-blue-300 ring-1 ring-blue-500/30"
+                              : isShared()
+                              ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border border-yellow-800/40"
+                              : "text-gray-300 hover:bg-white/5"
+                          }`}
+                          onClick={() => setGraphSelectedEntity(isSelected() ? null : node)}
+                        >
+                          <span class="flex-1">{node}</span>
+                          {isShared() && <span class="text-[10px] text-yellow-500 shrink-0">shared</span>}
+                          {(edges()[node]?.length || 0) > 0 && (
+                            <span class="text-[10px] text-gray-600 shrink-0">{edges()[node].length}</span>
                           )}
-                        </div>
-                        {entityGraph()?.roots?.[node] && (
-                          <div class="text-xs text-gray-400 mt-1">
-                            Root for: {entityGraph().roots[node].map((e: any) => `${e.method.toUpperCase()} ${e.path}`).join(", ")}
+                        </button>
+                        <Show when={isSelected()}>
+                          <div class="ml-3 pl-3 border-l-2 border-blue-500/30 py-1.5 space-y-1">
+                            {roots()[node] && (
+                              <div class="text-[11px] text-gray-400">
+                                <span class="text-gray-600">Root for</span>
+                                <div class="mt-0.5 space-y-0.5">
+                                  <For each={roots()[node]}>
+                                    {(e) => <div class="text-gray-400">{e.method.toUpperCase()} {e.path}</div>}
+                                  </For>
+                                </div>
+                              </div>
+                            )}
+                            {edges()[node]?.length > 0 && (
+                              <div class="text-[11px]">
+                                <span class="text-gray-600">References</span>
+                                <div class="mt-0.5 space-y-0.5">
+                                  <For each={edges()[node]}>
+                                    {(ref) => (
+                                      <button
+                                        class="block text-blue-400 hover:text-blue-300"
+                                        onClick={(ev) => { ev.stopPropagation(); setGraphSelectedEntity(ref); }}
+                                      >{ref}</button>
+                                    )}
+                                  </For>
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        )}
-                        {entityGraph()?.edges?.[node]?.length > 0 && (
-                          <div class="text-xs text-gray-500 mt-1">
-                            References: {entityGraph().edges[node].join(", ")}
-                          </div>
-                        )}
+                        </Show>
                       </div>
-                    )}
-                  </For>
-                </div>
-                <div class="flex gap-3 mt-4">
-                  <button
-                    class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
-                    onClick={() => setRecipeStep("select")}
-                  >
-                    Back
-                  </button>
-                  <button
-                    class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
-                    onClick={handleGoToConfig}
-                  >
-                    Next: Configure
-                  </button>
-                </div>
+                    );
+                  };
+
+                  return (
+                    <div>
+                      <div class="flex items-center justify-between mb-3">
+                        <div>
+                          <h3 class="text-lg font-semibold">Entity Graph</h3>
+                          <p class="text-sm text-gray-500">{nodes().length} entities · {shared().length} shared</p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <button
+                            class={`px-2.5 py-1 text-xs rounded-md transition-colors ${graphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                            onClick={() => setGraphGroupBy("alpha")}
+                          >A–Z</button>
+                          <button
+                            class={`px-2.5 py-1 text-xs rounded-md transition-colors ${graphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                            onClick={() => setGraphGroupBy("endpoint")}
+                          >By endpoint</button>
+                        </div>
+                      </div>
+
+                      <div class="flex gap-4" style="height: calc(100vh - 220px); min-height: 400px;">
+                        {/* Left panel: entity list */}
+                        <div class="w-72 shrink-0 flex flex-col">
+                          <input
+                            type="text"
+                            placeholder="Search entities..."
+                            value={graphSearch()}
+                            onInput={(e) => setGraphSearch(e.currentTarget.value)}
+                            class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-2"
+                          />
+                          <div class="flex-1 overflow-y-auto pr-1 space-y-0.5" style="scrollbar-width: thin;">
+                            <Show when={graphGroupBy() === "alpha"}>
+                              <For each={filteredNodes()}>
+                                {(node: string) => entityDetail(node)}
+                              </For>
+                            </Show>
+                            <Show when={graphGroupBy() === "endpoint"}>
+                              <For each={Object.entries(endpointGroups())}>
+                                {([endpoint, groupNodes]) => (
+                                  <div class="mb-2">
+                                    <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a0f1e] z-10">{endpoint}</div>
+                                    <For each={groupNodes as string[]}>
+                                      {(node: string) => entityDetail(node)}
+                                    </For>
+                                  </div>
+                                )}
+                              </For>
+                            </Show>
+                          </div>
+                        </div>
+
+                        {/* Right panel: neighborhood graph — fills remaining space */}
+                        <div class="flex-1 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center overflow-hidden">
+                          <Show when={graphSelectedEntity()} fallback={
+                            <div class="text-gray-600 text-sm text-center px-4">
+                              Select an entity to see its relationship graph
+                            </div>
+                          }>
+                            <svg viewBox="0 0 500 400" class="w-full h-full" preserveAspectRatio="xMidYMid meet">
+                              <defs>
+                                <marker id="arrow" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
+                                  <path d="M0,0 L6,2 L0,4" fill="#4b5563" />
+                                </marker>
+                              </defs>
+                              {/* Links */}
+                              <For each={layoutLinks()}>
+                                {(link) => {
+                                  const sel = graphSelectedEntity();
+                                  const isFromSelected = link.source === sel;
+                                  const isToSelected = link.target === sel;
+                                  return (
+                                    <line
+                                      x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
+                                      stroke={isFromSelected || isToSelected ? "#3b82f6" : "#374151"}
+                                      stroke-width={isFromSelected || isToSelected ? 1.5 : 0.8}
+                                      stroke-dasharray={isToSelected && !isFromSelected ? "4,3" : undefined}
+                                      marker-end="url(#arrow)"
+                                      opacity={isFromSelected || isToSelected ? 0.8 : 0.4}
+                                    />
+                                  );
+                                }}
+                              </For>
+                              {/* Nodes */}
+                              <For each={layoutNodes()}>
+                                {(node) => {
+                                  const isCenter = node.hop === 0;
+                                  const isShared = shared().includes(node.name);
+                                  const fillColor = isCenter ? "#1d4ed8" : isShared ? "#854d0e" : "#1f2937";
+                                  const strokeColor = isCenter ? "#3b82f6" : isShared ? "#a16207" : "#374151";
+                                  const textColor = isCenter ? "#93c5fd" : isShared ? "#fbbf24" : "#d1d5db";
+                                  const label = node.name.length > 22 ? node.name.slice(0, 20) + "…" : node.name;
+                                  return (
+                                    <g
+                                      style="cursor: pointer;"
+                                      onClick={() => setGraphSelectedEntity(node.name)}
+                                    >
+                                      <circle
+                                        cx={node.x} cy={node.y}
+                                        r={isCenter ? 8 : 6}
+                                        fill={fillColor}
+                                        stroke={strokeColor}
+                                        stroke-width={isCenter ? 2 : 1}
+                                      />
+                                      <text
+                                        x={node.x} y={node.y + (isCenter ? -14 : -10)}
+                                        text-anchor="middle"
+                                        fill={textColor}
+                                        font-size={isCenter ? "11" : "9"}
+                                        font-family="monospace"
+                                      >{label}</text>
+                                    </g>
+                                  );
+                                }}
+                              </For>
+                            </svg>
+                          </Show>
+                        </div>
+                      </div>
+
+                    </div>
+                  );
+                })()}
               </Show>
 
               {/* Step 4: Configure data generation */}
               <Show when={recipeStep() === "config"}>
-                <div>
-                  <h3 class="text-lg font-semibold mb-2">Configure Data Generation</h3>
+                {(() => {
+                  const hasPools = () => Object.keys(recipeSharedPools()).length > 0;
+                  const hasConfigs = () => Object.keys(recipeQuantityConfigs()).length > 0;
+                  const hasAnything = () => hasPools() || hasConfigs();
 
-                  {Object.keys(recipeSharedPools()).length > 0 && (
-                    <div class="mb-6">
-                      <h4 class="text-sm font-medium text-gray-300 mb-2">Shared Entity Pools</h4>
-                      <p class="text-sm text-gray-400 mb-3">Shared entities generate a fixed pool of instances reused across endpoints.</p>
-                      <For each={Object.entries(recipeSharedPools())}>
-                        {([entity, config]) => (
-                          <div class="flex items-center gap-3 p-2 bg-gray-800 rounded mb-2">
-                            <label class="flex items-center gap-2">
-                              <input type="checkbox" checked={config.is_shared}
-                                class="accent-blue-500 rounded"
-                                onChange={(e) => {
-                                  const pools = {...recipeSharedPools()};
-                                  pools[entity] = {...pools[entity], is_shared: e.target.checked};
-                                  setRecipeSharedPools(pools);
-                                }} />
-                              <span class="text-sm text-gray-200">{entity}</span>
+                  // Group array quantity configs by entity (part before the dot)
+                  const groupedConfigs = () => {
+                    const groups: Record<string, {key: string, config: {min: number, max: number}}[]> = {};
+                    for (const [key, config] of Object.entries(recipeQuantityConfigs())) {
+                      const dot = key.indexOf(".");
+                      const entity = dot >= 0 ? key.slice(0, dot) : key;
+                      if (!groups[entity]) groups[entity] = [];
+                      groups[entity].push({key, config});
+                    }
+                    return groups;
+                  };
+
+                  // Filter by search
+                  const filteredPools = () => {
+                    const q = configSearch().toLowerCase();
+                    const entries = Object.entries(recipeSharedPools());
+                    const filtered = q ? entries.filter(([e]) => e.toLowerCase().includes(q)) : entries;
+                    if (configShowNonDefault()) return filtered.filter(([_, c]) => !c.is_shared || c.pool_size !== 10);
+                    return filtered;
+                  };
+
+                  const filteredConfigGroups = () => {
+                    const q = configSearch().toLowerCase();
+                    const groups = groupedConfigs();
+                    const result: Record<string, {key: string, config: {min: number, max: number}}[]> = {};
+                    for (const [entity, items] of Object.entries(groups)) {
+                      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+                      const visible = configShowNonDefault() ? matching.filter(i => i.config.min !== 1 || i.config.max !== 3) : matching;
+                      if (visible.length > 0) result[entity] = visible;
+                    }
+                    return result;
+                  };
+
+                  // Collapsed state for entity groups
+                  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+                  const toggleGroup = (entity: string) => {
+                    const s = new Set(collapsedGroups());
+                    if (s.has(entity)) s.delete(entity); else s.add(entity);
+                    setCollapsedGroups(s);
+                  };
+
+                  return (
+                    <div>
+                      <div class="flex items-center justify-between mb-3">
+                        <div>
+                          <h3 class="text-lg font-semibold">Configure Data Generation</h3>
+                          <p class="text-sm text-gray-500">
+                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties
+                          </p>
+                        </div>
+                        <Show when={hasAnything()}>
+                          <div class="flex items-center gap-3">
+                            <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+                              <input type="checkbox" checked={configShowNonDefault()} onChange={(e) => setConfigShowNonDefault(e.target.checked)} class="accent-blue-500 rounded" />
+                              Changed only
                             </label>
-                            <input type="number" min="1" max="100" value={config.pool_size}
-                              class="w-20 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
-                              onInput={(e) => {
-                                const pools = {...recipeSharedPools()};
-                                pools[entity] = {...pools[entity], pool_size: parseInt(e.target.value) || 10};
-                                setRecipeSharedPools(pools);
-                              }} />
-                            <span class="text-xs text-gray-500">instances</span>
                           </div>
-                        )}
-                      </For>
-                    </div>
-                  )}
+                        </Show>
+                      </div>
 
-                  {Object.keys(recipeQuantityConfigs()).length > 0 && (
-                    <div class="mb-6">
-                      <h4 class="text-sm font-medium text-gray-300 mb-2">Array Quantity Ranges</h4>
-                      <p class="text-sm text-gray-400 mb-3">Control how many items are generated for array properties.</p>
-                      <For each={Object.entries(recipeQuantityConfigs())}>
-                        {([key, config]) => (
-                          <div class="flex items-center gap-3 p-2 bg-gray-800 rounded mb-2">
-                            <span class="font-mono text-sm text-gray-200 min-w-48">{key}</span>
-                            <input type="number" min="0" max="50" value={config.min}
-                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
-                              onInput={(e) => {
-                                const configs = {...recipeQuantityConfigs()};
-                                configs[key] = {...configs[key], min: parseInt(e.target.value) || 0};
-                                setRecipeQuantityConfigs(configs);
-                              }} />
-                            <span class="text-gray-500 text-sm">to</span>
-                            <input type="number" min="1" max="50" value={config.max}
-                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
-                              onInput={(e) => {
-                                const configs = {...recipeQuantityConfigs()};
-                                configs[key] = {...configs[key], max: parseInt(e.target.value) || 3};
-                                setRecipeQuantityConfigs(configs);
-                              }} />
-                            <span class="text-xs text-gray-500">items per record</span>
+                      <Show when={hasAnything()}>
+                        <input
+                          type="text"
+                          placeholder="Search pools and properties..."
+                          value={configSearch()}
+                          onInput={(e) => setConfigSearch(e.currentTarget.value)}
+                          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
+                        />
+                      </Show>
+
+                      {/* Shared Entity Pools */}
+                      <Show when={hasPools() && filteredPools().length > 0}>
+                        <div class="mb-6">
+                          <div class="flex items-center justify-between mb-2">
+                            <h4 class="text-sm font-medium text-gray-300">Shared Entity Pools</h4>
+                            <div class="flex items-center gap-2">
+                              <span class="text-[10px] text-gray-600">Set all to</span>
+                              <input
+                                type="number" min="1" max="100" placeholder="n"
+                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                onChange={(e) => {
+                                  const val = parseInt(e.target.value);
+                                  if (!val || val < 1) return;
+                                  const pools = {...recipeSharedPools()};
+                                  for (const key of Object.keys(pools)) {
+                                    pools[key] = {...pools[key], pool_size: val};
+                                  }
+                                  setRecipeSharedPools(pools);
+                                  e.target.value = "";
+                                }}
+                              />
+                            </div>
                           </div>
-                        )}
-                      </For>
+                          <div class="space-y-1">
+                            <For each={filteredPools()}>
+                              {([entity, config]) => (
+                                <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md">
+                                  <input type="checkbox" checked={config.is_shared}
+                                    class="accent-blue-500 rounded"
+                                    onChange={(e) => {
+                                      const pools = {...recipeSharedPools()};
+                                      pools[entity] = {...pools[entity], is_shared: e.target.checked};
+                                      setRecipeSharedPools(pools);
+                                    }} />
+                                  <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
+                                  <input type="number" min="1" max="100" value={config.pool_size}
+                                    class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                    onInput={(e) => {
+                                      const pools = {...recipeSharedPools()};
+                                      pools[entity] = {...pools[entity], pool_size: parseInt(e.target.value) || 10};
+                                      setRecipeSharedPools(pools);
+                                    }} />
+                                  <span class="text-xs text-gray-600 w-14">instances</span>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+
+                      {/* Array Quantity Ranges — grouped by entity */}
+                      <Show when={hasConfigs() && Object.keys(filteredConfigGroups()).length > 0}>
+                        <div class="mb-6">
+                          <div class="flex items-center justify-between mb-2">
+                            <h4 class="text-sm font-medium text-gray-300">Array Quantity Ranges</h4>
+                            <div class="flex items-center gap-2">
+                              <span class="text-[10px] text-gray-600">Set all to</span>
+                              <input
+                                type="number" min="0" max="50" placeholder="min"
+                                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                onChange={(e) => {
+                                  const val = parseInt(e.target.value);
+                                  if (isNaN(val) || val < 0) return;
+                                  const configs = {...recipeQuantityConfigs()};
+                                  for (const key of Object.keys(configs)) {
+                                    configs[key] = {...configs[key], min: val};
+                                  }
+                                  setRecipeQuantityConfigs(configs);
+                                  e.target.value = "";
+                                }}
+                              />
+                              <span class="text-[10px] text-gray-600">–</span>
+                              <input
+                                type="number" min="1" max="50" placeholder="max"
+                                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                onChange={(e) => {
+                                  const val = parseInt(e.target.value);
+                                  if (!val || val < 1) return;
+                                  const configs = {...recipeQuantityConfigs()};
+                                  for (const key of Object.keys(configs)) {
+                                    configs[key] = {...configs[key], max: val};
+                                  }
+                                  setRecipeQuantityConfigs(configs);
+                                  e.target.value = "";
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <div class="space-y-1">
+                            <For each={Object.entries(filteredConfigGroups()).sort(([a], [b]) => a.localeCompare(b))}>
+                              {([entity, items]) => (
+                                <div class="rounded-md overflow-hidden">
+                                  <button
+                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                                    onClick={() => toggleGroup(entity)}
+                                  >
+                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>▶</span>
+                                    <span class="font-medium">{entity}</span>
+                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
+                                  </button>
+                                  <Show when={!collapsedGroups().has(entity)}>
+                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                      <For each={items}>
+                                        {(item) => {
+                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                          return (
+                                            <div class="flex items-center gap-3 px-3 py-1.5">
+                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                              <input type="number" min="0" max="50" value={item.config.min}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) => {
+                                                  const configs = {...recipeQuantityConfigs()};
+                                                  configs[item.key] = {...configs[item.key], min: parseInt(e.target.value) || 0};
+                                                  setRecipeQuantityConfigs(configs);
+                                                }} />
+                                              <span class="text-gray-600 text-xs">–</span>
+                                              <input type="number" min="1" max="50" value={item.config.max}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) => {
+                                                  const configs = {...recipeQuantityConfigs()};
+                                                  configs[item.key] = {...configs[item.key], max: parseInt(e.target.value) || 3};
+                                                  setRecipeQuantityConfigs(configs);
+                                                }} />
+                                              <span class="text-[10px] text-gray-600 w-10">items</span>
+                                            </div>
+                                          );
+                                        }}
+                                      </For>
+                                    </div>
+                                  </Show>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+
+                      {!hasAnything() && (
+                        <p class="text-gray-400 mb-4">No shared entities or array properties detected. You can proceed to name your recipe.</p>
+                      )}
+
                     </div>
-                  )}
-
-                  {Object.keys(recipeSharedPools()).length === 0 && Object.keys(recipeQuantityConfigs()).length === 0 && (
-                    <p class="text-gray-400 mb-4">No shared entities or array properties detected. You can proceed to name your recipe.</p>
-                  )}
-
-                  <div class="flex gap-3 mt-4">
-                    <button
-                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
-                      onClick={() => setRecipeStep("graph")}
-                    >
-                      Back
-                    </button>
-                    <button
-                      class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors"
-                      onClick={() => setRecipeStep("name")}
-                    >
-                      Next: Name & Save
-                    </button>
-                  </div>
-                </div>
+                  );
+                })()}
               </Show>
 
               {/* Step 5: Name + seed count + save & activate */}
@@ -1411,28 +1904,6 @@ function App() {
                     </div>
                   </Show>
 
-                  <div class="flex gap-3 pt-2">
-                    <button
-                      class="px-5 py-2.5 bg-green-600 hover:bg-green-500 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                      onClick={handleRecipeSaveAndActivate}
-                      disabled={loading()}
-                    >
-                      {loading()
-                        ? saveActivatePhase() === "saving"
-                          ? "Saving..."
-                          : "Activating..."
-                        : editingRecipeId() !== null
-                          ? "Save"
-                          : "Save & Activate"}
-                    </button>
-                    <button
-                      class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-50"
-                      onClick={() => setRecipeStep("config")}
-                      disabled={loading()}
-                    >
-                      Back
-                    </button>
-                  </div>
                 </div>
               </Show>
             </Show>
@@ -1471,6 +1942,12 @@ function App() {
                               disabled={loading()}
                             >
                               Edit
+                            </button>
+                            <button
+                              class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors"
+                              onClick={() => handleRecipeExport(recipe.id)}
+                            >
+                              Export
                             </button>
                             <button
                               class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"
@@ -1602,13 +2079,14 @@ function formatCell(value: unknown): string {
 function StepIndicator(props: {
   current: "paste" | "select" | "graph" | "config" | "name";
   onNavigate: (step: "paste" | "select" | "graph" | "config" | "name") => void;
+  editMode?: boolean;
 }) {
-  const steps: { key: "paste" | "select" | "graph" | "config" | "name"; label: string }[] = [
+  const steps: { key: "paste" | "select" | "graph" | "config" | "name"; label: string; editLabel?: string }[] = [
     { key: "paste", label: "Import" },
     { key: "select", label: "Endpoints" },
     { key: "graph", label: "Entity Graph" },
     { key: "config", label: "Configure" },
-    { key: "name", label: "Generate" },
+    { key: "name", label: "Generate", editLabel: "Save" },
   ];
   const stepIndex = (key: string) => steps.findIndex((s) => s.key === key);
   const currentIdx = () => stepIndex(props.current);
@@ -1619,33 +2097,39 @@ function StepIndicator(props: {
         {(step, i) => {
           const isActive = () => i() === currentIdx();
           const isCompleted = () => i() < currentIdx();
-          const isFuture = () => i() > currentIdx();
+          const isNavigable = () => props.editMode || isCompleted();
           return (
             <>
               <button
                 class={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
                   isActive()
                     ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
-                    : isCompleted()
+                    : isNavigable()
                     ? "text-gray-300 hover:text-white hover:bg-white/5 cursor-pointer"
                     : "text-gray-600 cursor-default"
                 }`}
-                onClick={() => { if (isCompleted()) props.onNavigate(step.key); }}
-                disabled={isFuture()}
+                onClick={() => { if (isNavigable()) props.onNavigate(step.key); }}
+                disabled={!isActive() && !isNavigable()}
               >
                 <span class={`flex items-center justify-center w-5 h-5 rounded-full text-xs font-bold ${
                   isActive()
                     ? "bg-blue-600 text-white"
                     : isCompleted()
                     ? "bg-green-600 text-white"
+                    : props.editMode
+                    ? "bg-gray-700 text-gray-300"
                     : "bg-gray-800 text-gray-600"
                 }`}>
                   {isCompleted() ? "\u2713" : i() + 1}
                 </span>
-                {step.label}
+                {props.editMode && step.editLabel ? step.editLabel : step.label}
               </button>
               {i() < steps.length - 1 && (
-                <div class={`flex-1 h-px mx-1 ${i() < currentIdx() ? "bg-green-600/40" : "bg-gray-800"}`} />
+                <div class={`flex-1 h-px mx-1 ${
+                  props.editMode
+                    ? "bg-blue-600/20"
+                    : i() < currentIdx() ? "bg-green-600/40" : "bg-gray-800"
+                }`} />
               )}
             </>
           );
