@@ -116,6 +116,13 @@ function App() {
   // Log state
   const [logEntries, setLogEntries] = createSignal<LogEntry[]>([]);
   const [selectedLog, setSelectedLog] = createSignal<LogEntry | null>(null);
+  const [hideInternalCalls, setHideInternalCalls] = createSignal(false);
+  const displayedEntries = createMemo(() => {
+    const entries = hideInternalCalls()
+      ? logEntries().filter(e => !e.path.startsWith("/_api/"))
+      : logEntries();
+    return [...entries].reverse();
+  });
 
   // Recipe state
   const [recipes, setRecipes] = createSignal<Recipe[]>([]);
@@ -2372,12 +2379,30 @@ function App() {
             <div class="flex flex-col flex-1 min-h-0">
               <div class="flex items-center justify-between mb-6 shrink-0">
                 <h2 class="text-2xl font-semibold">Request Log</h2>
-                <span class="text-xs text-gray-500">{logEntries().length} entries &middot; auto-refreshing</span>
+                <div class="flex items-center gap-4">
+                  <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={hideInternalCalls()}
+                      onChange={(e) => setHideInternalCalls(e.currentTarget.checked)}
+                      class="accent-blue-500"
+                    />
+                    Hide internal calls
+                  </label>
+                  <span class="text-xs text-gray-500">
+                    {hideInternalCalls()
+                      ? `${displayedEntries().length} / ${logEntries().length} entries`
+                      : `${logEntries().length} entries`} &middot; auto-refreshing
+                  </span>
+                </div>
               </div>
               <Show when={logEntries().length === 0}>
                 <p class="text-gray-500">No requests logged yet. Make some API calls to see them here.</p>
               </Show>
-              <Show when={logEntries().length > 0}>
+              <Show when={logEntries().length > 0 && displayedEntries().length === 0}>
+                <p class="text-gray-500">All entries hidden by filter.</p>
+              </Show>
+              <Show when={displayedEntries().length > 0}>
                 <div class="rounded-xl border border-[#141b28] overflow-hidden flex-1 min-h-0 overflow-y-auto">
                   <table class="w-full text-left">
                     <thead>
@@ -2389,7 +2414,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      <For each={[...logEntries()].reverse()}>
+                      <For each={displayedEntries()}>
                         {(entry) => (
                           <tr
                             class={`border-t border-[#0e1521] cursor-pointer transition-colors ${
