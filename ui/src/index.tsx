@@ -1467,7 +1467,6 @@ function App() {
                 const graph = () => schemaGraph();
                 const nodes = () => (graph()?.nodes || []) as string[];
                 const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
-                const shared = () => (graph()?.shared_entities || []) as string[];
                 const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
                 const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
 
@@ -1528,21 +1527,21 @@ function App() {
 
                 const entityDetail = (node: string) => {
                   const isSelected = () => schemaGraphSelectedEntity() === node;
-                  const isShared = () => shared().includes(node);
+                  const isParent = () => Object.keys(roots()).includes(node);
                   return (
                     <div data-entity={node}>
                       <button
                         class={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors flex items-center gap-2 ${
                           isSelected()
                             ? "bg-blue-600/20 text-blue-300 ring-1 ring-blue-500/30"
-                            : isShared()
+                            : isParent()
                             ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border border-yellow-800/40"
                             : "text-gray-300 hover:bg-white/5"
                         }`}
                         onClick={() => setSchemaGraphSelectedEntity(isSelected() ? null : node)}
                       >
                         <span class="flex-1">{node}</span>
-                        {isShared() && <span class="text-[10px] text-yellow-500 shrink-0">shared</span>}
+                        {isParent() && <span class="text-[10px] text-yellow-500 shrink-0">parent</span>}
                         {(edges()[node]?.length || 0) > 0 && (
                           <span class="text-[10px] text-gray-600 shrink-0">{edges()[node].length}</span>
                         )}
@@ -1592,7 +1591,7 @@ function App() {
                 return (
                   <div>
                     <div class="flex items-center justify-between mb-3">
-                      <p class="text-sm text-gray-500">{nodes().length} entities · {shared().length} shared</p>
+                      <p class="text-sm text-gray-500">{nodes().length} entities · {Object.keys(roots()).length} parents</p>
                       <div class="flex items-center gap-3">
                         <div class="flex items-center gap-1.5">
                           <span class="text-[10px] text-gray-500">Depth</span>

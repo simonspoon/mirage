@@ -431,19 +431,19 @@ export default function ForceGraph(props: ForceGraphProps) {
           <span class="text-[9px] text-gray-400">Referenced by (inbound)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-blue-700" />
-          <span class="text-[9px] text-gray-400">Root (property)</span>
-        </div>
-        <div class="flex items-center gap-2">
           <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border border-yellow-700" />
-          <span class="text-[9px] text-gray-400">Root (array)</span>
+          <span class="text-[9px] text-gray-400">Parent (property)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-dashed border-blue-700" />
+          <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border-2 border-yellow-700" />
+          <span class="text-[9px] text-gray-400">Parent (array)</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-blue-700" />
           <span class="text-[9px] text-gray-400">Child (property)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border border-dashed border-yellow-700" />
+          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border-2 border-blue-700" />
           <span class="text-[9px] text-gray-400">Child (array)</span>
         </div>
       </div>
@@ -523,16 +523,13 @@ export default function ForceGraph(props: ForceGraphProps) {
 
               const fillColor = () =>
                 isSel() ? "#1e3a5f" :
-                node().isArray ? "#2d1f0e" :
-                "#0f1d33";
+                node().isRoot ? "#2d1f0e" : "#0f1d33";
               const strokeColor = () =>
                 isSel() ? "#3b82f6" :
-                node().isArray ? "#a16207" :
-                "#1d4ed8";
+                node().isRoot ? "#a16207" : "#1d4ed8";
               const textColor = () =>
                 isSel() ? "#93c5fd" :
-                node().isArray ? "#fbbf24" :
-                "#60a5fa";
+                node().isRoot ? "#fbbf24" : "#60a5fa";
 
               return (
                 <g
@@ -546,8 +543,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                     rx={6} ry={6}
                     fill={fillColor()}
                     stroke={strokeColor()}
-                    stroke-width={isSel() ? 1.8 : 0.8}
-                    stroke-dasharray={node().isRoot ? undefined : "4,3"}
+                    stroke-width={isSel() ? 1.8 : node().isArray ? 2.5 : 0.8}
                   />
                   <circle
                     cx={node().x - node().hw + 9} cy={node().y}
