@@ -13,7 +13,7 @@ interface SimNode {
   hw: number; // half-width of pill
   hh: number; // half-height of pill
   isRoot: boolean;
-  isShared: boolean;
+  isArray: boolean;
 }
 
 /** Snapshot of node state for rendering (new object each frame so SolidJS detects changes) */
@@ -24,7 +24,7 @@ interface RenderNode {
   hw: number;
   hh: number;
   isRoot: boolean;
-  isShared: boolean;
+  isArray: boolean;
   pinned: boolean;
 }
 
@@ -44,7 +44,7 @@ interface ForceGraphProps {
   nodes: string[];
   edges: Record<string, string[]>;
   roots: Record<string, { method: string; path: string }[]>;
-  shared: string[];
+  arrayTargets: string[];
   selectedEntity: string | null;
   onSelectEntity: (name: string | null) => void;
 }
@@ -115,7 +115,7 @@ export default function ForceGraph(props: ForceGraphProps) {
 
     const existing = new Map(simNodes.map(n => [n.id, n]));
     const rootSet = new Set(Object.keys(props.roots));
-    const sharedSet = new Set(props.shared);
+    const arraySet = new Set(props.arrayTargets);
 
     simNodes = nodeNames.map((name, i) => {
       const prev = existing.get(name);
@@ -125,7 +125,7 @@ export default function ForceGraph(props: ForceGraphProps) {
         prev.hw = hw;
         prev.hh = PILL_HH;
         prev.isRoot = rootSet.has(name);
-        prev.isShared = sharedSet.has(name);
+        prev.isArray = arraySet.has(name);
         return prev;
       }
       const angle = (2 * Math.PI * i) / nodeNames.length;
@@ -138,7 +138,7 @@ export default function ForceGraph(props: ForceGraphProps) {
         fx: null, fy: null,
         hw, hh: PILL_HH,
         isRoot: rootSet.has(name),
-        isShared: sharedSet.has(name),
+        isArray: arraySet.has(name),
       };
     });
 
@@ -261,7 +261,7 @@ export default function ForceGraph(props: ForceGraphProps) {
     // --- Build render snapshots (new objects so SolidJS detects changes) ---
     const nodeSnaps: RenderNode[] = nodes.map(n => ({
       id: n.id, x: n.x, y: n.y, hw: n.hw, hh: n.hh,
-      isRoot: n.isRoot, isShared: n.isShared, pinned: n.fx != null,
+      isRoot: n.isRoot, isArray: n.isArray, pinned: n.fx != null,
     }));
 
     const edgeSnaps: RenderEdge[] = linkList.map(l => {
@@ -432,15 +432,19 @@ export default function ForceGraph(props: ForceGraphProps) {
         </div>
         <div class="flex items-center gap-2">
           <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-blue-700" />
-          <span class="text-[9px] text-gray-400">Root entity</span>
+          <span class="text-[9px] text-gray-400">Root (property)</span>
         </div>
         <div class="flex items-center gap-2">
           <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border border-yellow-700" />
-          <span class="text-[9px] text-gray-400">Shared entity</span>
+          <span class="text-[9px] text-gray-400">Root (array)</span>
         </div>
         <div class="flex items-center gap-2">
-          <div class="w-4 h-2.5 rounded-sm bg-[#111827] border border-gray-700" />
-          <span class="text-[9px] text-gray-400">Child entity</span>
+          <div class="w-4 h-2.5 rounded-sm bg-[#0f1d33] border border-dashed border-blue-700" />
+          <span class="text-[9px] text-gray-400">Child (property)</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="w-4 h-2.5 rounded-sm bg-[#2d1f0e] border border-dashed border-yellow-700" />
+          <span class="text-[9px] text-gray-400">Child (array)</span>
         </div>
       </div>
 
@@ -455,12 +459,6 @@ export default function ForceGraph(props: ForceGraphProps) {
         onDblClick={onDblClick}
       >
         <defs>
-          <marker id="fg-arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
-            <path d="M0,0 L10,3.5 L0,7" fill="#4b5563" opacity="0.5" />
-          </marker>
-          <marker id="fg-arrow-active" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
-            <path d="M0,0 L10,3.5 L0,7" fill="#3b82f6" opacity="0.8" />
-          </marker>
           <filter id="glow-strong" x="-50%" y="-50%" width="200%" height="200%">
             <feGaussianBlur stdDeviation="4" result="blur" />
             <feMerge>
@@ -493,7 +491,6 @@ export default function ForceGraph(props: ForceGraphProps) {
                     stroke={active() ? "#3b82f6" : "#1e293b"}
                     stroke-width={active() ? 1.8 : 0.8}
                     stroke-dasharray={isToSel() && !isFromSel() ? "6,4" : undefined}
-                    marker-end={active() ? "url(#fg-arrow-active)" : "url(#fg-arrow)"}
                     opacity={sel() ? (active() ? 0.9 : 0.2) : 0.4}
                   />
                 );
@@ -526,16 +523,16 @@ export default function ForceGraph(props: ForceGraphProps) {
 
               const fillColor = () =>
                 isSel() ? "#1e3a5f" :
-                node().isShared ? "#2d1f0e" :
-                node().isRoot ? "#0f1d33" : "#111827";
+                node().isArray ? "#2d1f0e" :
+                "#0f1d33";
               const strokeColor = () =>
                 isSel() ? "#3b82f6" :
-                node().isShared ? "#a16207" :
-                node().isRoot ? "#1d4ed8" : "#1e293b";
+                node().isArray ? "#a16207" :
+                "#1d4ed8";
               const textColor = () =>
                 isSel() ? "#93c5fd" :
-                node().isShared ? "#fbbf24" :
-                node().isRoot ? "#60a5fa" : "#d1d5db";
+                node().isArray ? "#fbbf24" :
+                "#60a5fa";
 
               return (
                 <g
@@ -550,6 +547,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                     fill={fillColor()}
                     stroke={strokeColor()}
                     stroke-width={isSel() ? 1.8 : 0.8}
+                    stroke-dasharray={node().isRoot ? undefined : "4,3"}
                   />
                   <circle
                     cx={node().x - node().hw + 9} cy={node().y}

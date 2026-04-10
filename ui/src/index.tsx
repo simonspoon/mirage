@@ -846,7 +846,7 @@ function App() {
 
       {/* Main */}
       <main class="flex-1 min-h-screen">
-        <div class="p-8">
+        <div class="p-8 pb-2">
           <Show when={error()}>
             <div class="mb-6 px-4 py-3 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error()}
@@ -1469,6 +1469,7 @@ function App() {
                 const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
                 const shared = () => (graph()?.shared_entities || []) as string[];
                 const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
+                const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
 
                 const filteredNodes = () => {
                   const q = schemaGraphSearch().toLowerCase();
@@ -1614,7 +1615,7 @@ function App() {
                       </div>
                     </div>
 
-                    <div class="flex gap-4" style="height: calc(100vh - 220px); min-height: 400px;">
+                    <div class="flex gap-4" style="height: calc(100vh - 180px); min-height: 400px;">
                       <div class="w-72 shrink-0 flex flex-col">
                         <input
                           type="text"
@@ -1656,7 +1657,7 @@ function App() {
                             nodes={neighborhood().nodes}
                             edges={neighborhood().edges}
                             roots={roots()}
-                            shared={shared()}
+                            arrayTargets={arrayTargets()}
                             selectedEntity={schemaGraphSelectedEntity()}
                             onSelectEntity={setSchemaGraphSelectedEntity}
                           />
