@@ -34,8 +34,11 @@ mirage
 Open `http://localhost:3737/_admin/` and:
 
 1. Paste your Swagger 2.0 spec (JSON or YAML), click **Import Spec**
-2. Select which endpoints to activate, set seed count, click **Start Mock Server**
-3. The UI shows active endpoints — you're ready to go
+2. Select which endpoints to activate, set seed count
+3. Configure shared entity pools, faker strategies, and constraint rules
+4. Name and save as a **recipe**, then **Activate** — the server drops tables, reseeds with your config, and starts serving
+
+Recipes are stored in the embedded database and survive restarts. See [Commands and API > Recipes](commands.md#recipes) for the full recipe API, including the **constraint rules** system for bounded ranges, choices, constants, regex patterns, and cross-field compares.
 
 ## Port
 

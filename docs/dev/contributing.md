@@ -80,9 +80,22 @@ The pipeline: **parser types -> schema mapping -> seeder generation -> server ha
 
 2. **Schema** (`schema.rs`): Extend `map_type()` if the feature affects column types. Extend `generate_table_sql()` if it affects table structure.
 
-3. **Seeder** (`seeder.rs`): Extend `fake_value_for_field()` to generate appropriate fake data for the new type/format.
+3. **Seeder** (`seeder.rs`): Extend `fake_value_for_field()` to generate appropriate fake data for the new type/format. If document-based generation is affected, also update `composer.rs`.
 
 4. **Server** (`server.rs`): Modify handler functions if the feature changes response shape or behavior.
+
+## Adding a New Rule Kind
+
+Constraint rules live in `src/rules.rs`. To add a new rule kind:
+
+1. Add a variant to the `Rule` enum (serde tag = `"kind"`, rename_all `snake_case`).
+2. Update `Rule::target_field()` and `Rule::is_field_level()` / `is_compare()` helpers.
+3. Extend `validate_rules()` to reject invalid instances of the new kind (type mismatches, cycles, bad inputs).
+4. If field-level: handle it in `generate_for_field_rule()` and ensure `fake_value_for_field_layered()` consults the rule map first.
+5. If cross-field (like Compare): add an apply pass in `apply_compare_rules()` / `repair_left()` invoked after row generation.
+6. Thread the new variant through both the SQLite seed path (`seeder::seed_table`) and the composer path (`composer::generate_pools` / `compose_documents`).
+7. Add unit tests per variant + conflict/cycle/type-mismatch cases.
+8. Update the UI `RuleEditor` in `ui/src/index.tsx` so users can author the new kind.
 
 ## Project Structure
 
@@ -91,7 +104,11 @@ src/
   main.rs          CLI parsing, startup wiring
   parser.rs        Swagger 2.0 spec types and $ref resolution
   schema.rs        DDL generation from definitions
-  seeder.rs        Fake data generation
+  seeder.rs        Fake data generation (SQLite row path)
+  composer.rs      Document-based generation with shared pools (JSON response path)
+  rules.rs         Constraint rule enum, validation, field-level + compare-repair passes
+  recipe.rs        Recipe storage: endpoints, pools, faker rules, constraint rules
+  entity_graph.rs  Definition graph: nodes, edges, roots, shared entities
   server.rs        Axum router, catch-all handler, admin API
 tests/
   integration.rs   E2E tests (spawn real binary)

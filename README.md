@@ -9,8 +9,9 @@ Swagger 2.0 mock API server. Feed it a spec, get live CRUD endpoints backed by S
 - **Smart fake data** -- 40+ faker strategies with layered resolution: `x-faker` > format > name heuristic > type fallback
 - **Live CRUD endpoints** -- GET collection, GET by ID, POST create, DELETE
 - **Shared entity pools** -- cross-definition referential integrity
+- **Constraint rules** -- bounded ranges, enum choices, constants, regex patterns, and cross-field compares (`gt`/`lt`/`eq`/...) applied during seeding
 - **Admin UI** -- SolidJS browser wizard with recipe management, request log, schema browser, entity graph
-- **Recipe persistence** -- saved recipes survive restarts (SQLite-backed)
+- **Recipe persistence** -- saved recipes (endpoints, seed counts, shared pools, faker rules, constraint rules) survive restarts, SQLite-backed
 - **`inspect` subcommand** -- spec diagnostics without starting a server
 - **Single binary** -- UI embedded via rust-embed
 

@@ -256,6 +256,111 @@ When you select a path-parameter route such as `GET /pet/{petId}`, mirage automa
 
 ---
 
+## Recipes
+
+A **recipe** is a saved configuration for a spec. It bundles:
+
+- The spec source (raw YAML/JSON text)
+- The subset of endpoints to activate
+- The per-table seed count
+- **Shared entity pools** — sizes of cross-definition shared pools
+- **Quantity configs** — min/max collection sizes for array properties
+- **Faker rules** — per-field faker strategy overrides
+- **Constraint rules** — bounded ranges, choices, constants, patterns, and cross-field compares
+
+Recipes are persisted in the embedded SQLite database and survive restarts. All recipe fields (except name, spec source, and seed count) are stored as JSON strings.
+
+### Recipe CRUD endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/_api/admin/recipes` | List all saved recipes |
+| POST | `/_api/admin/recipes` | Create a new recipe |
+| GET | `/_api/admin/recipes/:id` | Get a single recipe |
+| PUT | `/_api/admin/recipes/:id` | Update all recipe fields |
+| DELETE | `/_api/admin/recipes/:id` | Delete a recipe |
+| GET | `/_api/admin/recipes/:id/config` | Get parsed config (pools/quantities/faker/rules) |
+| PUT | `/_api/admin/recipes/:id/config` | Update the parsed config |
+| POST | `/_api/admin/recipes/:id/activate` | Apply this recipe and start serving traffic |
+| GET | `/_api/admin/recipes/:id/export` | Export a recipe as JSON for backup/transfer |
+| POST | `/_api/admin/recipes/import` | Import a previously exported recipe |
+
+### POST /_api/admin/recipes
+
+Creates a new recipe. Validates constraint rules at create time (see [Constraint Rules](#constraint-rules) below); returns 400 with `{"error": "Invalid rules: ..."}` on any validation failure.
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Display name |
+| `spec_source` | string | Yes | Raw Swagger spec text (YAML or JSON) |
+| `selected_endpoints` | string (JSON array) | Yes | Serialized `[{method, path}, ...]` |
+| `seed_count` | integer | No | Rows per table (default 10) |
+| `shared_pools` | string (JSON object) | No | `{"DefName": poolSize, ...}` (default `{}`) |
+| `quantity_configs` | string (JSON object) | No | `{"DefName.prop": {min, max}, ...}` (default `{}`) |
+| `faker_rules` | string (JSON object) | No | `{"DefName": {"prop": "strategy"}}` (default `{}`) |
+| `rules` | string (JSON array) | No | Constraint rules (default `[]`) |
+
+### Constraint Rules
+
+Rules shape seeded data beyond what faker strategies alone can express. They run BEFORE and AFTER the standard field-generation layers:
+
+- **Field-level rules** (`range`, `choice`, `const`, `pattern`) override per-field generation *before* the `x-faker` → format → heuristic → type fallback layers.
+- **Cross-field rules** (`compare`) run in a per-row repair pass *after* initial generation.
+
+Rules are stored as a JSON array of tagged-union objects (serde `snake_case`). The `kind` field selects the variant:
+
+| Kind | Shape | Effect |
+|---|---|---|
+| `range` | `{"kind":"range","field":"Pet.age","min":0,"max":20}` | Numeric field clamped to `[min, max]` inclusive |
+| `choice` | `{"kind":"choice","field":"Pet.status","options":["available","pending","sold"]}` | Field is one of the listed JSON values |
+| `const` | `{"kind":"const","field":"Pet.name","value":"Cosmo"}` | Field is always this exact JSON value |
+| `pattern` | `{"kind":"pattern","field":"Tag.code","regex":"[A-Z]{3}-[0-9]{4}"}` | Field is a string matching the regex (generated via `rand_regex`) |
+| `compare` | `{"kind":"compare","left":"Pet.id","op":"gt","right":50}` | Cross-field predicate; `right` can be a field path or literal |
+
+`CompareOp` variants (all apply to numeric AND string fields):
+
+`eq`, `neq`, `gt`, `gte`, `lt`, `lte`
+
+Field paths use the `DefName.propName` convention (same as faker rules).
+
+**Validation errors** (rejected on create AND update, returned as `400 {"error": "Invalid rules: ..."}`):
+
+- Duplicate field-level rules on the same field
+- Compare rules with a cycle in the dependency graph
+- Compare rules with a self-loop (`left == right` field path)
+- Compare rules spanning different definitions
+- Field references that don't exist in the spec
+- Rule/type mismatches (e.g. `range` on a string field, `compare gt` on a boolean)
+- Pattern regexes that fail to parse
+- `choice` rules with an empty options list
+- `range` rules where `min > max`
+
+**Example — create a recipe with all five rule kinds:**
+
+```bash
+curl -X POST http://localhost:3737/_api/admin/recipes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "petstore bounded",
+    "spec_source": "<raw yaml here>",
+    "selected_endpoints": "[{\"method\":\"get\",\"path\":\"/pet\"}]",
+    "seed_count": 10,
+    "rules": "[
+      {\"kind\":\"range\",\"field\":\"Pet.id\",\"min\":1,\"max\":999},
+      {\"kind\":\"choice\",\"field\":\"Pet.status\",\"options\":[\"available\",\"pending\",\"sold\"]},
+      {\"kind\":\"const\",\"field\":\"Pet.name\",\"value\":\"Cosmo\"},
+      {\"kind\":\"pattern\",\"field\":\"Tag.name\",\"regex\":\"[A-Z]{3}-[0-9]{4}\"},
+      {\"kind\":\"compare\",\"left\":\"Pet.id\",\"op\":\"gt\",\"right\":50}
+    ]"
+  }'
+```
+
+On activate, rules apply to BOTH the seeded SQLite rows (via the seeder) AND any composed JSON response documents (via the composer / shared entity pools).
+
+---
+
 ## Mock API Behavior
 
 After a spec has been configured, mirage handles requests on the paths defined in that spec. All other paths return 404.
