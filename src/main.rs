@@ -2,6 +2,7 @@ mod composer;
 mod entity_graph;
 mod parser;
 mod recipe;
+mod rules;
 mod schema;
 mod seeder;
 mod server;
@@ -291,7 +292,9 @@ async fn main() {
         let entity_graph = entity_graph::build_entity_graph(&raw_spec, &all_ops);
         let pool_config = composer::SharedPoolConfig::new();
         let no_faker_rules = composer::FakerRules::new();
-        let pools = composer::generate_pools(&spec, &pool_config, &no_faker_rules);
+        let no_recipe_rules: Vec<rules::Rule> = Vec::new();
+        let pools =
+            composer::generate_pools(&spec, &pool_config, &no_faker_rules, &no_recipe_rules);
         let mut quantities = composer::QuantityConfigs::new();
         if let Some(defs) = &spec.definitions {
             for def_name in defs.keys() {
@@ -317,6 +320,7 @@ async fn main() {
             &quantities,
             &all_endpoints,
             &no_faker_rules,
+            &no_recipe_rules,
         );
         *documents.write().unwrap() = composed;
     }

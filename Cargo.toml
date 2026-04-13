@@ -14,6 +14,9 @@ serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 fake = { version = "5", features = ["derive"] }
 rand = "0.10"
+rand_regex = "0.19"
+regex-syntax = "0.8"
+regex = "1"
 mime_guess = "2"
 rust-embed = "8"
 tokio = { version = "1", features = ["full"] }

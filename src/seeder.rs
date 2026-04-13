@@ -16,6 +16,9 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::parser::{SchemaObject, SwaggerSpec};
+use crate::rules::{
+    self, CompareRulesByDef, FieldRuleMap, Rule, build_compare_rules_by_def, build_field_rule_map,
+};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -647,6 +650,23 @@ pub fn fake_value_for_field_with_rule(
     }
 }
 
+/// Layered field generation: recipe rules override faker strategy override
+/// the default fake_value_for_field. Recipe rules take precedence so that
+/// Range/Choice/Const/Pattern beat the per-field faker hint.
+pub fn fake_value_for_field_layered(
+    name: &str,
+    schema: &SchemaObject,
+    recipe_rule: Option<&Rule>,
+    faker_rule: Option<&FakerStrategy>,
+) -> serde_json::Value {
+    if let Some(r) = recipe_rule
+        && let Some(v) = rules::generate_for_field_rule(r)
+    {
+        return v;
+    }
+    fake_value_for_field_with_rule(name, schema, faker_rule)
+}
+
 fn map_type(schema: &SchemaObject) -> &str {
     match schema.schema_type.as_deref() {
         Some("integer") => "INTEGER",
@@ -678,12 +698,14 @@ fn effective_props(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn seed_table(
     conn: &Connection,
     table_name: &str,
     schema: &SchemaObject,
     count: usize,
     faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
+    recipe_rules: Option<&[Rule]>,
 ) -> Result<(), rusqlite::Error> {
     let props = match effective_props(schema) {
         Some(p) => p,
@@ -705,15 +727,44 @@ pub fn seed_table(
 
     let sql = format!("INSERT INTO \"{table_name}\" ({columns_str}) VALUES ({placeholders_str})");
 
-    for _ in 0..count {
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    // Pre-compute recipe rule lookups for this table.
+    let field_rule_map: FieldRuleMap = recipe_rules
+        .map(build_field_rule_map)
+        .unwrap_or_default();
+    let compare_rules_by_def: CompareRulesByDef = recipe_rules
+        .map(build_compare_rules_by_def)
+        .unwrap_or_default();
+    let table_compare_rules = compare_rules_by_def.get(table_name);
 
+    for _ in 0..count {
+        // First pass: generate all field values into a serde_json map, applying
+        // field-level recipe rules and then faker rules.
+        let mut row_map = serde_json::Map::new();
         for col_name in &col_names {
             let col_schema = &props[col_name.as_str()];
-            let rule = faker_rules
+            let faker_rule = faker_rules
                 .and_then(|r| r.get(table_name))
                 .and_then(|m| m.get(col_name.as_str()));
-            let value = fake_value_for_field_with_rule(col_name, col_schema, rule);
+            let recipe_rule = field_rule_map
+                .get(&(table_name.to_string(), (*col_name).clone()));
+            let value =
+                fake_value_for_field_layered(col_name, col_schema, recipe_rule, faker_rule);
+            row_map.insert((*col_name).clone(), value);
+        }
+
+        // Second pass: apply compare rules to the generated row.
+        if let Some(rules) = table_compare_rules {
+            crate::rules::apply_compare_rules(&mut row_map, rules);
+        }
+
+        // Third pass: bind values into the prepared statement in column order.
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for col_name in &col_names {
+            let col_schema = &props[col_name.as_str()];
+            let value = row_map
+                .get(col_name.as_str())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let sqlite_type = map_type(col_schema);
 
             match sqlite_type {
@@ -762,7 +813,7 @@ pub fn seed_tables(
     spec: &SwaggerSpec,
     rows_per_table: usize,
 ) -> Result<(), rusqlite::Error> {
-    seed_tables_filtered(conn, spec, rows_per_table, None, None)
+    seed_tables_filtered(conn, spec, rows_per_table, None, None, None)
 }
 
 pub fn seed_tables_filtered(
@@ -771,6 +822,7 @@ pub fn seed_tables_filtered(
     rows_per_table: usize,
     only: Option<&std::collections::HashSet<String>>,
     faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
+    recipe_rules: Option<&[Rule]>,
 ) -> Result<(), rusqlite::Error> {
     if let Some(ref definitions) = spec.definitions {
         for (name, schema) in definitions {
@@ -779,7 +831,14 @@ pub fn seed_tables_filtered(
             {
                 continue;
             }
-            seed_table(conn, name, schema, rows_per_table, faker_rules)?;
+            seed_table(
+                conn,
+                name,
+                schema,
+                rows_per_table,
+                faker_rules,
+                recipe_rules,
+            )?;
         }
     }
     Ok(())
@@ -869,6 +928,212 @@ mod tests {
                 valid.contains(&status.as_str()),
                 "status '{status}' should be one of {valid:?}"
             );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Recipe rule integration tests
+    // -------------------------------------------------------------------
+
+    use crate::rules::{CompareOp, Rule};
+
+    #[test]
+    fn test_seed_with_const_rule_string() {
+        let (conn, spec) = setup();
+        let rules = vec![Rule::Const {
+            field: "Pet.name".to_string(),
+            value: serde_json::json!("Fido"),
+        }];
+        seed_tables_filtered(&conn, &spec, 8, None, None, Some(&rules)).unwrap();
+
+        let names: Vec<String> = conn
+            .prepare("SELECT \"name\" FROM \"Pet\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names.len(), 8);
+        for name in &names {
+            assert_eq!(name, "Fido", "all Pet.name should be 'Fido', got '{name}'");
+        }
+    }
+
+    #[test]
+    fn test_seed_with_choice_rule_string() {
+        let (conn, spec) = setup();
+        let allowed = vec!["zebra".to_string(), "yak".to_string(), "ox".to_string()];
+        let rules = vec![Rule::Choice {
+            field: "Pet.name".to_string(),
+            options: allowed.iter().map(|s| serde_json::json!(s)).collect(),
+        }];
+        seed_tables_filtered(&conn, &spec, 12, None, None, Some(&rules)).unwrap();
+
+        let names: Vec<String> = conn
+            .prepare("SELECT \"name\" FROM \"Pet\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names.len(), 12);
+        for name in &names {
+            assert!(
+                allowed.contains(name),
+                "name '{name}' should be one of {allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seed_with_range_rule_integer() {
+        let (conn, spec) = setup();
+        let rules = vec![Rule::Range {
+            field: "Pet.id".to_string(),
+            min: 1000.0,
+            max: 1010.0,
+        }];
+        seed_tables_filtered(&conn, &spec, 15, None, None, Some(&rules)).unwrap();
+
+        let ids: Vec<i64> = conn
+            .prepare("SELECT \"id\" FROM \"Pet\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids.len(), 15);
+        for id in &ids {
+            assert!(
+                (1000..=1010).contains(id),
+                "id {id} should be in [1000,1010]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seed_with_pattern_rule_string() {
+        let (conn, spec) = setup();
+        let rules = vec![Rule::Pattern {
+            field: "Pet.name".to_string(),
+            regex: r"[A-Z]{3}-[0-9]{4}".to_string(),
+        }];
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules)).unwrap();
+
+        let pattern = regex::Regex::new(r"^[A-Z]{3}-[0-9]{4}$").unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT \"name\" FROM \"Pet\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names.len(), 10);
+        for name in &names {
+            assert!(
+                pattern.is_match(name),
+                "name '{name}' should match [A-Z]{{3}}-[0-9]{{4}}"
+            );
+        }
+    }
+
+    /// Build a small in-memory spec with Box<i32> fields that are easy to
+    /// compare-test. We synthesize a spec by hand-constructing the
+    /// SchemaObject; this avoids needing a yaml fixture for every shape.
+    fn box_spec() -> SwaggerSpec {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: BoxTest
+  version: "1.0.0"
+paths: {}
+definitions:
+  Box:
+    type: object
+    properties:
+      width:
+        type: integer
+      height:
+        type: integer
+"#;
+        let mut spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        spec.resolve_refs();
+        spec
+    }
+
+    #[test]
+    fn test_seed_with_compare_rule_numeric_gt() {
+        let spec = box_spec();
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn, &spec).unwrap();
+
+        let rules = vec![Rule::Compare {
+            left: "Box.height".to_string(),
+            op: CompareOp::Gt,
+            right: serde_json::json!("Box.width"),
+        }];
+        seed_tables_filtered(&conn, &spec, 25, None, None, Some(&rules)).unwrap();
+
+        let rows: Vec<(i64, i64)> = conn
+            .prepare("SELECT \"height\", \"width\" FROM \"Box\"")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 25);
+        for (h, w) in &rows {
+            assert!(h > w, "height {h} should be > width {w}");
+        }
+    }
+
+    #[test]
+    fn test_seed_with_compare_rule_numeric_lt_literal() {
+        let spec = box_spec();
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn, &spec).unwrap();
+
+        // height must be < 50 (literal).
+        let rules = vec![Rule::Compare {
+            left: "Box.height".to_string(),
+            op: CompareOp::Lt,
+            right: serde_json::json!(50),
+        }];
+        seed_tables_filtered(&conn, &spec, 30, None, None, Some(&rules)).unwrap();
+
+        let heights: Vec<i64> = conn
+            .prepare("SELECT \"height\" FROM \"Box\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(heights.len(), 30);
+        for h in &heights {
+            assert!(*h < 50, "height {h} should be < 50");
+        }
+    }
+
+    #[test]
+    fn test_seed_with_field_level_rule_overrides_faker() {
+        // Range rule beats default faker generation. Pet.id default would be
+        // an arbitrary i64; with a Range rule it should always be in [42, 42].
+        let (conn, spec) = setup();
+        let rules = vec![Rule::Const {
+            field: "Pet.id".to_string(),
+            value: serde_json::json!(42),
+        }];
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules)).unwrap();
+
+        let ids: Vec<i64> = conn
+            .prepare("SELECT \"id\" FROM \"Pet\"")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for id in &ids {
+            assert_eq!(*id, 42);
         }
     }
 }

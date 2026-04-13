@@ -6,7 +6,10 @@ use rand::RngExt;
 
 use crate::entity_graph::EntityGraph;
 use crate::parser::{SchemaObject, SwaggerSpec};
-use crate::seeder::{FakerStrategy, fake_value_for_field, fake_value_for_field_with_rule};
+use crate::rules::{
+    self, FieldRuleMap, Rule, build_compare_rules_by_def, build_field_rule_map,
+};
+use crate::seeder::{FakerStrategy, fake_value_for_field, fake_value_for_field_layered};
 use crate::server::EndpointInfo;
 
 pub type FakerRules = HashMap<String, HashMap<String, FakerStrategy>>;
@@ -28,11 +31,15 @@ pub fn generate_pools(
     spec: &SwaggerSpec,
     pool_config: &SharedPoolConfig,
     faker_rules: &FakerRules,
+    recipe_rules: &[Rule],
 ) -> DocumentStore {
     let defs = match &spec.definitions {
         Some(d) => d,
         None => return DocumentStore::new(),
     };
+
+    let field_rule_map = build_field_rule_map(recipe_rules);
+    let compare_rules_by_def = build_compare_rules_by_def(recipe_rules);
 
     let mut store = DocumentStore::new();
 
@@ -44,8 +51,14 @@ pub fn generate_pools(
 
         let mut instances = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
-            let mut doc =
-                generate_document_from_schema(def_name, schema, &DocumentStore::new(), faker_rules);
+            let mut doc = generate_document_from_schema(
+                def_name,
+                schema,
+                &DocumentStore::new(),
+                faker_rules,
+                &field_rule_map,
+                compare_rules_by_def.get(def_name).map(Vec::as_slice),
+            );
             // Assign a stable id to each pool entity
             if let serde_json::Value::Object(ref mut map) = doc {
                 map.insert(
@@ -65,6 +78,7 @@ pub fn generate_pools(
 /// Uses shared pools where configured, generates fresh fakes otherwise.
 /// `spec` (resolved) is used for schema generation (inlined properties).
 /// `raw_spec` (unresolved) is used for definition name lookup (retains $ref paths).
+#[allow(clippy::too_many_arguments)]
 pub fn compose_documents(
     spec: &SwaggerSpec,
     raw_spec: &SwaggerSpec,
@@ -73,6 +87,7 @@ pub fn compose_documents(
     quantities: &QuantityConfigs,
     selected_endpoints: &[EndpointInfo],
     faker_rules: &FakerRules,
+    recipe_rules: &[Rule],
 ) -> DocumentStore {
     let defs = match &spec.definitions {
         Some(d) => d,
@@ -85,6 +100,9 @@ pub fn compose_documents(
         .iter()
         .map(|(path, method, op)| ((*path, *method), *op))
         .collect();
+
+    let field_rule_map = build_field_rule_map(recipe_rules);
+    let compare_rules_by_def = build_compare_rules_by_def(recipe_rules);
 
     let mut store = DocumentStore::new();
 
@@ -119,9 +137,18 @@ pub fn compose_documents(
             rng.random_range(min..=max)
         };
 
+        let def_compare_rules = compare_rules_by_def.get(&def_name).map(Vec::as_slice);
+
         let mut docs = Vec::with_capacity(count);
         for i in 0..count {
-            let mut doc = generate_document_from_schema(&def_name, schema, pools, faker_rules);
+            let mut doc = generate_document_from_schema(
+                &def_name,
+                schema,
+                pools,
+                faker_rules,
+                &field_rule_map,
+                def_compare_rules,
+            );
             // Assign incremental id
             if let serde_json::Value::Object(ref mut map) = doc {
                 map.insert(
@@ -139,14 +166,16 @@ pub fn compose_documents(
 
 /// Generate a single document from a schema, sampling from pools for $ref properties.
 fn generate_document_from_schema(
-    _def_name: &str,
+    def_name: &str,
     schema: &SchemaObject,
     pools: &DocumentStore,
     faker_rules: &FakerRules,
+    field_rule_map: &FieldRuleMap,
+    compare_rules: Option<&[Rule]>,
 ) -> serde_json::Value {
     let props = match &schema.properties {
         Some(p) => p,
-        None => return fake_value_for_field(_def_name, schema),
+        None => return fake_value_for_field(def_name, schema),
     };
 
     let mut map = serde_json::Map::new();
@@ -158,16 +187,22 @@ fn generate_document_from_schema(
             prop_schema,
             pools,
             &mut rng,
-            _def_name,
+            def_name,
             faker_rules,
+            field_rule_map,
         );
         map.insert(prop_name.clone(), value);
+    }
+
+    if let Some(rules) = compare_rules {
+        rules::apply_compare_rules(&mut map, rules);
     }
 
     serde_json::Value::Object(map)
 }
 
 /// Generate a value for a single property, consulting pools for $ref targets.
+#[allow(clippy::too_many_arguments)]
 fn generate_property_value(
     prop_name: &str,
     prop_schema: &SchemaObject,
@@ -175,6 +210,7 @@ fn generate_property_value(
     rng: &mut impl rand::Rng,
     def_name: &str,
     faker_rules: &FakerRules,
+    field_rule_map: &FieldRuleMap,
 ) -> serde_json::Value {
     // Check if this is an array with $ref items pointing to a pool
     if prop_schema.schema_type.as_deref() == Some("array")
@@ -207,9 +243,9 @@ fn generate_property_value(
         return pool[idx].clone();
     }
 
-    // Check for faker rule
-    let rule = faker_rules.get(def_name).and_then(|m| m.get(prop_name));
-    fake_value_for_field_with_rule(prop_name, prop_schema, rule)
+    let recipe_rule = field_rule_map.get(&(def_name.to_string(), prop_name.to_string()));
+    let faker_rule = faker_rules.get(def_name).and_then(|m| m.get(prop_name));
+    fake_value_for_field_layered(prop_name, prop_schema, recipe_rule, faker_rule)
 }
 
 /// Extract the definition name from a schema if it has a $ref.
@@ -350,7 +386,7 @@ mod tests {
         pool_config.insert("Category".to_string(), 5);
         pool_config.insert("Tag".to_string(), 3);
 
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
 
         assert_eq!(pools.get("Category").unwrap().len(), 5);
         assert_eq!(pools.get("Tag").unwrap().len(), 3);
@@ -368,7 +404,7 @@ mod tests {
         let spec = load_petstore_resolved();
         let pool_config = SharedPoolConfig::new();
 
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
 
         assert!(pools.is_empty(), "empty config should produce empty pools");
     }
@@ -397,6 +433,7 @@ mod tests {
             &quantities,
             &endpoints,
             &FakerRules::new(),
+            &[],
         );
 
         assert!(docs.contains_key("Pet"), "should have Pet documents");
@@ -465,7 +502,7 @@ mod tests {
         // Create a Category pool
         let mut pool_config = SharedPoolConfig::new();
         pool_config.insert("Category".to_string(), 3);
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new());
+        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
 
         let mut quantities = QuantityConfigs::new();
         quantities.insert("Pet".to_string(), QuantityConfig { min: 5, max: 5 });
@@ -483,6 +520,7 @@ mod tests {
             &quantities,
             &endpoints,
             &FakerRules::new(),
+            &[],
         );
 
         let pets = docs.get("Pet").unwrap();

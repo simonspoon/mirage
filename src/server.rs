@@ -920,9 +920,14 @@ async fn admin_configure(
             )
                 .into_response();
         }
-        if let Err(e) =
-            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs), None)
-        {
+        if let Err(e) = seeder::seed_tables_filtered(
+            &conn,
+            &spec,
+            seed_count,
+            Some(&needed_defs),
+            None,
+            None,
+        ) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
@@ -961,6 +966,7 @@ struct CreateRecipeRequest {
     shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
+    rules: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -972,6 +978,7 @@ struct UpdateRecipeRequest {
     shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
+    rules: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -979,7 +986,7 @@ async fn admin_create_recipe(
     Json(body): Json<CreateRecipeRequest>,
 ) -> Response {
     // Validate the spec_source is valid swagger
-    let _spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
+    let parsed_spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1014,6 +1021,21 @@ async fn admin_create_recipe(
         .faker_rules
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let rules_str = body
+        .rules
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
+
+    // Validate rules against the spec (resolve refs first so field lookups work)
+    if let Some(ref rs) = rules_str
+        && let Err(e) = validate_recipe_rules(rs, &parsed_spec)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid rules: {e}")})),
+        )
+            .into_response();
+    }
 
     let recipe = {
         let conn = state.recipe_db.lock().unwrap();
@@ -1026,6 +1048,7 @@ async fn admin_create_recipe(
             shared_pools_str.as_deref(),
             quantity_configs_str.as_deref(),
             faker_rules_str.as_deref(),
+            rules_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1039,6 +1062,16 @@ async fn admin_create_recipe(
     };
 
     (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response()
+}
+
+/// Validate a JSON rules string against a swagger spec. Returns Err with a
+/// human-readable message if the rules are invalid. Resolves refs on a clone
+/// of the spec so the original is untouched.
+fn validate_recipe_rules(rules_json: &str, spec: &SwaggerSpec) -> Result<(), String> {
+    let rules = crate::rules::parse_rules(rules_json)?;
+    let mut resolved = spec.clone();
+    resolved.resolve_refs();
+    crate::rules::validate_rules(&rules, Some(&resolved))
 }
 
 async fn admin_list_recipes(State(state): State<AppState>) -> Response {
@@ -1099,7 +1132,7 @@ async fn admin_update_recipe(
     Json(body): Json<UpdateRecipeRequest>,
 ) -> Response {
     // Validate the spec_source is valid swagger
-    let _spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
+    let parsed_spec: SwaggerSpec = match serde_yaml::from_str(&body.spec_source) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1137,6 +1170,20 @@ async fn admin_update_recipe(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|| "{}".to_string());
+    let rules_str = body
+        .rules
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "[]".to_string());
+
+    // Validate rules with the same checks as create_recipe.
+    if let Err(e) = validate_recipe_rules(&rules_str, &parsed_spec) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid rules: {e}")})),
+        )
+            .into_response();
+    }
 
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::update_recipe(
@@ -1149,6 +1196,7 @@ async fn admin_update_recipe(
         &shared_pools_str,
         &quantity_configs_str,
         &faker_rules_str,
+        &rules_str,
     ) {
         Ok(true) => match crate::recipe::get_recipe(&conn, id) {
             Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
@@ -1182,6 +1230,8 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
             let faker_rules: serde_json::Value =
                 serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
+            let rules: serde_json::Value =
+                serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
 
             let export = serde_json::json!({
                 "mirage_recipe": 1,
@@ -1192,6 +1242,7 @@ async fn admin_export_recipe(
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
+                "rules": rules,
             });
 
             let filename = format!(
@@ -1270,7 +1321,7 @@ async fn admin_import_recipe(
     };
 
     // Validate the spec is parseable
-    let _spec: SwaggerSpec = match serde_yaml::from_str(&spec_source) {
+    let parsed_spec: SwaggerSpec = match serde_yaml::from_str(&spec_source) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1308,6 +1359,20 @@ async fn admin_import_recipe(
     let faker_rules_str = body
         .get("faker_rules")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let rules_str = body
+        .get("rules")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
+
+    // Validate rules from the imported recipe.
+    if let Some(ref rs) = rules_str
+        && let Err(e) = validate_recipe_rules(rs, &parsed_spec)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid rules in imported recipe: {e}")})),
+        )
+            .into_response();
+    }
 
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::create_recipe(
@@ -1319,6 +1384,7 @@ async fn admin_import_recipe(
         shared_pools_str.as_deref(),
         quantity_configs_str.as_deref(),
         faker_rules_str.as_deref(),
+        rules_str.as_deref(),
     ) {
         Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
         Err(e) => (
@@ -1387,6 +1453,15 @@ async fn admin_activate_recipe(
     let pool_config = crate::composer::parse_shared_pools(&recipe.shared_pools);
     let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
     let faker_rules = crate::composer::parse_faker_rules(&recipe.faker_rules);
+    // Parse recipe rules. If parsing fails (corrupt store), fall back to no
+    // rules but log the failure rather than aborting activation.
+    let recipe_rules: Vec<crate::rules::Rule> = match crate::rules::parse_rules(&recipe.rules) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Warning: failed to parse rules for recipe {}: {e}", recipe.id);
+            Vec::new()
+        }
+    };
 
     // Store spec in registry (same as admin_import)
     {
@@ -1497,6 +1572,7 @@ async fn admin_activate_recipe(
             seed_count,
             Some(&needed_defs),
             Some(&faker_rules),
+            Some(&recipe_rules),
         ) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1508,7 +1584,7 @@ async fn admin_activate_recipe(
 
     // Generate document store using composer
     let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
-    let pools = crate::composer::generate_pools(&spec, &pool_config, &faker_rules);
+    let pools = crate::composer::generate_pools(&spec, &pool_config, &faker_rules, &recipe_rules);
 
     // Build quantity configs: use recipe quantity_configs, with seed_count as default
     let mut effective_quantities = quantity_configs;
@@ -1530,6 +1606,7 @@ async fn admin_activate_recipe(
         &effective_quantities,
         &endpoints,
         &faker_rules,
+        &recipe_rules,
     );
 
     // Store composed documents
@@ -1575,10 +1652,13 @@ async fn admin_get_recipe_config(
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
             let faker_rules: serde_json::Value =
                 serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
+            let rules: serde_json::Value =
+                serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
             Json(serde_json::json!({
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
+                "rules": rules,
             }))
             .into_response()
         }
@@ -1600,6 +1680,8 @@ struct UpdateRecipeConfigRequest {
     shared_pools: serde_json::Value,
     quantity_configs: serde_json::Value,
     faker_rules: serde_json::Value,
+    #[serde(default)]
+    rules: serde_json::Value,
 }
 
 async fn admin_put_recipe_config(
@@ -1613,6 +1695,53 @@ async fn admin_put_recipe_config(
         serde_json::to_string(&body.quantity_configs).unwrap_or_else(|_| "{}".to_string());
     let faker_rules_str =
         serde_json::to_string(&body.faker_rules).unwrap_or_else(|_| "{}".to_string());
+    let rules_str = if body.rules.is_null() {
+        "[]".to_string()
+    } else {
+        serde_json::to_string(&body.rules).unwrap_or_else(|_| "[]".to_string())
+    };
+
+    // Validate rules against the recipe's spec.
+    {
+        let conn = state.recipe_db.lock().unwrap();
+        let existing = match crate::recipe::get_recipe(&conn, id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "recipe not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to load recipe: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let parsed_spec: SwaggerSpec = match serde_yaml::from_str(&existing.spec_source) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": format!("Stored spec invalid: {e}")}),
+                    ),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = validate_recipe_rules(&rules_str, &parsed_spec) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid rules: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::update_recipe_config(
         &conn,
@@ -1620,11 +1749,13 @@ async fn admin_put_recipe_config(
         &shared_pools_str,
         &quantity_configs_str,
         &faker_rules_str,
+        &rules_str,
     ) {
         Ok(true) => Json(serde_json::json!({
             "shared_pools": body.shared_pools,
             "quantity_configs": body.quantity_configs,
             "faker_rules": body.faker_rules,
+            "rules": serde_json::from_str::<serde_json::Value>(&rules_str).unwrap_or(serde_json::json!([])),
         }))
         .into_response(),
         Ok(false) => (
@@ -2656,5 +2787,353 @@ mod tests {
         let quantity_configs: serde_json::Value =
             serde_json::from_str(json["quantity_configs"].as_str().unwrap()).unwrap();
         assert_eq!(quantity_configs["Pet.tags"]["max"], serde_json::json!(5));
+    }
+
+    // -------------------------------------------------------------------
+    // Recipe rules HTTP tests
+    // -------------------------------------------------------------------
+
+    fn recipe_body_with_rules(rules: serde_json::Value) -> serde_json::Value {
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        serde_json::json!({
+            "name": "Ruled Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+            ],
+            "seed_count": 5,
+            "rules": rules,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_range_rule() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "range", "field": "Pet.id", "min": 1, "max": 100}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_choice_rule() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "choice", "field": "Pet.status", "options": ["available", "pending"]}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_const_rule() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "const", "field": "Pet.name", "value": "Rex"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_pattern_rule() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "pattern", "field": "Pet.name", "regex": "[A-Z][a-z]{2,5}"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_compare_rule_literal() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "compare", "left": "Pet.id", "op": "gt", "right": 100}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_rejects_conflicting_rules() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "range", "field": "Pet.id", "min": 1, "max": 100},
+            {"kind": "const", "field": "Pet.id", "value": 42}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("Pet.id"), "error should mention Pet.id, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_rejects_unknown_field() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "const", "field": "Pet.bogus_field", "value": 1}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_rejects_bad_regex() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "pattern", "field": "Pet.name", "regex": "[unterminated"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_rejects_compare_cycle() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "compare", "left": "Category.id", "op": "gt", "right": "Tag.id"},
+            {"kind": "compare", "left": "Tag.id", "op": "gt", "right": "Category.id"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // This is rejected at the cross-def check (compare cross-definition not supported).
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_recipe_validates_rules() {
+        let router = setup_empty();
+
+        // Create a recipe without rules.
+        let body = recipe_test_body();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // PUT with conflicting rules.
+        let mut update = recipe_test_body();
+        update["rules"] = serde_json::json!([
+            {"kind": "range", "field": "Pet.id", "min": 1, "max": 100},
+            {"kind": "const", "field": "Pet.id", "value": 42}
+        ]);
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&update).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PUT should reject conflicting rules just like POST"
+        );
+
+        // PUT with valid rules succeeds.
+        let mut update = recipe_test_body();
+        update["rules"] = serde_json::json!([
+            {"kind": "range", "field": "Pet.id", "min": 1, "max": 100}
+        ]);
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&update).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_recipe_config_includes_rules() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "const", "field": "Pet.name", "value": "Bingo"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // GET /_api/admin/recipes/:id/config should include rules.
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rules = json["rules"].as_array().expect("rules should be an array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["kind"], "const");
+        assert_eq!(rules[0]["field"], "Pet.name");
+        assert_eq!(rules[0]["value"], "Bingo");
+    }
+
+    #[tokio::test]
+    async fn test_put_recipe_config_with_rules() {
+        let router = setup_empty();
+
+        // Create a recipe.
+        let body = recipe_test_body();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // PUT config with rules.
+        let body = serde_json::json!({
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [
+                {"kind": "const", "field": "Pet.name", "value": "Whiskers"}
+            ]
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET should reflect the new rules.
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["value"], "Whiskers");
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_applies_rules() {
+        let router = setup_empty();
+        let body = recipe_body_with_rules(serde_json::json!([
+            {"kind": "const", "field": "Pet.name", "value": "Cosmo"}
+        ]));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Hit /pet -- composer documents drive the response. Every name should
+        // be "Cosmo".
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert!(!arr.is_empty(), "should have at least one pet");
+        for pet in arr {
+            assert_eq!(
+                pet["name"].as_str().unwrap_or(""),
+                "Cosmo",
+                "all pets should be named Cosmo, got {pet}"
+            );
+        }
     }
 }
