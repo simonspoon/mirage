@@ -47,7 +47,24 @@ interface Recipe {
   shared_pools: string;
   quantity_configs: string;
   faker_rules: string;
+  rules: string;
 }
+
+// Recipe rule data model — mirrors the Rust serde tagged union in src/rules.rs.
+// The `kind` discriminator is snake_case; CompareOp is also snake_case.
+type CompareOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
+type RuleKind = "range" | "choice" | "const" | "pattern" | "compare";
+
+type RangeRule = { kind: "range"; field: string; min: number; max: number };
+type ChoiceRule = { kind: "choice"; field: string; options: (string | number | boolean)[] };
+type ConstRule = { kind: "const"; field: string; value: string | number | boolean };
+type PatternRule = { kind: "pattern"; field: string; regex: string };
+type CompareRule = { kind: "compare"; left: string; op: CompareOp; right: string | number | boolean };
+
+type Rule = RangeRule | ChoiceRule | ConstRule | PatternRule | CompareRule;
+
+const RULE_KINDS: RuleKind[] = ["range", "choice", "const", "pattern", "compare"];
+const COMPARE_OPS: CompareOp[] = ["eq", "neq", "gt", "gte", "lt", "lte"];
 
 interface PropertyInfo {
   type: string;
@@ -138,6 +155,7 @@ function App() {
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
   const [recipeFakerRules, setRecipeFakerRules] = createSignal<Record<string, string>>({});
+  const [recipeRules, setRecipeRules] = createSignal<Rule[]>([]);
   const [configSearch, setConfigSearch] = createSignal("");
   const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
   const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
@@ -471,6 +489,7 @@ function App() {
             shared_pools: recipeSharedPools(),
             quantity_configs: recipeQuantityConfigs(),
             faker_rules: recipeFakerRules(),
+            rules: recipeRules(),
           }),
         });
         if (!res.ok) {
@@ -492,6 +511,7 @@ function App() {
         setRecipeSharedPools({});
         setRecipeQuantityConfigs({});
         setRecipeFakerRules({});
+        setRecipeRules([]);
         setEditingRecipeId(null);
         setSaveActivatePhase("idle");
         await refreshRecipes();
@@ -521,6 +541,7 @@ function App() {
           shared_pools: recipeSharedPools(),
           quantity_configs: recipeQuantityConfigs(),
           faker_rules: recipeFakerRules(),
+          rules: recipeRules(),
         }),
       });
       if (!res.ok) {
@@ -577,6 +598,7 @@ function App() {
       setRecipeSharedPools({});
       setRecipeQuantityConfigs({});
       setRecipeFakerRules({});
+      setRecipeRules([]);
       setEntityGraph(null);
       setSavedRecipeId(null);
       setSaveActivatePhase("idle");
@@ -660,13 +682,18 @@ function App() {
         selectedEps.some((sel) => sel.method === ep.method && sel.path === ep.path)
       );
 
-      // Parse shared_pools, quantity_configs, and faker_rules
+      // Parse shared_pools, quantity_configs, faker_rules, and rules
       let sharedPools: Record<string, {is_shared: boolean, pool_size: number}> = {};
       try { sharedPools = JSON.parse(recipe.shared_pools); } catch { /* empty */ }
       let quantityConfigs: Record<string, {min: number, max: number}> = {};
       try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
       let fakerRules: Record<string, string> = {};
       try { fakerRules = JSON.parse(recipe.faker_rules); } catch { /* empty */ }
+      let rules: Rule[] = [];
+      try {
+        const parsed = JSON.parse(recipe.rules ?? "[]");
+        if (Array.isArray(parsed)) rules = parsed as Rule[];
+      } catch { /* empty */ }
 
       setRecipeSpecText(recipe.spec_source);
       setRecipeAvailableEndpoints(availableEps);
@@ -676,6 +703,7 @@ function App() {
       setRecipeSharedPools(sharedPools);
       setRecipeQuantityConfigs(quantityConfigs);
       setRecipeFakerRules(fakerRules);
+      setRecipeRules(rules);
       setEditingRecipeId(recipe.id);
       setRecipeStep("select");
       setRecipeCreating(true);
@@ -697,6 +725,7 @@ function App() {
     setRecipeSharedPools({});
     setRecipeQuantityConfigs({});
     setRecipeFakerRules({});
+    setRecipeRules([]);
     setEditingRecipeId(null);
     setError(null);
   };
@@ -2026,7 +2055,7 @@ function App() {
                         <div>
                           <h3 class="text-lg font-semibold">Configure Data Generation</h3>
                           <p class="text-sm text-gray-500">
-                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties · {Object.keys(recipeFakerRules()).length} field rules
+                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties · {Object.keys(recipeFakerRules()).length} field rules · {recipeRules().length} constraint rules
                           </p>
                         </div>
                         <Show when={hasAnything()}>
@@ -2260,7 +2289,290 @@ function App() {
                         </div>
                       </Show>
 
-                      {!hasAnything() && (
+                      {/* Constraint Rules — bounded values + cross-field compares */}
+                      {(() => {
+                        // Field options derived from entityGraph().scalar_properties.
+                        // Rendered as <optgroup> per def_name so the user can scan visually.
+                        const scalarFields = (): {def: string, prop: string, type: string, format: string | null}[] => {
+                          const g = entityGraph();
+                          if (!g || !Array.isArray(g.scalar_properties)) return [];
+                          return g.scalar_properties.map((sp: any) => ({
+                            def: sp.def_name,
+                            prop: sp.prop_name,
+                            type: sp.prop_type,
+                            format: sp.format,
+                          }));
+                        };
+                        const groupedFields = () => {
+                          const groups: Record<string, {def: string, prop: string, type: string, format: string | null}[]> = {};
+                          for (const f of scalarFields()) {
+                            if (!groups[f.def]) groups[f.def] = [];
+                            groups[f.def].push(f);
+                          }
+                          return groups;
+                        };
+
+                        const [newRuleKind, setNewRuleKind] = createSignal<RuleKind>("range");
+
+                        const firstFieldPath = (): string => {
+                          const fs = scalarFields();
+                          return fs.length > 0 ? `${fs[0].def}.${fs[0].prop}` : "";
+                        };
+
+                        const makeRule = (kind: RuleKind): Rule => {
+                          const f = firstFieldPath();
+                          switch (kind) {
+                            case "range": return { kind: "range", field: f, min: 0, max: 100 };
+                            case "choice": return { kind: "choice", field: f, options: [] };
+                            case "const": return { kind: "const", field: f, value: "" };
+                            case "pattern": return { kind: "pattern", field: f, regex: "" };
+                            case "compare": return { kind: "compare", left: f, op: "gt", right: f };
+                          }
+                        };
+
+                        const addRule = () => {
+                          setRecipeRules([...recipeRules(), makeRule(newRuleKind())]);
+                        };
+
+                        const removeRule = (idx: number) => {
+                          const next = [...recipeRules()];
+                          next.splice(idx, 1);
+                          setRecipeRules(next);
+                        };
+
+                        const updateRule = (idx: number, patch: Partial<Rule>) => {
+                          const next = [...recipeRules()];
+                          next[idx] = { ...next[idx], ...patch } as Rule;
+                          setRecipeRules(next);
+                        };
+
+                        // Parse a literal: number-literal -> number, "true"/"false" -> bool, else string.
+                        const parseLiteral = (raw: string): string | number | boolean => {
+                          const trimmed = raw.trim();
+                          if (trimmed === "true") return true;
+                          if (trimmed === "false") return false;
+                          if (trimmed !== "" && !isNaN(Number(trimmed))) return Number(trimmed);
+                          return raw;
+                        };
+                        const parseChoiceOptions = (raw: string): (string | number | boolean)[] => {
+                          if (!raw.trim()) return [];
+                          return raw.split(",").map((s) => parseLiteral(s.trim()));
+                        };
+                        const stringifyChoiceOptions = (opts: (string | number | boolean)[]): string => {
+                          return opts.map((o) => String(o)).join(", ");
+                        };
+
+                        // Field select: rendered inline at each call site (NOT wrapped in a helper function),
+                        // because Solid's compiler can only wrap inline JSX expressions in reactive effects.
+                        // Function-call arguments are evaluated eagerly and lose reactivity.
+                        const FieldSelect = (props: { value: string; onChange: (next: string) => void }) => (
+                          <select
+                            value={props.value}
+                            class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                            onChange={(e) => props.onChange(e.target.value)}
+                          >
+                            <Show when={!props.value}>
+                              <option value="">-- field --</option>
+                            </Show>
+                            <For each={Object.entries(groupedFields()).sort(([a], [b]) => a.localeCompare(b))}>
+                              {([def, ps]) => (
+                                <optgroup label={def}>
+                                  <For each={ps}>
+                                    {(p) => (
+                                      <option value={`${def}.${p.prop}`}>
+                                        {p.prop} <Show when={p.type}>({p.type}{p.format ? `/${p.format}` : ""})</Show>
+                                      </option>
+                                    )}
+                                  </For>
+                                </optgroup>
+                              )}
+                            </For>
+                          </select>
+                        );
+
+                        return (
+                          <div class="mb-6" data-testid="constraint-rules-section">
+                            <div class="flex items-center justify-between mb-2">
+                              <h4 class="text-sm font-medium text-gray-300">Constraint Rules</h4>
+                              <div class="flex items-center gap-2">
+                                <select
+                                  value={newRuleKind()}
+                                  class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                  onChange={(e) => setNewRuleKind(e.target.value as RuleKind)}
+                                  data-testid="rule-kind-picker"
+                                >
+                                  <For each={RULE_KINDS}>
+                                    {(k) => <option value={k}>{k}</option>}
+                                  </For>
+                                </select>
+                                <button
+                                  class="px-2 py-0.5 text-xs font-medium text-blue-300 hover:text-blue-200 border border-blue-500/30 hover:border-blue-500/60 rounded-md transition-colors disabled:opacity-50"
+                                  onClick={addRule}
+                                  disabled={scalarFields().length === 0}
+                                  data-testid="rule-add-btn"
+                                >
+                                  + Add Rule
+                                </button>
+                              </div>
+                            </div>
+
+                            <Show when={scalarFields().length === 0}>
+                              <p class="text-xs text-gray-600 mb-2">Load endpoint graph first — no scalar fields detected.</p>
+                            </Show>
+
+                            <Show when={recipeRules().length === 0 && scalarFields().length > 0}>
+                              <p class="text-xs text-gray-600 mb-2">No constraint rules. Pick a kind and click Add Rule to bound a field, fix a value, restrict to a set, match a regex, or relate two fields.</p>
+                            </Show>
+
+                            <div class="space-y-2" data-testid="rule-list">
+                              <For each={recipeRules()}>
+                                {(rule, i) => (
+                                  <div class="flex items-center gap-2 px-3 py-2 bg-gray-800/50 rounded-md flex-wrap" data-testid={`rule-row-${rule.kind}`}>
+                                    <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-medium w-16 text-center">
+                                      {rule.kind}
+                                    </span>
+
+                                    {/* range: field min max */}
+                                    <Show when={rule.kind === "range"}>
+                                      <FieldSelect
+                                        value={(rule as RangeRule).field}
+                                        onChange={(next) => updateRule(i(), { field: next } as Partial<RangeRule>)}
+                                      />
+                                      <span class="text-[10px] text-gray-500">min</span>
+                                      <input
+                                        type="number"
+                                        value={(rule as RangeRule).min}
+                                        class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => updateRule(i(), { min: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                                      />
+                                      <span class="text-[10px] text-gray-500">max</span>
+                                      <input
+                                        type="number"
+                                        value={(rule as RangeRule).max}
+                                        class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => updateRule(i(), { max: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                                      />
+                                    </Show>
+
+                                    {/* choice: field options (comma list) */}
+                                    <Show when={rule.kind === "choice"}>
+                                      <FieldSelect
+                                        value={(rule as ChoiceRule).field}
+                                        onChange={(next) => updateRule(i(), { field: next } as Partial<ChoiceRule>)}
+                                      />
+                                      <input
+                                        type="text"
+                                        placeholder="value1, value2, value3"
+                                        value={stringifyChoiceOptions((rule as ChoiceRule).options)}
+                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => updateRule(i(), { options: parseChoiceOptions(e.currentTarget.value) } as Partial<ChoiceRule>)}
+                                      />
+                                    </Show>
+
+                                    {/* const: field value */}
+                                    <Show when={rule.kind === "const"}>
+                                      <FieldSelect
+                                        value={(rule as ConstRule).field}
+                                        onChange={(next) => updateRule(i(), { field: next } as Partial<ConstRule>)}
+                                      />
+                                      <input
+                                        type="text"
+                                        placeholder="value"
+                                        value={String((rule as ConstRule).value ?? "")}
+                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => updateRule(i(), { value: parseLiteral(e.currentTarget.value) } as Partial<ConstRule>)}
+                                      />
+                                    </Show>
+
+                                    {/* pattern: field regex */}
+                                    <Show when={rule.kind === "pattern"}>
+                                      <FieldSelect
+                                        value={(rule as PatternRule).field}
+                                        onChange={(next) => updateRule(i(), { field: next } as Partial<PatternRule>)}
+                                      />
+                                      <input
+                                        type="text"
+                                        placeholder="[A-Z]{3}-[0-9]{4}"
+                                        value={(rule as PatternRule).regex}
+                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 font-mono focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => updateRule(i(), { regex: e.currentTarget.value } as Partial<PatternRule>)}
+                                      />
+                                    </Show>
+
+                                    {/* compare: left op right (right may be field or literal) */}
+                                    <Show when={rule.kind === "compare"}>
+                                      <FieldSelect
+                                        value={(rule as CompareRule).left}
+                                        onChange={(next) => updateRule(i(), { left: next } as Partial<CompareRule>)}
+                                      />
+                                      <select
+                                        value={(rule as CompareRule).op}
+                                        class="bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                        onChange={(e) => updateRule(i(), { op: e.target.value as CompareOp } as Partial<CompareRule>)}
+                                      >
+                                        <For each={COMPARE_OPS}>
+                                          {(o) => <option value={o}>{o}</option>}
+                                        </For>
+                                      </select>
+                                      {(() => {
+                                        // Right is a field reference if its current value matches a known field path,
+                                        // otherwise a literal. The toggle <select> swaps between the two input modes.
+                                        const cr = () => rule as CompareRule;
+                                        const knownPaths = () => new Set(scalarFields().map((f) => `${f.def}.${f.prop}`));
+                                        const isFieldRef = () => typeof cr().right === "string" && knownPaths().has(cr().right as string);
+                                        return (
+                                          <>
+                                            <select
+                                              class="bg-[#070c17] border border-gray-800 rounded px-1 py-1 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
+                                              value={isFieldRef() ? "field" : "literal"}
+                                              onChange={(e) => {
+                                                if (e.target.value === "field") {
+                                                  updateRule(i(), { right: firstFieldPath() } as Partial<CompareRule>);
+                                                } else {
+                                                  updateRule(i(), { right: "" } as Partial<CompareRule>);
+                                                }
+                                              }}
+                                            >
+                                              <option value="field">field</option>
+                                              <option value="literal">literal</option>
+                                            </select>
+                                            <Show when={isFieldRef()}>
+                                              <FieldSelect
+                                                value={typeof cr().right === "string" ? (cr().right as string) : ""}
+                                                onChange={(next) => updateRule(i(), { right: next } as Partial<CompareRule>)}
+                                              />
+                                            </Show>
+                                            <Show when={!isFieldRef()}>
+                                              <input
+                                                type="text"
+                                                placeholder="literal value"
+                                                value={String(cr().right ?? "")}
+                                                class="flex-1 min-w-[120px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                                onInput={(e) => updateRule(i(), { right: parseLiteral(e.currentTarget.value) } as Partial<CompareRule>)}
+                                              />
+                                            </Show>
+                                          </>
+                                        );
+                                      })()}
+                                    </Show>
+
+                                    <button
+                                      class="ml-auto text-gray-500 hover:text-red-400 text-sm w-6 h-6 flex items-center justify-center rounded hover:bg-red-500/10 transition-colors"
+                                      onClick={() => removeRule(i())}
+                                      title="Remove rule"
+                                      data-testid="rule-remove-btn"
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {!hasAnything() && recipeRules().length === 0 && (
                         <p class="text-gray-400 mb-4">No shared entities, array properties, or scalar fields detected. You can proceed to name your recipe.</p>
                       )}
 
