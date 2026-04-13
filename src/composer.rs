@@ -6,9 +6,7 @@ use rand::RngExt;
 
 use crate::entity_graph::EntityGraph;
 use crate::parser::{SchemaObject, SwaggerSpec};
-use crate::rules::{
-    self, FieldRuleMap, Rule, build_compare_rules_by_def, build_field_rule_map,
-};
+use crate::rules::{self, FieldRuleMap, Rule, build_compare_rules_by_def, build_field_rule_map};
 use crate::seeder::{FakerStrategy, fake_value_for_field, fake_value_for_field_layered};
 use crate::server::EndpointInfo;
 

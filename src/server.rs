@@ -920,14 +920,9 @@ async fn admin_configure(
             )
                 .into_response();
         }
-        if let Err(e) = seeder::seed_tables_filtered(
-            &conn,
-            &spec,
-            seed_count,
-            Some(&needed_defs),
-            None,
-            None,
-        ) {
+        if let Err(e) =
+            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs), None, None)
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
@@ -1458,7 +1453,10 @@ async fn admin_activate_recipe(
     let recipe_rules: Vec<crate::rules::Rule> = match crate::rules::parse_rules(&recipe.rules) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Warning: failed to parse rules for recipe {}: {e}", recipe.id);
+            eprintln!(
+                "Warning: failed to parse rules for recipe {}: {e}",
+                recipe.id
+            );
             Vec::new()
         }
     };
@@ -1726,9 +1724,7 @@ async fn admin_put_recipe_config(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"error": format!("Stored spec invalid: {e}")}),
-                    ),
+                    Json(serde_json::json!({"error": format!("Stored spec invalid: {e}")})),
                 )
                     .into_response();
             }
@@ -2904,7 +2900,10 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let err = json["error"].as_str().unwrap();
-        assert!(err.contains("Pet.id"), "error should mention Pet.id, got: {err}");
+        assert!(
+            err.contains("Pet.id"),
+            "error should mention Pet.id, got: {err}"
+        );
     }
 
     #[tokio::test]

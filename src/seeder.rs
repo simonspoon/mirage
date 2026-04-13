@@ -728,9 +728,7 @@ pub fn seed_table(
     let sql = format!("INSERT INTO \"{table_name}\" ({columns_str}) VALUES ({placeholders_str})");
 
     // Pre-compute recipe rule lookups for this table.
-    let field_rule_map: FieldRuleMap = recipe_rules
-        .map(build_field_rule_map)
-        .unwrap_or_default();
+    let field_rule_map: FieldRuleMap = recipe_rules.map(build_field_rule_map).unwrap_or_default();
     let compare_rules_by_def: CompareRulesByDef = recipe_rules
         .map(build_compare_rules_by_def)
         .unwrap_or_default();
@@ -745,10 +743,8 @@ pub fn seed_table(
             let faker_rule = faker_rules
                 .and_then(|r| r.get(table_name))
                 .and_then(|m| m.get(col_name.as_str()));
-            let recipe_rule = field_rule_map
-                .get(&(table_name.to_string(), (*col_name).clone()));
-            let value =
-                fake_value_for_field_layered(col_name, col_schema, recipe_rule, faker_rule);
+            let recipe_rule = field_rule_map.get(&(table_name.to_string(), (*col_name).clone()));
+            let value = fake_value_for_field_layered(col_name, col_schema, recipe_rule, faker_rule);
             row_map.insert((*col_name).clone(), value);
         }
 

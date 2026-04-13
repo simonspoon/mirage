@@ -201,9 +201,7 @@ pub fn validate_rules(rules: &[Rule], spec: Option<&SwaggerSpec>) -> Result<(), 
     for rule in rules {
         if let Rule::Compare { left, right, .. } = rule {
             let (left_def, _left_prop) = split_field_path(left).ok_or_else(|| {
-                format!(
-                    "Compare rule left side must be a 'DefName.field' path, got: {left}"
-                )
+                format!("Compare rule left side must be a 'DefName.field' path, got: {left}")
             })?;
             // If right is a string, it MAY be a field path — in that case
             // require it to be in the same def AND not equal to left.
@@ -211,9 +209,7 @@ pub fn validate_rules(rules: &[Rule], spec: Option<&SwaggerSpec>) -> Result<(), 
                 && let Some((right_def, _right_prop)) = split_field_path(right_str)
             {
                 if right_str == left {
-                    return Err(format!(
-                        "Compare rule self-loop: {left} compared to itself"
-                    ));
+                    return Err(format!("Compare rule self-loop: {left} compared to itself"));
                 }
                 if right_def != left_def {
                     return Err(format!(
@@ -261,10 +257,8 @@ fn detect_compare_cycles(rules: &[Rule]) -> Result<(), String> {
         Gray,
         Black,
     }
-    let mut color: HashMap<String, Color> = graph
-        .keys()
-        .map(|k| (k.clone(), Color::White))
-        .collect();
+    let mut color: HashMap<String, Color> =
+        graph.keys().map(|k| (k.clone(), Color::White)).collect();
 
     for start in graph.keys() {
         if matches!(color.get(start), Some(Color::White)) {
@@ -283,9 +277,7 @@ fn detect_compare_cycles(rules: &[Rule]) -> Result<(), String> {
                 let child = &children[child_idx];
                 match color.get(child) {
                     Some(Color::Gray) => {
-                        return Err(format!(
-                            "Compare rule cycle detected involving {child}"
-                        ));
+                        return Err(format!("Compare rule cycle detected involving {child}"));
                     }
                     Some(Color::White) => {
                         color.insert(child.clone(), Color::Gray);
@@ -450,8 +442,7 @@ pub fn generate_for_field_rule(rule: &Rule) -> Option<serde_json::Value> {
 /// Generate a string matching the given regex via rand_regex. Returns Err
 /// with a human-readable message if the regex is invalid.
 pub fn generate_for_pattern(regex: &str) -> Result<serde_json::Value, String> {
-    let hir = regex_syntax::parse(regex)
-        .map_err(|e| format!("Invalid regex '{regex}': {e}"))?;
+    let hir = regex_syntax::parse(regex).map_err(|e| format!("Invalid regex '{regex}': {e}"))?;
     let generator = rand_regex::Regex::with_hir(hir, 100)
         .map_err(|e| format!("rand_regex failed for '{regex}': {e}"))?;
     let mut rng = rand::rng();
