@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -54,6 +54,38 @@ pub struct RouteEntry {
 pub type Registry = Arc<RwLock<RouteRegistry>>;
 
 const MAX_LOG_ENTRIES: usize = 500;
+
+/// Maximum size (in bytes) of a request or response body the logging
+/// middleware will buffer in memory. Bodies larger than this are not
+/// silently dropped: the request path returns 413, the response path
+/// substitutes a sentinel in the captured log.
+const LOG_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum size (in bytes) of a body string actually stored in a
+/// `LogEntry`. With `MAX_LOG_ENTRIES` capped by count rather than size
+/// and `LOG_BODY_LIMIT_BYTES` allowing 16 MB bodies through, an
+/// uncapped store could grow to multi-GB. Anything beyond this is
+/// truncated with a marker suffix.
+const LOG_BODY_STORE_MAX: usize = 64 * 1024;
+
+/// Truncate a body string for storage in `LogEntry`, leaving a marker
+/// indicating how many bytes the original payload contained.
+fn truncate_for_log(s: &str) -> String {
+    let total = s.len();
+    if total <= LOG_BODY_STORE_MAX {
+        return s.to_string();
+    }
+    // Find a UTF-8 boundary at or below LOG_BODY_STORE_MAX so we never
+    // slice through a multi-byte character.
+    let mut end = LOG_BODY_STORE_MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 32);
+    out.push_str(&s[..end]);
+    out.push_str(&format!("[truncated: {total} bytes total]"));
+    out
+}
 
 #[derive(Clone, Serialize)]
 pub struct LogEntry {
@@ -524,8 +556,8 @@ fn log_request(
         method: method.to_uppercase(),
         path: path.to_string(),
         status,
-        request_body,
-        response_body,
+        request_body: request_body.map(|s| truncate_for_log(&s)),
+        response_body: response_body.map(|s| truncate_for_log(&s)),
     };
     let mut log = log.lock().unwrap();
     log.push(entry);
@@ -1930,11 +1962,39 @@ async fn logging_middleware(
         return next.run(req).await;
     }
 
-    // Buffer request body
+    // Buffer request body. We must read the whole body in order to log it
+    // and then reconstruct the request for downstream handlers. If the body
+    // is larger than `LOG_BODY_LIMIT_BYTES` the original stream is partially
+    // consumed and unrecoverable, so we cannot forward the request: return
+    // 413 Payload Too Large and record the event in the log.
     let (parts, body) = req.into_parts();
-    let req_bytes = axum::body::to_bytes(body, 1024 * 1024)
-        .await
-        .unwrap_or_default();
+    let req_bytes = match axum::body::to_bytes(body, LOG_BODY_LIMIT_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "Warning: request body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); returning 413"
+            );
+            let sentinel =
+                format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
+            log_request(
+                &state.log,
+                &method,
+                &path,
+                StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                Some(sentinel),
+                None,
+            );
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "request body exceeds limit of {LOG_BODY_LIMIT_BYTES} bytes"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
     let request_body = if req_bytes.is_empty() {
         None
     } else {
@@ -1945,15 +2005,30 @@ async fn logging_middleware(
     let response = next.run(req).await;
     let status = response.status().as_u16();
 
-    // Buffer response body
+    // Buffer response body. If it exceeds the limit we log a sentinel and
+    // forward the response with an empty body (matching the prior failure
+    // mode). The 16 MB ceiling makes this branch a safeguard, not a hot
+    // path; very-large responses remain a known theoretical hole.
     let (parts, body) = response.into_parts();
-    let res_bytes = axum::body::to_bytes(body, 1024 * 1024)
+    let (response_body, forward_bytes) = match axum::body::to_bytes(body, LOG_BODY_LIMIT_BYTES)
         .await
-        .unwrap_or_default();
-    let response_body = if res_bytes.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&res_bytes).into_owned())
+    {
+        Ok(bytes) => {
+            let logged = if bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            };
+            (logged, bytes)
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: response body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); logging sentinel"
+            );
+            let sentinel =
+                format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
+            (Some(sentinel), axum::body::Bytes::new())
+        }
     };
 
     log_request(
@@ -1965,7 +2040,7 @@ async fn logging_middleware(
         response_body,
     );
 
-    Response::from_parts(parts, axum::body::Body::from(res_bytes))
+    Response::from_parts(parts, axum::body::Body::from(forward_bytes))
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -2012,6 +2087,12 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             logging_middleware,
         ))
+        // Raise axum's 2 MB default body limit for `Json`/`String`/`Bytes`
+        // extractors so admin endpoints (e.g. recipe import with a large
+        // OpenAPI spec) can accept payloads up to `LOG_BODY_LIMIT_BYTES`.
+        // The logging middleware is the first line of defense against bodies
+        // larger than that.
+        .layer(DefaultBodyLimit::max(LOG_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -3134,5 +3215,130 @@ mod tests {
                 "all pets should be named Cosmo, got {pet}"
             );
         }
+    }
+
+    /// Build a recipe-create body whose `spec_source` is the petstore YAML
+    /// padded to roughly `target_size` bytes. Padding is added as a top-level
+    /// `x-padding:` key whose scalar value is a long string of `x`s, which
+    /// keeps the document valid YAML and a valid swagger 2.0 spec (unknown
+    /// `x-` extensions are ignored by serde via `#[serde(deny_unknown_fields)]`
+    /// being absent on `SwaggerSpec`).
+    fn padded_recipe_body(name: &str, target_size: usize) -> serde_json::Value {
+        let base = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let mut spec = base.clone();
+        if !spec.ends_with('\n') {
+            spec.push('\n');
+        }
+        let prefix = "x-padding: \"";
+        let suffix = "\"\n";
+        let overhead = spec.len() + prefix.len() + suffix.len();
+        if target_size > overhead {
+            let pad_len = target_size - overhead;
+            spec.push_str(prefix);
+            spec.extend(std::iter::repeat_n('x', pad_len));
+            spec.push_str(suffix);
+        }
+        serde_json::json!({
+            "name": name,
+            "spec_source": spec,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 1
+        })
+    }
+
+    #[tokio::test]
+    async fn test_recipe_spec_source_just_under_1mb() {
+        let router = setup_empty();
+        let body = padded_recipe_body("Padded ~999KB", 999 * 1024);
+        let payload = serde_json::to_string(&body).unwrap();
+        // Sanity: the wire payload is at least the spec size.
+        assert!(payload.len() >= 999 * 1024);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_recipe_spec_source_just_over_1mb() {
+        // Regression test for the bug where `to_bytes(.., 1024 * 1024)` in
+        // logging_middleware silently dropped bodies > 1 MB and the
+        // downstream Json extractor returned 400 EOF.
+        let router = setup_empty();
+        let body = padded_recipe_body("Padded ~1.1MB", 1_100_000);
+        let payload = serde_json::to_string(&body).unwrap();
+        assert!(payload.len() > 1024 * 1024);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_recipe_spec_source_at_16mb() {
+        // Pad the spec close to but just under the 16 MB middleware ceiling.
+        // The JSON envelope adds a small amount of overhead so we leave a
+        // 256 KB margin to stay below the limit.
+        let router = setup_empty();
+        let target = 16 * 1024 * 1024 - 256 * 1024;
+        let body = padded_recipe_body("Padded ~16MB", target);
+        let payload = serde_json::to_string(&body).unwrap();
+        assert!(payload.len() > 8 * 1024 * 1024);
+        assert!(payload.len() < 16 * 1024 * 1024);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_recipe_spec_source_zero_bytes() {
+        // Confirm we did not suppress legitimate validation: an empty
+        // spec_source must still be rejected by the spec parser.
+        let router = setup_empty();
+        let body = serde_json::json!({
+            "name": "Empty Spec",
+            "spec_source": "",
+            "endpoints": [],
+            "seed_count": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_truncate_for_log_short_string_unchanged() {
+        let s = "hello world";
+        assert_eq!(truncate_for_log(s), s);
+    }
+
+    #[test]
+    fn test_truncate_for_log_long_string_truncated() {
+        let s = "a".repeat(LOG_BODY_STORE_MAX + 1024);
+        let out = truncate_for_log(&s);
+        assert!(out.starts_with(&"a".repeat(LOG_BODY_STORE_MAX)));
+        assert!(out.contains("[truncated:"));
+        assert!(out.len() < s.len());
     }
 }
