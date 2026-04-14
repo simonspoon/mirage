@@ -1,6 +1,7 @@
 // Axum API server
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error as _;
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -9,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use http_body_util::LengthLimitError;
 use rusqlite::types::Value as SqlValue;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -1971,28 +1973,52 @@ async fn logging_middleware(
     let req_bytes = match axum::body::to_bytes(body, LOG_BODY_LIMIT_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            eprintln!(
-                "Warning: request body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); returning 413"
-            );
-            let sentinel =
-                format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
-            log_request(
-                &state.log,
-                &method,
-                &path,
-                StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                Some(sentinel),
-                None,
-            );
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "request body exceeds limit of {LOG_BODY_LIMIT_BYTES} bytes"
-                    )
-                })),
-            )
-                .into_response();
+            let is_limit = err
+                .source()
+                .and_then(|s| s.downcast_ref::<LengthLimitError>())
+                .is_some();
+            if is_limit {
+                eprintln!(
+                    "Warning: request body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); returning 413"
+                );
+                let sentinel =
+                    format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
+                log_request(
+                    &state.log,
+                    &method,
+                    &path,
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    Some(sentinel),
+                    None,
+                );
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "request body exceeds limit of {LOG_BODY_LIMIT_BYTES} bytes"
+                        )
+                    })),
+                )
+                    .into_response();
+            } else {
+                eprintln!("logging_middleware request body read error (non-limit): {err}");
+                let sentinel = format!("<body read error: {err}>");
+                log_request(
+                    &state.log,
+                    &method,
+                    &path,
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    Some(sentinel),
+                    None,
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "failed to read request body"
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
     let request_body = if req_bytes.is_empty() {
@@ -2022,9 +2048,17 @@ async fn logging_middleware(
             (logged, bytes)
         }
         Err(err) => {
-            eprintln!(
-                "Warning: response body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); logging sentinel"
-            );
+            let is_limit = err
+                .source()
+                .and_then(|s| s.downcast_ref::<LengthLimitError>())
+                .is_some();
+            if is_limit {
+                eprintln!(
+                    "Warning: response body for {method} {path} exceeded {LOG_BODY_LIMIT_BYTES} bytes ({err}); logging sentinel"
+                );
+            } else {
+                eprintln!("logging_middleware response body read error (non-limit): {err}");
+            }
             let sentinel =
                 format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
             (Some(sentinel), axum::body::Bytes::new())
