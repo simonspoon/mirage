@@ -47,8 +47,8 @@ interface ForceGraphProps {
   edges: Record<string, string[]>;
   roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }>;
   arrayTargets: string[];
-  selectedEntity: string | null;
-  onSelectEntity: (name: string | null) => void;
+  selectedEntities: Set<string>;
+  onSelectEntity: (name: string) => void;
 }
 
 // --- Constants ---
@@ -167,8 +167,8 @@ export default function ForceGraph(props: ForceGraphProps) {
 
   // Reheat on selection change
   createEffect(() => {
-    props.selectedEntity; // track
-    alpha = Math.max(alpha, 0.3);
+    const s = props.selectedEntities; // track
+    if (s.size > 0) alpha = Math.max(alpha, 0.3);
   });
 
   // --- Simulation tick ---
@@ -377,13 +377,8 @@ export default function ForceGraph(props: ForceGraphProps) {
   function onPointerUp(e: PointerEvent) {
     if (dragging) {
       if (!didDrag) {
-        // Click (no movement) on a node — select it if it's not already selected
-        const sel = props.selectedEntity;
-        if (dragging.id !== sel) {
-          props.onSelectEntity(dragging.id);
-        }
+        props.onSelectEntity(dragging.id);
       }
-      // Unpin after drag or click
       dragging.fx = null;
       dragging.fy = null;
       dragging = null;
@@ -419,7 +414,7 @@ export default function ForceGraph(props: ForceGraphProps) {
 
   // --- Render ---
 
-  const sel = () => props.selectedEntity;
+  const selSet = () => props.selectedEntities;
 
   return (
     <div class="relative w-full h-full">
@@ -496,8 +491,8 @@ export default function ForceGraph(props: ForceGraphProps) {
           <g style="pointer-events: none;">
             <Index each={renderEdges()}>
               {(line) => {
-                const isFromSel = () => line().source === sel();
-                const isToSel = () => line().target === sel();
+                const isFromSel = () => selSet().has(line().source);
+                const isToSel = () => selSet().has(line().target);
                 const active = () => isFromSel() || isToSel();
                 return (
                   <line
@@ -506,7 +501,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                     stroke={active() ? "#3b82f6" : "#1e293b"}
                     stroke-width={active() ? 1.8 : 0.8}
                     stroke-dasharray={isToSel() && !isFromSel() ? "6,4" : undefined}
-                    opacity={sel() ? (active() ? 0.9 : 0.2) : 0.4}
+                    opacity={selSet().size > 0 ? (active() ? 0.9 : 0.2) : 0.4}
                   />
                 );
               }}
@@ -517,7 +512,7 @@ export default function ForceGraph(props: ForceGraphProps) {
                   <circle
                     cx={p().x} cy={p().y} r={1.5}
                     fill="#60a5fa"
-                    opacity={p().opacity * (sel() ? 0.3 : 0.5)}
+                    opacity={p().opacity * (selSet().size > 0 ? 0.3 : 0.5)}
                   />
                 </Show>
               )}

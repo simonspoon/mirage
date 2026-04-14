@@ -165,7 +165,8 @@ function App() {
   const [definitions, setDefinitions] = createSignal<Record<string, DefinitionInfo>>({});
   const [schemaRoutes, setSchemaRoutes] = createSignal<RouteInfo[]>([]);
   const [expandedDefs, setExpandedDefs] = createSignal<Set<string>>(new Set());
-  const [selectedEntity, setSelectedEntity] = createSignal<string | null>(null);
+  const [selectedEntities, setSelectedEntities] = createSignal<Set<string>>(new Set());
+  const [lastSelectedEntity, setLastSelectedEntity] = createSignal<string | null>(null);
   const [schemaFilter, setSchemaFilter] = createSignal("");
 
   // Schema-level entity graph state
@@ -794,8 +795,27 @@ function App() {
   };
 
   const selectEntity = (name: string) => {
-    setSelectedEntity(name);
-    if (!expandedDefs().has(name)) toggleDef(name);
+    const prev = selectedEntities();
+    const next = new Set(prev);
+    const wasSelected = next.has(name);
+    if (wasSelected) {
+      next.delete(name);
+    } else {
+      next.add(name);
+    }
+    setSelectedEntities(next);
+    if (wasSelected) {
+      const remaining = Array.from(next);
+      setLastSelectedEntity(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+    } else {
+      setLastSelectedEntity(name);
+      if (!expandedDefs().has(name)) toggleDef(name);
+    }
+  };
+
+  const collapseGraph = () => {
+    setSelectedEntities(new Set<string>());
+    setLastSelectedEntity(null);
   };
 
   const endpointsForDef = (defName: string) =>
@@ -1322,8 +1342,9 @@ function App() {
             <SchemasPage
               schemaGraph={schemaGraph}
               definitions={definitions}
-              selectedEntity={selectedEntity}
-              setSelectedEntity={setSelectedEntity}
+              selectedEntities={selectedEntities}
+              lastSelectedEntity={lastSelectedEntity}
+              collapseGraph={collapseGraph}
               schemaFilter={schemaFilter}
               setSchemaFilter={setSchemaFilter}
               schemaGraphGroupBy={schemaGraphGroupBy}
@@ -1735,8 +1756,9 @@ function FieldSelect(props: {
 function SchemasPage(props: {
   schemaGraph: Accessor<any>;
   definitions: Accessor<Record<string, DefinitionInfo>>;
-  selectedEntity: Accessor<string | null>;
-  setSelectedEntity: Setter<string | null>;
+  selectedEntities: Accessor<Set<string>>;
+  lastSelectedEntity: Accessor<string | null>;
+  collapseGraph: () => void;
   schemaFilter: Accessor<string>;
   setSchemaFilter: Setter<string>;
   schemaGraphGroupBy: Accessor<"alpha" | "endpoint">;
@@ -1787,59 +1809,74 @@ function SchemasPage(props: {
   };
 
   const neighborhood = createMemo(() => {
-    const sel = props.selectedEntity();
+    const entities = props.selectedEntities();
     const depth = props.schemaGraphHopDepth();
-    if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
+    if (entities.size === 0) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
     const e = edges();
 
-    // Role map: focused node + two directional BFS passes
     const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
-    roleMap[sel] = { role: 'focused', hop: 0 };
 
-    // Outbound BFS (children): follow e[n] → targets
-    const outVisited = new Set<string>([sel]);
-    let outFrontier = new Set<string>([sel]);
-    for (let hop = 1; hop <= depth; hop++) {
-      const next = new Set<string>();
-      for (const n of outFrontier) {
-        for (const t of (e[n] || [])) {
-          if (!outVisited.has(t)) {
-            outVisited.add(t);
-            next.add(t);
-            roleMap[t] = { role: 'child', hop };
-          }
-        }
+    // For each selected entity, run BFS and merge into roleMap
+    for (const sel of entities) {
+      // Mark focused — always wins
+      if (!roleMap[sel] || roleMap[sel].role !== 'focused') {
+        roleMap[sel] = { role: 'focused', hop: 0 };
       }
-      outFrontier = next;
-    }
 
-    // Inbound BFS (parents): find src where e[src] includes n
-    const inVisited = new Set<string>([sel]);
-    let inFrontier = new Set<string>([sel]);
-    for (let hop = 1; hop <= depth; hop++) {
-      const next = new Set<string>();
-      for (const n of inFrontier) {
-        for (const [src, targets] of Object.entries(e)) {
-          if (targets.includes(n) && !inVisited.has(src)) {
-            inVisited.add(src);
-            next.add(src);
-            const existing = roleMap[src];
-            if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
+      // Outbound BFS (children)
+      const outVisited = new Set<string>([sel]);
+      let outFrontier = new Set<string>([sel]);
+      for (let hop = 1; hop <= depth; hop++) {
+        const next = new Set<string>();
+        for (const n of outFrontier) {
+          for (const t of (e[n] || [])) {
+            if (!outVisited.has(t)) {
+              outVisited.add(t);
+              next.add(t);
+              const existing = roleMap[t];
               if (!existing) {
-                roleMap[src] = { role: 'parent', hop };
-              } else if (hop < existing.hop) {
-                roleMap[src] = { role: 'parent', hop };
+                roleMap[t] = { role: 'child', hop };
+              } else if (existing.role !== 'focused') {
+                if (hop < existing.hop) {
+                  roleMap[t] = { role: 'child', hop };
+                }
               }
             }
           }
         }
+        outFrontier = next;
       }
-      inFrontier = next;
+
+      // Inbound BFS (parents)
+      const inVisited = new Set<string>([sel]);
+      let inFrontier = new Set<string>([sel]);
+      for (let hop = 1; hop <= depth; hop++) {
+        const next = new Set<string>();
+        for (const n of inFrontier) {
+          for (const [src, targets] of Object.entries(e)) {
+            if (targets.includes(n) && !inVisited.has(src)) {
+              inVisited.add(src);
+              next.add(src);
+              const existing = roleMap[src];
+              if (!existing) {
+                roleMap[src] = { role: 'parent', hop };
+              } else if (existing.role !== 'focused') {
+                if (hop < existing.hop) {
+                  roleMap[src] = { role: 'parent', hop };
+                } else if (hop === existing.hop && existing.role === 'child') {
+                  roleMap[src] = { role: 'parent', hop };
+                }
+              }
+            }
+          }
+        }
+        inFrontier = next;
+      }
     }
 
-    // Collect all visited nodes
-    const visited = new Set<string>([...outVisited, ...inVisited]);
-    const allNodes = Array.from(visited);
+    // Collect all nodes in roleMap
+    const allNodes = Object.keys(roleMap);
+    const visited = new Set(allNodes);
     const nbEdges: Record<string, string[]> = {};
     for (const n of allNodes) {
       const targets = (e[n] || []).filter(t => visited.has(t));
@@ -1849,7 +1886,7 @@ function SchemasPage(props: {
   });
 
   createEffect(() => {
-    const sel = props.selectedEntity();
+    const sel = props.lastSelectedEntity();
     if (!sel) return;
     const id = requestAnimationFrame(() => {
       const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
@@ -1900,7 +1937,7 @@ function SchemasPage(props: {
                     {(defName: string) => {
                       const def = () => props.definitions()[defName];
                       const eps = () => props.endpointsForDef(defName);
-                      const isSelected = () => props.selectedEntity() === defName;
+                      const isSelected = () => props.selectedEntities().has(defName);
                       const isExpanded = () => props.expandedDefs().has(defName);
                       const isParent = () => Object.keys(roots()).includes(defName);
                       return (
@@ -2005,7 +2042,7 @@ function SchemasPage(props: {
                           {(defName: string) => {
                             const def = () => props.definitions()[defName];
                             const eps = () => props.endpointsForDef(defName);
-                            const isSelected = () => props.selectedEntity() === defName;
+                            const isSelected = () => props.selectedEntities().has(defName);
                             const isExpanded = () => props.expandedDefs().has(defName);
                             const isParent = () => Object.keys(roots()).includes(defName);
                             return (
@@ -2111,14 +2148,14 @@ function SchemasPage(props: {
           {/* Right panel - Detail / Graph tabs */}
           <div class="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto">
             {/* Empty state — no tabs */}
-            <Show when={!props.selectedEntity()}>
+            <Show when={props.selectedEntities().size === 0}>
               <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
                 <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
               </div>
             </Show>
 
             {/* Tabbed content — only when entity selected */}
-            <Show when={props.selectedEntity()}>
+            <Show when={props.selectedEntities().size > 0}>
               {/* Tab bar */}
               <div class="flex items-center gap-1 mb-3 shrink-0">
                 <button
@@ -2140,9 +2177,9 @@ function SchemasPage(props: {
               </div>
 
               {/* Details tab content */}
-              <Show when={rightTab() === "details" && props.definitions()[props.selectedEntity()!]}>
+              <Show when={rightTab() === "details" && props.lastSelectedEntity() && props.definitions()[props.lastSelectedEntity()!]}>
                 {(() => {
-                  const defName = () => props.selectedEntity()!;
+                  const defName = () => props.lastSelectedEntity()!;
                   const def = () => props.definitions()[defName()];
                   const eps = () => props.endpointsForDef(defName());
                   return (
@@ -2273,6 +2310,10 @@ function SchemasPage(props: {
                       class="w-14 h-1 accent-blue-500"
                     />
                     <span class="text-[10px] text-gray-400 w-3">{props.schemaGraphHopDepth()}</span>
+                    <button
+                      class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50 ml-2"
+                      onClick={() => props.collapseGraph()}
+                    >Collapse</button>
                   </div>
                 </div>
                 <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
@@ -2281,8 +2322,8 @@ function SchemasPage(props: {
                     edges={neighborhood().edges}
                     roleMap={neighborhood().roleMap}
                     arrayTargets={arrayTargets()}
-                    selectedEntity={props.selectedEntity()}
-                    onSelectEntity={props.setSelectedEntity}
+                    selectedEntities={props.selectedEntities()}
+                    onSelectEntity={(name) => props.selectEntity(name)}
                   />
                 </div>
               </Show>
