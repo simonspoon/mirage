@@ -2534,7 +2534,36 @@ function RecipeConfigStep(props: {
     return result;
   };
 
-  // Collapsed state for endpoint and entity groups (ep: prefix for endpoint-level)
+  // Indexed lookups: bucket label → data for O(1) access in endpoint-first rendering
+  const poolsByLabel = createMemo((): Record<string, [string, { is_shared: boolean; pool_size: number }][]> => {
+    const map: Record<string, [string, { is_shared: boolean; pool_size: number }][]> = {};
+    for (const b of poolsByBucket()) map[b.label] = b.pools;
+    return map;
+  });
+
+  const configsByLabel = createMemo((): Record<string, [string, { key: string; config: { min: number; max: number } }[]][]> => {
+    const map: Record<string, [string, { key: string; config: { min: number; max: number } }[]][]> = {};
+    for (const b of configsByBucket()) map[b.label] = b.entities;
+    return map;
+  });
+
+  const rulesByLabel = createMemo((): Record<string, [string, { key: string; strategy: string; propType: string; format: string | null }[]][]> => {
+    const map: Record<string, [string, { key: string; strategy: string; propType: string; format: string | null }[]][]> = {};
+    for (const b of rulesByBucket()) map[b.label] = b.entities;
+    return map;
+  });
+
+  // Combined list of endpoint labels that have any visible data
+  const activeEndpoints = createMemo((): string[] => {
+    const pools = poolsByLabel();
+    const configs = configsByLabel();
+    const rules = rulesByLabel();
+    return endpointBuckets()
+      .map(b => b.label)
+      .filter(label => (pools[label]?.length ?? 0) > 0 || (configs[label]?.length ?? 0) > 0 || (rules[label]?.length ?? 0) > 0);
+  });
+
+  // Collapsed state for endpoint and entity groups
   const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
   const toggleGroup = (key: string) => {
     const s = new Set(collapsedGroups());
@@ -2577,13 +2606,12 @@ function RecipeConfigStep(props: {
         />
       </Show>
 
-      {/* Shared Entity Pools */}
-      <Show when={hasPools() && filteredPools().length > 0}>
-        <div class="mb-6">
-          <div class="flex items-center justify-between mb-2">
-            <h4 class="text-sm font-medium text-gray-300">Shared Entity Pools</h4>
+      {/* Bulk controls — apply across all endpoints */}
+      <Show when={hasAnything()}>
+        <div class="flex flex-wrap items-center gap-4 mb-4 px-3 py-2 bg-gray-900/50 rounded-lg border border-gray-800/50">
+          <Show when={hasPools()}>
             <div class="flex items-center gap-2">
-              <span class="text-[10px] text-gray-600">Set all to</span>
+              <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">All pools</span>
               <input
                 type="number" min="1" max="100" placeholder="n"
                 class="w-14 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
@@ -2599,60 +2627,10 @@ function RecipeConfigStep(props: {
                 }}
               />
             </div>
-          </div>
-          <div class="space-y-2">
-            <For each={poolsByBucket()}>
-              {(bucket) => (
-                <div class="rounded-md overflow-hidden">
-                  <button
-                    data-testid="endpoint-group-header"
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
-                    onClick={() => toggleGroup(`ep:pools:${bucket.label}`)}
-                  >
-                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:pools:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
-                    <span class="font-mono text-xs">{bucket.label}</span>
-                    <span class="text-xs text-gray-600 ml-auto">{bucket.pools.length} {bucket.pools.length === 1 ? "entity" : "entities"}</span>
-                  </button>
-                  <Show when={!collapsedGroups().has(`ep:pools:${bucket.label}`)}>
-                    <div class="space-y-1 py-1">
-                      <For each={bucket.pools}>
-                        {([entity, config]) => (
-                          <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-3">
-                            <input type="checkbox" checked={config.is_shared}
-                              class="accent-blue-500 rounded"
-                              onChange={(e) => {
-                                const pools = { ...props.recipeSharedPools() };
-                                pools[entity] = { ...pools[entity], is_shared: e.target.checked };
-                                props.setRecipeSharedPools(pools);
-                              }} />
-                            <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
-                            <input type="number" min="1" max="100" value={config.pool_size}
-                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                              onInput={(e) => {
-                                const pools = { ...props.recipeSharedPools() };
-                                pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
-                                props.setRecipeSharedPools(pools);
-                              }} />
-                            <span class="text-xs text-gray-600 w-14">instances</span>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
-        </div>
-      </Show>
-
-      {/* Array Quantity Ranges — grouped by endpoint then entity */}
-      <Show when={hasConfigs() && Object.keys(filteredConfigGroups()).length > 0}>
-        <div class="mb-6">
-          <div class="flex items-center justify-between mb-2">
-            <h4 class="text-sm font-medium text-gray-300">Array Quantity Ranges</h4>
+          </Show>
+          <Show when={hasConfigs()}>
             <div class="flex items-center gap-2">
-              <span class="text-[10px] text-gray-600">Set all to</span>
+              <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">All arrays</span>
               <input
                 type="number" min="0" max="50" placeholder="min"
                 class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
@@ -2683,82 +2661,10 @@ function RecipeConfigStep(props: {
                 }}
               />
             </div>
-          </div>
-          <div class="space-y-2">
-            <For each={configsByBucket()}>
-              {(bucket) => (
-                <div class="rounded-md overflow-hidden">
-                  <button
-                    data-testid="endpoint-group-header"
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
-                    onClick={() => toggleGroup(`ep:configs:${bucket.label}`)}
-                  >
-                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:configs:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
-                    <span class="font-mono text-xs">{bucket.label}</span>
-                    <span class="text-xs text-gray-600 ml-auto">{bucket.entities.length} {bucket.entities.length === 1 ? "entity" : "entities"}</span>
-                  </button>
-                  <Show when={!collapsedGroups().has(`ep:configs:${bucket.label}`)}>
-                    <div class="space-y-1 ml-3">
-                      <For each={bucket.entities}>
-                        {([entity, items]) => (
-                          <div class="rounded-md overflow-hidden">
-                            <button
-                              class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                              onClick={() => toggleGroup(entity)}
-                            >
-                              <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>&#9654;</span>
-                              <span class="font-medium">{entity}</span>
-                              <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
-                            </button>
-                            <Show when={!collapsedGroups().has(entity)}>
-                              <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                <For each={items}>
-                                  {(item) => {
-                                    const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                    return (
-                                      <div class="flex items-center gap-3 px-3 py-1.5">
-                                        <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                        <input type="number" min="0" max="50" value={item.config.min}
-                                          class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                          onInput={(e) => {
-                                            const configs = { ...props.recipeQuantityConfigs() };
-                                            configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
-                                            props.setRecipeQuantityConfigs(configs);
-                                          }} />
-                                        <span class="text-gray-600 text-xs">–</span>
-                                        <input type="number" min="1" max="50" value={item.config.max}
-                                          class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                          onInput={(e) => {
-                                            const configs = { ...props.recipeQuantityConfigs() };
-                                            configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
-                                            props.setRecipeQuantityConfigs(configs);
-                                          }} />
-                                        <span class="text-[10px] text-gray-600 w-10">items</span>
-                                      </div>
-                                    );
-                                  }}
-                                </For>
-                              </div>
-                            </Show>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
-        </div>
-      </Show>
-
-      {/* Field Generation Rules — grouped by endpoint then entity */}
-      <Show when={hasRules() && Object.keys(filteredRuleGroups()).length > 0}>
-        <div class="mb-6">
-          <div class="flex items-center justify-between mb-2">
-            <h4 class="text-sm font-medium text-gray-300">Field Generation Rules</h4>
+          </Show>
+          <Show when={hasRules()}>
             <div class="flex items-center gap-2">
-              <span class="text-[10px] text-gray-600">Set all to</span>
+              <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">All rules</span>
               <select
                 class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
                 onChange={(e) => {
@@ -2778,72 +2684,189 @@ function RecipeConfigStep(props: {
                 </For>
               </select>
             </div>
-          </div>
-          <div class="space-y-2">
-            <For each={rulesByBucket()}>
-              {(bucket) => (
-                <div class="rounded-md overflow-hidden">
-                  <button
-                    data-testid="endpoint-group-header"
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
-                    onClick={() => toggleGroup(`ep:rules:${bucket.label}`)}
-                  >
-                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:rules:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
-                    <span class="font-mono text-xs">{bucket.label}</span>
-                    <span class="text-xs text-gray-600 ml-auto">{bucket.entities.length} {bucket.entities.length === 1 ? "entity" : "entities"}</span>
-                  </button>
-                  <Show when={!collapsedGroups().has(`ep:rules:${bucket.label}`)}>
-                    <div class="space-y-1 ml-3">
-                      <For each={bucket.entities}>
-                        {([entity, items]) => (
-                          <div class="rounded-md overflow-hidden">
-                            <button
-                              class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                              onClick={() => toggleGroup(entity + "_rules")}
-                            >
-                              <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
-                              <span class="font-medium">{entity}</span>
-                              <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
-                            </button>
-                            <Show when={!collapsedGroups().has(entity + "_rules")}>
-                              <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                <For each={items}>
-                                  {(item) => {
-                                    const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                    return (
-                                      <div class="flex items-center gap-3 px-3 py-1.5">
-                                        <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
-                                        <select
-                                          value={item.strategy}
-                                          class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                          onChange={(e) => {
-                                            const rules = { ...props.recipeFakerRules() };
-                                            rules[item.key] = e.target.value;
-                                            props.setRecipeFakerRules(rules);
-                                          }}
-                                        >
-                                          <For each={FAKER_STRATEGIES}>
-                                            {(s) => <option value={s}>{s}</option>}
-                                          </For>
-                                        </select>
-                                      </div>
-                                    );
-                                  }}
-                                </For>
-                              </div>
-                            </Show>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
+          </Show>
         </div>
       </Show>
+
+      {/* Endpoint-first groups */}
+      <div class="space-y-3">
+        <For each={activeEndpoints()}>
+          {(label) => {
+            const epPools = () => poolsByLabel()[label] || [];
+            const epConfigs = () => configsByLabel()[label] || [];
+            const epRules = () => rulesByLabel()[label] || [];
+            const epKey = () => `ep:${label}`;
+
+            return (
+              <div class="rounded-md overflow-hidden border border-gray-800/50">
+                {/* Endpoint header */}
+                <button
+                  data-testid="endpoint-group-header"
+                  class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors"
+                  onClick={() => toggleGroup(epKey())}
+                >
+                  <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(epKey()) ? "" : "rotate-90"}`}>&#9654;</span>
+                  <span class="font-mono text-xs">{label}</span>
+                  <span class="text-xs text-gray-600 ml-auto">
+                    {epPools().length > 0 ? `${epPools().length} pools` : ""}
+                    {epPools().length > 0 && (epConfigs().length > 0 || epRules().length > 0) ? " · " : ""}
+                    {epConfigs().length > 0 ? `${epConfigs().reduce((n, [, items]) => n + items.length, 0)} arrays` : ""}
+                    {epConfigs().length > 0 && epRules().length > 0 ? " · " : ""}
+                    {epRules().length > 0 ? `${epRules().reduce((n, [, items]) => n + items.length, 0)} rules` : ""}
+                  </span>
+                </button>
+
+                <Show when={!collapsedGroups().has(epKey())}>
+                  <div class="px-2 py-2 space-y-2">
+
+                    {/* Pools sub-section */}
+                    <Show when={epPools().length > 0}>
+                      <div>
+                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Shared Pools</div>
+                        <div class="space-y-1">
+                          <For each={epPools()}>
+                            {([entity, config]) => (
+                              <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-2">
+                                <input type="checkbox" checked={config.is_shared}
+                                  class="accent-blue-500 rounded"
+                                  onChange={(e) => {
+                                    const pools = { ...props.recipeSharedPools() };
+                                    pools[entity] = { ...pools[entity], is_shared: e.target.checked };
+                                    props.setRecipeSharedPools(pools);
+                                  }} />
+                                <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
+                                <input type="number" min="1" max="100" value={config.pool_size}
+                                  class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                  onInput={(e) => {
+                                    const pools = { ...props.recipeSharedPools() };
+                                    pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
+                                    props.setRecipeSharedPools(pools);
+                                  }} />
+                                <span class="text-xs text-gray-600 w-14">instances</span>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
+
+                    {/* Arrays sub-section */}
+                    <Show when={epConfigs().length > 0}>
+                      <div>
+                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Array Quantities</div>
+                        <div class="space-y-1 ml-2">
+                          <For each={epConfigs()}>
+                            {([entity, items]) => {
+                              const arrKey = () => `ep:${label}:arrays:${entity}`;
+                              return (
+                                <div class="rounded-md overflow-hidden">
+                                  <button
+                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                                    onClick={() => toggleGroup(arrKey())}
+                                  >
+                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(arrKey()) ? "" : "rotate-90"}`}>&#9654;</span>
+                                    <span class="font-medium">{entity}</span>
+                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
+                                  </button>
+                                  <Show when={!collapsedGroups().has(arrKey())}>
+                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                      <For each={items}>
+                                        {(item) => {
+                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                          return (
+                                            <div class="flex items-center gap-3 px-3 py-1.5">
+                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                              <input type="number" min="0" max="50" value={item.config.min}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) => {
+                                                  const configs = { ...props.recipeQuantityConfigs() };
+                                                  configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
+                                                  props.setRecipeQuantityConfigs(configs);
+                                                }} />
+                                              <span class="text-gray-600 text-xs">–</span>
+                                              <input type="number" min="1" max="50" value={item.config.max}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) => {
+                                                  const configs = { ...props.recipeQuantityConfigs() };
+                                                  configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
+                                                  props.setRecipeQuantityConfigs(configs);
+                                                }} />
+                                              <span class="text-[10px] text-gray-600 w-10">items</span>
+                                            </div>
+                                          );
+                                        }}
+                                      </For>
+                                    </div>
+                                  </Show>
+                                </div>
+                              );
+                            }}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
+
+                    {/* Rules sub-section */}
+                    <Show when={epRules().length > 0}>
+                      <div>
+                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Field Rules</div>
+                        <div class="space-y-1 ml-2">
+                          <For each={epRules()}>
+                            {([entity, items]) => {
+                              const ruleKey = () => `ep:${label}:rules:${entity}`;
+                              return (
+                                <div class="rounded-md overflow-hidden">
+                                  <button
+                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                                    onClick={() => toggleGroup(ruleKey())}
+                                  >
+                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(ruleKey()) ? "" : "rotate-90"}`}>&#9654;</span>
+                                    <span class="font-medium">{entity}</span>
+                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
+                                  </button>
+                                  <Show when={!collapsedGroups().has(ruleKey())}>
+                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                      <For each={items}>
+                                        {(item) => {
+                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                          return (
+                                            <div class="flex items-center gap-3 px-3 py-1.5">
+                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
+                                              <select
+                                                value={item.strategy}
+                                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                                onChange={(e) => {
+                                                  const rules = { ...props.recipeFakerRules() };
+                                                  rules[item.key] = e.target.value;
+                                                  props.setRecipeFakerRules(rules);
+                                                }}
+                                              >
+                                                <For each={FAKER_STRATEGIES}>
+                                                  {(s) => <option value={s}>{s}</option>}
+                                                </For>
+                                              </select>
+                                            </div>
+                                          );
+                                        }}
+                                      </For>
+                                    </div>
+                                  </Show>
+                                </div>
+                              );
+                            }}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
+
+                  </div>
+                </Show>
+              </div>
+            );
+          }}
+        </For>
+      </div>
 
       {/* Constraint Rules — bounded values + cross-field compares */}
       <ConstraintRulesEditor
