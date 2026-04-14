@@ -1899,7 +1899,7 @@ function SchemasPage(props: {
                   <For each={filteredNodes()}>
                     {(defName: string) => {
                       const def = () => props.definitions()[defName];
-                      const epCount = () => props.endpointsForDef(defName).length;
+                      const eps = () => props.endpointsForDef(defName);
                       const isSelected = () => props.selectedEntity() === defName;
                       const isExpanded = () => props.expandedDefs().has(defName);
                       const isParent = () => Object.keys(roots()).includes(defName);
@@ -1923,8 +1923,25 @@ function SchemasPage(props: {
                               <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
                             </svg>
                             <span class="truncate flex-1 text-left">{defName}</span>
-                            <Show when={epCount() > 0}>
-                              <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                            <Show when={eps().length > 0}>
+                              <span class="flex items-center gap-0.5 shrink-0">
+                                <For each={eps().slice(0, 3)}>
+                                  {(route) => (
+                                    <span class={`inline-block font-mono text-[9px] font-medium px-1 py-0 rounded ring-1 ${
+                                      ({
+                                        get: "bg-emerald-500/15 text-emerald-400 ring-emerald-500/20",
+                                        post: "bg-blue-500/15 text-blue-400 ring-blue-500/20",
+                                        delete: "bg-red-500/15 text-red-400 ring-red-500/20",
+                                        put: "bg-amber-500/15 text-amber-400 ring-amber-500/20",
+                                        patch: "bg-violet-500/15 text-violet-400 ring-violet-500/20",
+                                      } as Record<string, string>)[route.method.toLowerCase()] || "bg-gray-500/15 text-gray-400 ring-gray-500/20"
+                                    }`}>{route.method.toUpperCase()}</span>
+                                  )}
+                                </For>
+                                <Show when={eps().length > 3}>
+                                  <span class="text-[9px] text-gray-500">+{eps().length - 3}</span>
+                                </Show>
+                              </span>
                             </Show>
                             {(edges()[defName]?.length || 0) > 0 && (
                               <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
@@ -1987,7 +2004,7 @@ function SchemasPage(props: {
                         <For each={groupNodes as string[]}>
                           {(defName: string) => {
                             const def = () => props.definitions()[defName];
-                            const epCount = () => props.endpointsForDef(defName).length;
+                            const eps = () => props.endpointsForDef(defName);
                             const isSelected = () => props.selectedEntity() === defName;
                             const isExpanded = () => props.expandedDefs().has(defName);
                             const isParent = () => Object.keys(roots()).includes(defName);
@@ -2011,8 +2028,25 @@ function SchemasPage(props: {
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
                                   </svg>
                                   <span class="truncate flex-1 text-left">{defName}</span>
-                                  <Show when={epCount() > 0}>
-                                    <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                                  <Show when={eps().length > 0}>
+                                    <span class="flex items-center gap-0.5 shrink-0">
+                                      <For each={eps().slice(0, 3)}>
+                                        {(route) => (
+                                          <span class={`inline-block font-mono text-[9px] font-medium px-1 py-0 rounded ring-1 ${
+                                            ({
+                                              get: "bg-emerald-500/15 text-emerald-400 ring-emerald-500/20",
+                                              post: "bg-blue-500/15 text-blue-400 ring-blue-500/20",
+                                              delete: "bg-red-500/15 text-red-400 ring-red-500/20",
+                                              put: "bg-amber-500/15 text-amber-400 ring-amber-500/20",
+                                              patch: "bg-violet-500/15 text-violet-400 ring-violet-500/20",
+                                            } as Record<string, string>)[route.method.toLowerCase()] || "bg-gray-500/15 text-gray-400 ring-gray-500/20"
+                                          }`}>{route.method.toUpperCase()}</span>
+                                        )}
+                                      </For>
+                                      <Show when={eps().length > 3}>
+                                        <span class="text-[9px] text-gray-500">+{eps().length - 3}</span>
+                                      </Show>
+                                    </span>
                                   </Show>
                                   {(edges()[defName]?.length || 0) > 0 && (
                                     <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
@@ -2129,6 +2163,23 @@ function SchemasPage(props: {
                         </Show>
                       </div>
 
+                      {/* Used by endpoints */}
+                      <Show when={eps().length > 0}>
+                        <div class="px-6 py-4 border-b border-[#141b28]">
+                          <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
+                          <div class="space-y-2">
+                            <For each={eps()}>
+                              {(route) => (
+                                <div class="flex items-center gap-2 rounded border border-[#141b28] bg-[#0d1520] p-2">
+                                  <MethodBadge method={route.method} />
+                                  <span class="font-mono text-sm text-gray-400">{route.path}</span>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+
                       {/* Properties table */}
                       <div class="px-6 py-4">
                         <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
@@ -2204,23 +2255,6 @@ function SchemasPage(props: {
                           </div>
                         </Show>
                       </div>
-
-                      {/* Used by endpoints */}
-                      <Show when={eps().length > 0}>
-                        <div class="px-6 py-4 border-t border-[#141b28]">
-                          <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
-                          <div class="space-y-1.5">
-                            <For each={eps()}>
-                              {(route) => (
-                                <div class="flex items-center gap-2">
-                                  <MethodBadge method={route.method} />
-                                  <span class="font-mono text-sm text-gray-400">{route.path}</span>
-                                </div>
-                              )}
-                            </For>
-                          </div>
-                        </div>
-                      </Show>
                     </div>
                   );
                 })()}
