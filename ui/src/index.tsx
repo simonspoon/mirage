@@ -1,5 +1,6 @@
 import { render } from "solid-js/web";
-import { createSignal, onMount, onCleanup, For, Show, createEffect, createMemo } from "solid-js";
+import type { Accessor, Setter } from "solid-js";
+import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo } from "solid-js";
 import "./index.css";
 import ForceGraph from "./ForceGraph";
 
@@ -1318,517 +1319,23 @@ function App() {
 
           {/* === Schemas === */}
           <Show when={page() === "schemas"}>
-            {(() => {
-              const graph = () => schemaGraph();
-              const nodes = () => (graph()?.nodes || []) as string[];
-              const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
-              const roots = () => (graph()?.roots || {}) as Record<string, {method: string, path: string}[]>;
-              const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
-              const [rightTab, setRightTab] = createSignal<"details" | "graph">("details");
-
-              const filteredNodes = () => {
-                const q = schemaFilter().toLowerCase();
-                const allNodes = nodes();
-                const defKeys = Object.keys(definitions());
-                const merged = [...new Set([...allNodes, ...defKeys])];
-                const filtered = q ? merged.filter((n: string) => n.toLowerCase().includes(q)) : merged;
-                if (schemaGraphGroupBy() === "alpha") return filtered.sort();
-                return filtered;
-              };
-
-              const endpointGroups = () => {
-                if (schemaGraphGroupBy() !== "endpoint") return {};
-                const groups: Record<string, string[]> = {};
-                const r = roots();
-                const assigned = new Set<string>();
-                for (const node of filteredNodes()) {
-                  if (r[node]) {
-                    for (const ep of r[node]) {
-                      const key = `${ep.method.toUpperCase()} ${ep.path}`;
-                      if (!groups[key]) groups[key] = [];
-                      groups[key].push(node);
-                      assigned.add(node);
-                    }
-                  }
-                }
-                const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
-                if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
-                return groups;
-              };
-
-              const neighborhood = createMemo(() => {
-                const sel = selectedEntity();
-                const depth = schemaGraphHopDepth();
-                if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
-                const e = edges();
-
-                // Role map: focused node + two directional BFS passes
-                const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
-                roleMap[sel] = { role: 'focused', hop: 0 };
-
-                // Outbound BFS (children): follow e[n] → targets
-                const outVisited = new Set<string>([sel]);
-                let outFrontier = new Set<string>([sel]);
-                for (let hop = 1; hop <= depth; hop++) {
-                  const next = new Set<string>();
-                  for (const n of outFrontier) {
-                    for (const t of (e[n] || [])) {
-                      if (!outVisited.has(t)) {
-                        outVisited.add(t);
-                        next.add(t);
-                        roleMap[t] = { role: 'child', hop };
-                      }
-                    }
-                  }
-                  outFrontier = next;
-                }
-
-                // Inbound BFS (parents): find src where e[src] includes n
-                const inVisited = new Set<string>([sel]);
-                let inFrontier = new Set<string>([sel]);
-                for (let hop = 1; hop <= depth; hop++) {
-                  const next = new Set<string>();
-                  for (const n of inFrontier) {
-                    for (const [src, targets] of Object.entries(e)) {
-                      if (targets.includes(n) && !inVisited.has(src)) {
-                        inVisited.add(src);
-                        next.add(src);
-                        const existing = roleMap[src];
-                        if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
-                          if (!existing) {
-                            roleMap[src] = { role: 'parent', hop };
-                          } else if (hop < existing.hop) {
-                            roleMap[src] = { role: 'parent', hop };
-                          }
-                        }
-                      }
-                    }
-                  }
-                  inFrontier = next;
-                }
-
-                // Collect all visited nodes
-                const visited = new Set<string>([...outVisited, ...inVisited]);
-                const allNodes = Array.from(visited);
-                const nbEdges: Record<string, string[]> = {};
-                for (const n of allNodes) {
-                  const targets = (e[n] || []).filter(t => visited.has(t));
-                  if (targets.length > 0) nbEdges[n] = targets;
-                }
-                return { nodes: allNodes, edges: nbEdges, roleMap };
-              });
-
-              createEffect(() => {
-                const sel = selectedEntity();
-                if (!sel) return;
-                const id = requestAnimationFrame(() => {
-                  const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
-                  if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                });
-                onCleanup(() => cancelAnimationFrame(id));
-              });
-
-              return (
-                <div class="flex flex-col flex-1 min-h-0">
-                  <div class="flex items-center justify-between mb-6 shrink-0">
-                    <h2 class="text-2xl font-semibold">Schemas</h2>
-                  </div>
-                  <Show when={Object.keys(definitions()).length === 0}>
-                    <p class="text-gray-500">No definitions available. Import a spec first.</p>
-                  </Show>
-                  <Show when={Object.keys(definitions()).length > 0}>
-                    <div class="flex gap-6 flex-1 min-h-0">
-                      {/* Left panel - Hybrid entity list */}
-                      <div class="w-72 shrink-0 flex flex-col">
-                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden flex flex-col h-full">
-                          <div class="px-4 py-3 border-b border-[#141b28] space-y-2">
-                            <div class="flex items-center justify-between">
-                              <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
-                              <span class="text-xs text-gray-600 tabular-nums">{filteredNodes().length}</span>
-                            </div>
-                            <input
-                              type="text"
-                              placeholder="Filter..."
-                              value={schemaFilter()}
-                              onInput={(e) => setSchemaFilter(e.currentTarget.value)}
-                              class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
-                            />
-                            <div class="flex gap-1">
-                              <button
-                                class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                                onClick={() => setSchemaGraphGroupBy("alpha")}
-                              >A--Z</button>
-                              <button
-                                class={`px-2.5 py-1 text-xs rounded-md transition-colors ${schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
-                                onClick={() => setSchemaGraphGroupBy("endpoint")}
-                              >By endpoint</button>
-                            </div>
-                          </div>
-                          <div class="flex-1 overflow-y-auto" style="scrollbar-width: thin;">
-                            <Show when={schemaGraphGroupBy() === "alpha"}>
-                              <For each={filteredNodes()}>
-                                {(defName: string) => {
-                                  const def = () => definitions()[defName];
-                                  const epCount = () => endpointsForDef(defName).length;
-                                  const isSelected = () => selectedEntity() === defName;
-                                  const isExpanded = () => expandedDefs().has(defName);
-                                  const isParent = () => Object.keys(roots()).includes(defName);
-                                  return (
-                                    <div data-entity={defName}>
-                                      <button
-                                        class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
-                                          isSelected()
-                                            ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
-                                            : isParent()
-                                            ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
-                                            : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
-                                        }`}
-                                        onClick={() => selectEntity(defName)}
-                                      >
-                                        <svg
-                                          class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
-                                          fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
-                                          onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
-                                        >
-                                          <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
-                                        </svg>
-                                        <span class="truncate flex-1 text-left">{defName}</span>
-                                        <Show when={epCount() > 0}>
-                                          <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
-                                        </Show>
-                                        {(edges()[defName]?.length || 0) > 0 && (
-                                          <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
-                                        )}
-                                      </button>
-                                      <Show when={def()?.extends}>
-                                        <div class="px-3 pl-8 pb-1">
-                                          <span class="text-xs text-gray-600">extends </span>
-                                          <span
-                                            class="text-xs text-purple-400 cursor-pointer hover:underline"
-                                            onClick={() => selectEntity(def()!.extends!)}
-                                          >{def()!.extends}</span>
-                                        </div>
-                                      </Show>
-                                      <Show when={isExpanded() && def()}>
-                                        <div class="pb-1">
-                                          <For each={Object.entries(def()?.properties || {})}>
-                                            {([propName, prop]) => (
-                                              <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
-                                                <span class="text-gray-400 truncate">
-                                                  {propName}
-                                                  <Show when={prop.required}><span class="text-red-400">*</span></Show>
-                                                </span>
-                                                <Show when={prop.ref_name}>
-                                                  <span
-                                                    class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                                    onClick={() => selectEntity(prop.ref_name!)}
-                                                  >{prop.ref_name}</span>
-                                                </Show>
-                                                <Show when={prop.is_array && prop.items_ref}>
-                                                  <span
-                                                    class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                                    onClick={() => selectEntity(prop.items_ref!)}
-                                                  >[{prop.items_ref}]</span>
-                                                </Show>
-                                                <Show when={prop.is_array && !prop.items_ref}>
-                                                  <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                                </Show>
-                                                <Show when={prop.enum_values}>
-                                                  <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                                </Show>
-                                                <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                                  <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
-                                                </Show>
-                                              </div>
-                                            )}
-                                          </For>
-                                        </div>
-                                      </Show>
-                                    </div>
-                                  );
-                                }}
-                              </For>
-                            </Show>
-                            <Show when={schemaGraphGroupBy() === "endpoint"}>
-                              <For each={Object.entries(endpointGroups())}>
-                                {([endpoint, groupNodes]) => (
-                                  <div class="mb-2">
-                                    <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a101d] z-10">{endpoint}</div>
-                                    <For each={groupNodes as string[]}>
-                                      {(defName: string) => {
-                                        const def = () => definitions()[defName];
-                                        const epCount = () => endpointsForDef(defName).length;
-                                        const isSelected = () => selectedEntity() === defName;
-                                        const isExpanded = () => expandedDefs().has(defName);
-                                        const isParent = () => Object.keys(roots()).includes(defName);
-                                        return (
-                                          <div data-entity={defName}>
-                                            <button
-                                              class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
-                                                isSelected()
-                                                  ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
-                                                  : isParent()
-                                                  ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
-                                                  : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
-                                              }`}
-                                              onClick={() => selectEntity(defName)}
-                                            >
-                                              <svg
-                                                class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
-                                                fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
-                                                onClick={(e: MouseEvent) => { e.stopPropagation(); toggleDef(defName); }}
-                                              >
-                                                <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
-                                              </svg>
-                                              <span class="truncate flex-1 text-left">{defName}</span>
-                                              <Show when={epCount() > 0}>
-                                                <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
-                                              </Show>
-                                              {(edges()[defName]?.length || 0) > 0 && (
-                                                <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
-                                              )}
-                                            </button>
-                                            <Show when={def()?.extends}>
-                                              <div class="px-3 pl-8 pb-1">
-                                                <span class="text-xs text-gray-600">extends </span>
-                                                <span
-                                                  class="text-xs text-purple-400 cursor-pointer hover:underline"
-                                                  onClick={() => selectEntity(def()!.extends!)}
-                                                >{def()!.extends}</span>
-                                              </div>
-                                            </Show>
-                                            <Show when={isExpanded() && def()}>
-                                              <div class="pb-1">
-                                                <For each={Object.entries(def()?.properties || {})}>
-                                                  {([propName, prop]) => (
-                                                    <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
-                                                      <span class="text-gray-400 truncate">
-                                                        {propName}
-                                                        <Show when={prop.required}><span class="text-red-400">*</span></Show>
-                                                      </span>
-                                                      <Show when={prop.ref_name}>
-                                                        <span
-                                                          class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                                          onClick={() => selectEntity(prop.ref_name!)}
-                                                        >{prop.ref_name}</span>
-                                                      </Show>
-                                                      <Show when={prop.is_array && prop.items_ref}>
-                                                        <span
-                                                          class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                                          onClick={() => selectEntity(prop.items_ref!)}
-                                                        >[{prop.items_ref}]</span>
-                                                      </Show>
-                                                      <Show when={prop.is_array && !prop.items_ref}>
-                                                        <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                                      </Show>
-                                                      <Show when={prop.enum_values}>
-                                                        <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                                      </Show>
-                                                      <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                                        <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
-                                                      </Show>
-                                                    </div>
-                                                  )}
-                                                </For>
-                                              </div>
-                                            </Show>
-                                          </div>
-                                        );
-                                      }}
-                                    </For>
-                                  </div>
-                                )}
-                              </For>
-                            </Show>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Right panel - Detail / Graph tabs */}
-                      <div class="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto">
-                        {/* Empty state — no tabs */}
-                        <Show when={!selectedEntity()}>
-                          <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
-                            <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
-                          </div>
-                        </Show>
-
-                        {/* Tabbed content — only when entity selected */}
-                        <Show when={selectedEntity()}>
-                          {/* Tab bar */}
-                          <div class="flex items-center gap-1 mb-3 shrink-0">
-                            <button
-                              class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                                rightTab() === "details"
-                                  ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
-                                  : "text-gray-400 hover:text-gray-200"
-                              }`}
-                              onClick={() => setRightTab("details")}
-                            >Details</button>
-                            <button
-                              class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                                rightTab() === "graph"
-                                  ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
-                                  : "text-gray-400 hover:text-gray-200"
-                              }`}
-                              onClick={() => setRightTab("graph")}
-                            >Graph</button>
-                          </div>
-
-                          {/* Details tab content */}
-                          <Show when={rightTab() === "details" && definitions()[selectedEntity()!]}>
-                            {(() => {
-                              const defName = () => selectedEntity()!;
-                              const def = () => definitions()[defName()];
-                              const eps = () => endpointsForDef(defName());
-                              return (
-                                <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-y-auto">
-                                  <div class="px-6 py-5 border-b border-[#141b28]">
-                                    <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
-                                    <Show when={def()?.description}>
-                                      <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
-                                    </Show>
-                                    <Show when={def()?.extends}>
-                                      <p class="text-sm text-gray-500 mt-1">
-                                        Extends:{" "}
-                                        <span
-                                          class="text-purple-400 cursor-pointer hover:underline"
-                                          onClick={() => selectEntity(def()!.extends!)}
-                                        >{def()!.extends}</span>
-                                      </p>
-                                    </Show>
-                                  </div>
-
-                                  {/* Properties table */}
-                                  <div class="px-6 py-4">
-                                    <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
-                                    <Show when={Object.keys(def()?.properties || {}).length === 0}>
-                                      <p class="text-sm text-gray-600">No properties defined.</p>
-                                    </Show>
-                                    <Show when={Object.keys(def()?.properties || {}).length > 0}>
-                                      <div class="rounded-lg border border-[#141b28] overflow-hidden">
-                                        <table class="w-full text-left">
-                                          <thead>
-                                            <tr class="bg-[#090e1a]">
-                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
-                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
-                                              <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
-                                            </tr>
-                                          </thead>
-                                          <tbody>
-                                            <For each={Object.entries(def()?.properties || {})}>
-                                              {([propName, prop]) => (
-                                                <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
-                                                  <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
-                                                    {propName}
-                                                    <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
-                                                  </td>
-                                                  <td class="py-2.5 px-4">
-                                                    <Show when={prop.ref_name}>
-                                                      <span
-                                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
-                                                        onClick={() => selectEntity(prop.ref_name!)}
-                                                      >{prop.ref_name}</span>
-                                                    </Show>
-                                                    <Show when={prop.is_array && prop.items_ref}>
-                                                      <span
-                                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
-                                                        onClick={() => selectEntity(prop.items_ref!)}
-                                                      >[{prop.items_ref}]</span>
-                                                    </Show>
-                                                    <Show when={prop.is_array && !prop.items_ref}>
-                                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
-                                                    </Show>
-                                                    <Show when={prop.enum_values}>
-                                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
-                                                    </Show>
-                                                    <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
-                                                      <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${typeBadgeClass(prop.type, false, false)}`}>
-                                                        {prop.type}{prop.format ? ` (${prop.format})` : ""}
-                                                      </span>
-                                                    </Show>
-                                                    <Show when={prop.enum_values}>
-                                                      <div class="flex flex-wrap gap-1 mt-1">
-                                                        <For each={prop.enum_values!}>
-                                                          {(val) => (
-                                                            <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
-                                                          )}
-                                                        </For>
-                                                      </div>
-                                                    </Show>
-                                                  </td>
-                                                  <td class="py-2.5 px-4 text-center">
-                                                    <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
-                                                      {prop.required ? "\u2713" : "\u2014"}
-                                                    </span>
-                                                  </td>
-                                                  <td class="py-2.5 px-4 text-sm text-gray-500">
-                                                    {prop.description || "\u2014"}
-                                                  </td>
-                                                </tr>
-                                              )}
-                                            </For>
-                                          </tbody>
-                                        </table>
-                                      </div>
-                                    </Show>
-                                  </div>
-
-                                  {/* Used by endpoints */}
-                                  <Show when={eps().length > 0}>
-                                    <div class="px-6 py-4 border-t border-[#141b28]">
-                                      <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
-                                      <div class="space-y-1.5">
-                                        <For each={eps()}>
-                                          {(route) => (
-                                            <div class="flex items-center gap-2">
-                                              <MethodBadge method={route.method} />
-                                              <span class="font-mono text-sm text-gray-400">{route.path}</span>
-                                            </div>
-                                          )}
-                                        </For>
-                                      </div>
-                                    </div>
-                                  </Show>
-                                </div>
-                              );
-                            })()}
-                          </Show>
-
-                          {/* Graph tab content */}
-                          <Show when={rightTab() === "graph"}>
-                            <div class="flex items-center justify-between mb-1">
-                              <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
-                              <div class="flex items-center gap-1.5">
-                                <span class="text-[10px] text-gray-500">Depth</span>
-                                <input
-                                  type="range" min="1" max="3" step="1"
-                                  value={schemaGraphHopDepth()}
-                                  onInput={(e) => setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
-                                  class="w-14 h-1 accent-blue-500"
-                                />
-                                <span class="text-[10px] text-gray-400 w-3">{schemaGraphHopDepth()}</span>
-                              </div>
-                            </div>
-                            <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
-                              <ForceGraph
-                                nodes={neighborhood().nodes}
-                                edges={neighborhood().edges}
-                                roleMap={neighborhood().roleMap}
-                                arrayTargets={arrayTargets()}
-                                selectedEntity={selectedEntity()}
-                                onSelectEntity={setSelectedEntity}
-                              />
-                            </div>
-                          </Show>
-                        </Show>
-                      </div>
-                    </div>
-                  </Show>
-                </div>
-              );
-            })()}
+            <SchemasPage
+              schemaGraph={schemaGraph}
+              definitions={definitions}
+              selectedEntity={selectedEntity}
+              setSelectedEntity={setSelectedEntity}
+              schemaFilter={schemaFilter}
+              setSchemaFilter={setSchemaFilter}
+              schemaGraphGroupBy={schemaGraphGroupBy}
+              setSchemaGraphGroupBy={setSchemaGraphGroupBy}
+              schemaGraphHopDepth={schemaGraphHopDepth}
+              setSchemaGraphHopDepth={setSchemaGraphHopDepth}
+              expandedDefs={expandedDefs}
+              toggleDef={toggleDef}
+              selectEntity={selectEntity}
+              endpointsForDef={endpointsForDef}
+              typeBadgeClass={typeBadgeClass}
+            />
           </Show>
 
           {/* === Recipes === */}
@@ -1971,614 +1478,21 @@ function App() {
 
               {/* Step 3: Configure data generation */}
               <Show when={recipeStep() === "config"}>
-                {(() => {
-                  const hasPools = () => Object.keys(recipeSharedPools()).length > 0;
-                  const hasConfigs = () => Object.keys(recipeQuantityConfigs()).length > 0;
-                  const hasRules = () => Object.keys(recipeFakerRules()).length > 0;
-                  const hasAnything = () => hasPools() || hasConfigs() || hasRules();
-
-                  // Group array quantity configs by entity (part before the dot)
-                  const groupedConfigs = () => {
-                    const groups: Record<string, {key: string, config: {min: number, max: number}}[]> = {};
-                    for (const [key, config] of Object.entries(recipeQuantityConfigs())) {
-                      const dot = key.indexOf(".");
-                      const entity = dot >= 0 ? key.slice(0, dot) : key;
-                      if (!groups[entity]) groups[entity] = [];
-                      groups[entity].push({key, config});
-                    }
-                    return groups;
-                  };
-
-                  // Filter by search
-                  const filteredPools = () => {
-                    const q = configSearch().toLowerCase();
-                    const entries = Object.entries(recipeSharedPools());
-                    const filtered = q ? entries.filter(([e]) => e.toLowerCase().includes(q)) : entries;
-                    if (configShowNonDefault()) return filtered.filter(([_, c]) => !c.is_shared || c.pool_size !== 10);
-                    return filtered;
-                  };
-
-                  const filteredConfigGroups = () => {
-                    const q = configSearch().toLowerCase();
-                    const groups = groupedConfigs();
-                    const result: Record<string, {key: string, config: {min: number, max: number}}[]> = {};
-                    for (const [entity, items] of Object.entries(groups)) {
-                      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
-                      const visible = configShowNonDefault() ? matching.filter(i => i.config.min !== 1 || i.config.max !== 3) : matching;
-                      if (visible.length > 0) result[entity] = visible;
-                    }
-                    return result;
-                  };
-
-                  const FAKER_STRATEGIES = ["auto","word","name","email","phone","url","sentence","paragraph","uuid","date","integer","float","boolean"];
-
-                  const groupedRules = () => {
-                    const groups: Record<string, {key: string, strategy: string, propType: string, format: string | null}[]> = {};
-                    const graph = entityGraph();
-                    const scalarMap: Record<string, {prop_type: string, format: string | null}> = {};
-                    for (const sp of graph?.scalar_properties || []) {
-                      scalarMap[`${sp.def_name}.${sp.prop_name}`] = {prop_type: sp.prop_type, format: sp.format};
-                    }
-                    for (const [key, strategy] of Object.entries(recipeFakerRules())) {
-                      const dot = key.indexOf(".");
-                      const entity = dot >= 0 ? key.slice(0, dot) : key;
-                      if (!groups[entity]) groups[entity] = [];
-                      const meta = scalarMap[key] || {prop_type: "string", format: null};
-                      groups[entity].push({key, strategy, propType: meta.prop_type, format: meta.format});
-                    }
-                    return groups;
-                  };
-
-                  const filteredRuleGroups = () => {
-                    const q = configSearch().toLowerCase();
-                    const groups = groupedRules();
-                    const result: typeof groups = {};
-                    for (const [entity, items] of Object.entries(groups)) {
-                      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
-                      const visible = configShowNonDefault() ? matching.filter(i => i.strategy !== "auto") : matching;
-                      if (visible.length > 0) result[entity] = visible;
-                    }
-                    return result;
-                  };
-
-                  // Collapsed state for entity groups
-                  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
-                  const toggleGroup = (entity: string) => {
-                    const s = new Set(collapsedGroups());
-                    if (s.has(entity)) s.delete(entity); else s.add(entity);
-                    setCollapsedGroups(s);
-                  };
-
-                  return (
-                    <div>
-                      <div class="flex items-center justify-between mb-3">
-                        <div>
-                          <h3 class="text-lg font-semibold">Configure Data Generation</h3>
-                          <p class="text-sm text-gray-500">
-                            {Object.keys(recipeSharedPools()).length} shared pools · {Object.keys(recipeQuantityConfigs()).length} array properties · {Object.keys(recipeFakerRules()).length} field rules · {recipeRules().length} constraint rules
-                          </p>
-                        </div>
-                        <Show when={hasAnything()}>
-                          <div class="flex items-center gap-3">
-                            <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
-                              <input type="checkbox" checked={configShowNonDefault()} onChange={(e) => setConfigShowNonDefault(e.target.checked)} class="accent-blue-500 rounded" />
-                              Changed only
-                            </label>
-                          </div>
-                        </Show>
-                      </div>
-
-                      <Show when={hasAnything()}>
-                        <input
-                          type="text"
-                          placeholder="Search pools, properties, and rules..."
-                          value={configSearch()}
-                          onInput={(e) => setConfigSearch(e.currentTarget.value)}
-                          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
-                        />
-                      </Show>
-
-                      {/* Shared Entity Pools */}
-                      <Show when={hasPools() && filteredPools().length > 0}>
-                        <div class="mb-6">
-                          <div class="flex items-center justify-between mb-2">
-                            <h4 class="text-sm font-medium text-gray-300">Shared Entity Pools</h4>
-                            <div class="flex items-center gap-2">
-                              <span class="text-[10px] text-gray-600">Set all to</span>
-                              <input
-                                type="number" min="1" max="100" placeholder="n"
-                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                onChange={(e) => {
-                                  const val = parseInt(e.target.value);
-                                  if (!val || val < 1) return;
-                                  const pools = {...recipeSharedPools()};
-                                  for (const key of Object.keys(pools)) {
-                                    pools[key] = {...pools[key], pool_size: val};
-                                  }
-                                  setRecipeSharedPools(pools);
-                                  e.target.value = "";
-                                }}
-                              />
-                            </div>
-                          </div>
-                          <div class="space-y-1">
-                            <For each={filteredPools()}>
-                              {([entity, config]) => (
-                                <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md">
-                                  <input type="checkbox" checked={config.is_shared}
-                                    class="accent-blue-500 rounded"
-                                    onChange={(e) => {
-                                      const pools = {...recipeSharedPools()};
-                                      pools[entity] = {...pools[entity], is_shared: e.target.checked};
-                                      setRecipeSharedPools(pools);
-                                    }} />
-                                  <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
-                                  <input type="number" min="1" max="100" value={config.pool_size}
-                                    class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                    onInput={(e) => {
-                                      const pools = {...recipeSharedPools()};
-                                      pools[entity] = {...pools[entity], pool_size: parseInt(e.target.value) || 10};
-                                      setRecipeSharedPools(pools);
-                                    }} />
-                                  <span class="text-xs text-gray-600 w-14">instances</span>
-                                </div>
-                              )}
-                            </For>
-                          </div>
-                        </div>
-                      </Show>
-
-                      {/* Array Quantity Ranges — grouped by entity */}
-                      <Show when={hasConfigs() && Object.keys(filteredConfigGroups()).length > 0}>
-                        <div class="mb-6">
-                          <div class="flex items-center justify-between mb-2">
-                            <h4 class="text-sm font-medium text-gray-300">Array Quantity Ranges</h4>
-                            <div class="flex items-center gap-2">
-                              <span class="text-[10px] text-gray-600">Set all to</span>
-                              <input
-                                type="number" min="0" max="50" placeholder="min"
-                                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                onChange={(e) => {
-                                  const val = parseInt(e.target.value);
-                                  if (isNaN(val) || val < 0) return;
-                                  const configs = {...recipeQuantityConfigs()};
-                                  for (const key of Object.keys(configs)) {
-                                    configs[key] = {...configs[key], min: val};
-                                  }
-                                  setRecipeQuantityConfigs(configs);
-                                  e.target.value = "";
-                                }}
-                              />
-                              <span class="text-[10px] text-gray-600">–</span>
-                              <input
-                                type="number" min="1" max="50" placeholder="max"
-                                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                onChange={(e) => {
-                                  const val = parseInt(e.target.value);
-                                  if (!val || val < 1) return;
-                                  const configs = {...recipeQuantityConfigs()};
-                                  for (const key of Object.keys(configs)) {
-                                    configs[key] = {...configs[key], max: val};
-                                  }
-                                  setRecipeQuantityConfigs(configs);
-                                  e.target.value = "";
-                                }}
-                              />
-                            </div>
-                          </div>
-                          <div class="space-y-1">
-                            <For each={Object.entries(filteredConfigGroups()).sort(([a], [b]) => a.localeCompare(b))}>
-                              {([entity, items]) => (
-                                <div class="rounded-md overflow-hidden">
-                                  <button
-                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                                    onClick={() => toggleGroup(entity)}
-                                  >
-                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>▶</span>
-                                    <span class="font-medium">{entity}</span>
-                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
-                                  </button>
-                                  <Show when={!collapsedGroups().has(entity)}>
-                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                      <For each={items}>
-                                        {(item) => {
-                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                          return (
-                                            <div class="flex items-center gap-3 px-3 py-1.5">
-                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                              <input type="number" min="0" max="50" value={item.config.min}
-                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                                onInput={(e) => {
-                                                  const configs = {...recipeQuantityConfigs()};
-                                                  configs[item.key] = {...configs[item.key], min: parseInt(e.target.value) || 0};
-                                                  setRecipeQuantityConfigs(configs);
-                                                }} />
-                                              <span class="text-gray-600 text-xs">–</span>
-                                              <input type="number" min="1" max="50" value={item.config.max}
-                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                                onInput={(e) => {
-                                                  const configs = {...recipeQuantityConfigs()};
-                                                  configs[item.key] = {...configs[item.key], max: parseInt(e.target.value) || 3};
-                                                  setRecipeQuantityConfigs(configs);
-                                                }} />
-                                              <span class="text-[10px] text-gray-600 w-10">items</span>
-                                            </div>
-                                          );
-                                        }}
-                                      </For>
-                                    </div>
-                                  </Show>
-                                </div>
-                              )}
-                            </For>
-                          </div>
-                        </div>
-                      </Show>
-
-                      {/* Field Generation Rules — grouped by entity */}
-                      <Show when={hasRules() && Object.keys(filteredRuleGroups()).length > 0}>
-                        <div class="mb-6">
-                          <div class="flex items-center justify-between mb-2">
-                            <h4 class="text-sm font-medium text-gray-300">Field Generation Rules</h4>
-                            <div class="flex items-center gap-2">
-                              <span class="text-[10px] text-gray-600">Set all to</span>
-                              <select
-                                class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                onChange={(e) => {
-                                  const val = e.target.value;
-                                  if (!val) return;
-                                  const rules = {...recipeFakerRules()};
-                                  for (const key of Object.keys(rules)) {
-                                    rules[key] = val;
-                                  }
-                                  setRecipeFakerRules(rules);
-                                  e.target.value = "";
-                                }}
-                              >
-                                <option value="">--</option>
-                                <For each={FAKER_STRATEGIES}>
-                                  {(s) => <option value={s}>{s}</option>}
-                                </For>
-                              </select>
-                            </div>
-                          </div>
-                          <div class="space-y-1">
-                            <For each={Object.entries(filteredRuleGroups()).sort(([a], [b]) => a.localeCompare(b))}>
-                              {([entity, items]) => (
-                                <div class="rounded-md overflow-hidden">
-                                  <button
-                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                                    onClick={() => toggleGroup(entity + "_rules")}
-                                  >
-                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
-                                    <span class="font-medium">{entity}</span>
-                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
-                                  </button>
-                                  <Show when={!collapsedGroups().has(entity + "_rules")}>
-                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                      <For each={items}>
-                                        {(item) => {
-                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                          return (
-                                            <div class="flex items-center gap-3 px-3 py-1.5">
-                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
-                                              <select
-                                                value={item.strategy}
-                                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                                onChange={(e) => {
-                                                  const rules = {...recipeFakerRules()};
-                                                  rules[item.key] = e.target.value;
-                                                  setRecipeFakerRules(rules);
-                                                }}
-                                              >
-                                                <For each={FAKER_STRATEGIES}>
-                                                  {(s) => <option value={s}>{s}</option>}
-                                                </For>
-                                              </select>
-                                            </div>
-                                          );
-                                        }}
-                                      </For>
-                                    </div>
-                                  </Show>
-                                </div>
-                              )}
-                            </For>
-                          </div>
-                        </div>
-                      </Show>
-
-                      {/* Constraint Rules — bounded values + cross-field compares */}
-                      {(() => {
-                        // Field options derived from entityGraph().scalar_properties.
-                        // Rendered as <optgroup> per def_name so the user can scan visually.
-                        const scalarFields = (): {def: string, prop: string, type: string, format: string | null}[] => {
-                          const g = entityGraph();
-                          if (!g || !Array.isArray(g.scalar_properties)) return [];
-                          return g.scalar_properties.map((sp: any) => ({
-                            def: sp.def_name,
-                            prop: sp.prop_name,
-                            type: sp.prop_type,
-                            format: sp.format,
-                          }));
-                        };
-                        const groupedFields = () => {
-                          const groups: Record<string, {def: string, prop: string, type: string, format: string | null}[]> = {};
-                          for (const f of scalarFields()) {
-                            if (!groups[f.def]) groups[f.def] = [];
-                            groups[f.def].push(f);
-                          }
-                          return groups;
-                        };
-
-                        const [newRuleKind, setNewRuleKind] = createSignal<RuleKind>("range");
-
-                        const firstFieldPath = (): string => {
-                          const fs = scalarFields();
-                          return fs.length > 0 ? `${fs[0].def}.${fs[0].prop}` : "";
-                        };
-
-                        const makeRule = (kind: RuleKind): Rule => {
-                          const f = firstFieldPath();
-                          switch (kind) {
-                            case "range": return { kind: "range", field: f, min: 0, max: 100 };
-                            case "choice": return { kind: "choice", field: f, options: [] };
-                            case "const": return { kind: "const", field: f, value: "" };
-                            case "pattern": return { kind: "pattern", field: f, regex: "" };
-                            case "compare": return { kind: "compare", left: f, op: "gt", right: f };
-                          }
-                        };
-
-                        const addRule = () => {
-                          setRecipeRules([...recipeRules(), makeRule(newRuleKind())]);
-                        };
-
-                        const removeRule = (idx: number) => {
-                          const next = [...recipeRules()];
-                          next.splice(idx, 1);
-                          setRecipeRules(next);
-                        };
-
-                        const updateRule = (idx: number, patch: Partial<Rule>) => {
-                          const next = [...recipeRules()];
-                          next[idx] = { ...next[idx], ...patch } as Rule;
-                          setRecipeRules(next);
-                        };
-
-                        // Parse a literal: number-literal -> number, "true"/"false" -> bool, else string.
-                        const parseLiteral = (raw: string): string | number | boolean => {
-                          const trimmed = raw.trim();
-                          if (trimmed === "true") return true;
-                          if (trimmed === "false") return false;
-                          if (trimmed !== "" && !isNaN(Number(trimmed))) return Number(trimmed);
-                          return raw;
-                        };
-                        const parseChoiceOptions = (raw: string): (string | number | boolean)[] => {
-                          if (!raw.trim()) return [];
-                          return raw.split(",").map((s) => parseLiteral(s.trim()));
-                        };
-                        const stringifyChoiceOptions = (opts: (string | number | boolean)[]): string => {
-                          return opts.map((o) => String(o)).join(", ");
-                        };
-
-                        // Field select: rendered inline at each call site (NOT wrapped in a helper function),
-                        // because Solid's compiler can only wrap inline JSX expressions in reactive effects.
-                        // Function-call arguments are evaluated eagerly and lose reactivity.
-                        const FieldSelect = (props: { value: string; onChange: (next: string) => void }) => (
-                          <select
-                            value={props.value}
-                            class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                            onChange={(e) => props.onChange(e.target.value)}
-                          >
-                            <Show when={!props.value}>
-                              <option value="">-- field --</option>
-                            </Show>
-                            <For each={Object.entries(groupedFields()).sort(([a], [b]) => a.localeCompare(b))}>
-                              {([def, ps]) => (
-                                <optgroup label={def}>
-                                  <For each={ps}>
-                                    {(p) => (
-                                      <option value={`${def}.${p.prop}`}>
-                                        {p.prop} <Show when={p.type}>({p.type}{p.format ? `/${p.format}` : ""})</Show>
-                                      </option>
-                                    )}
-                                  </For>
-                                </optgroup>
-                              )}
-                            </For>
-                          </select>
-                        );
-
-                        return (
-                          <div class="mb-6" data-testid="constraint-rules-section">
-                            <div class="flex items-center justify-between mb-2">
-                              <h4 class="text-sm font-medium text-gray-300">Constraint Rules</h4>
-                              <div class="flex items-center gap-2">
-                                <select
-                                  value={newRuleKind()}
-                                  class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                  onChange={(e) => setNewRuleKind(e.target.value as RuleKind)}
-                                  data-testid="rule-kind-picker"
-                                >
-                                  <For each={RULE_KINDS}>
-                                    {(k) => <option value={k}>{k}</option>}
-                                  </For>
-                                </select>
-                                <button
-                                  class="px-2 py-0.5 text-xs font-medium text-blue-300 hover:text-blue-200 border border-blue-500/30 hover:border-blue-500/60 rounded-md transition-colors disabled:opacity-50"
-                                  onClick={addRule}
-                                  disabled={scalarFields().length === 0}
-                                  data-testid="rule-add-btn"
-                                >
-                                  + Add Rule
-                                </button>
-                              </div>
-                            </div>
-
-                            <Show when={scalarFields().length === 0}>
-                              <p class="text-xs text-gray-600 mb-2">Load endpoint graph first — no scalar fields detected.</p>
-                            </Show>
-
-                            <Show when={recipeRules().length === 0 && scalarFields().length > 0}>
-                              <p class="text-xs text-gray-600 mb-2">No constraint rules. Pick a kind and click Add Rule to bound a field, fix a value, restrict to a set, match a regex, or relate two fields.</p>
-                            </Show>
-
-                            <div class="space-y-2" data-testid="rule-list">
-                              <For each={recipeRules()}>
-                                {(rule, i) => (
-                                  <div class="flex items-center gap-2 px-3 py-2 bg-gray-800/50 rounded-md flex-wrap" data-testid={`rule-row-${rule.kind}`}>
-                                    <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-medium w-16 text-center">
-                                      {rule.kind}
-                                    </span>
-
-                                    {/* range: field min max */}
-                                    <Show when={rule.kind === "range"}>
-                                      <FieldSelect
-                                        value={(rule as RangeRule).field}
-                                        onChange={(next) => updateRule(i(), { field: next } as Partial<RangeRule>)}
-                                      />
-                                      <span class="text-[10px] text-gray-500">min</span>
-                                      <input
-                                        type="number"
-                                        value={(rule as RangeRule).min}
-                                        class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                        onInput={(e) => updateRule(i(), { min: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
-                                      />
-                                      <span class="text-[10px] text-gray-500">max</span>
-                                      <input
-                                        type="number"
-                                        value={(rule as RangeRule).max}
-                                        class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                        onInput={(e) => updateRule(i(), { max: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
-                                      />
-                                    </Show>
-
-                                    {/* choice: field options (comma list) */}
-                                    <Show when={rule.kind === "choice"}>
-                                      <FieldSelect
-                                        value={(rule as ChoiceRule).field}
-                                        onChange={(next) => updateRule(i(), { field: next } as Partial<ChoiceRule>)}
-                                      />
-                                      <input
-                                        type="text"
-                                        placeholder="value1, value2, value3"
-                                        value={stringifyChoiceOptions((rule as ChoiceRule).options)}
-                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                        onInput={(e) => updateRule(i(), { options: parseChoiceOptions(e.currentTarget.value) } as Partial<ChoiceRule>)}
-                                      />
-                                    </Show>
-
-                                    {/* const: field value */}
-                                    <Show when={rule.kind === "const"}>
-                                      <FieldSelect
-                                        value={(rule as ConstRule).field}
-                                        onChange={(next) => updateRule(i(), { field: next } as Partial<ConstRule>)}
-                                      />
-                                      <input
-                                        type="text"
-                                        placeholder="value"
-                                        value={String((rule as ConstRule).value ?? "")}
-                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                        onInput={(e) => updateRule(i(), { value: parseLiteral(e.currentTarget.value) } as Partial<ConstRule>)}
-                                      />
-                                    </Show>
-
-                                    {/* pattern: field regex */}
-                                    <Show when={rule.kind === "pattern"}>
-                                      <FieldSelect
-                                        value={(rule as PatternRule).field}
-                                        onChange={(next) => updateRule(i(), { field: next } as Partial<PatternRule>)}
-                                      />
-                                      <input
-                                        type="text"
-                                        placeholder="[A-Z]{3}-[0-9]{4}"
-                                        value={(rule as PatternRule).regex}
-                                        class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 font-mono focus:outline-none focus:border-gray-700"
-                                        onInput={(e) => updateRule(i(), { regex: e.currentTarget.value } as Partial<PatternRule>)}
-                                      />
-                                    </Show>
-
-                                    {/* compare: left op right (right may be field or literal) */}
-                                    <Show when={rule.kind === "compare"}>
-                                      <FieldSelect
-                                        value={(rule as CompareRule).left}
-                                        onChange={(next) => updateRule(i(), { left: next } as Partial<CompareRule>)}
-                                      />
-                                      <select
-                                        value={(rule as CompareRule).op}
-                                        class="bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                        onChange={(e) => updateRule(i(), { op: e.target.value as CompareOp } as Partial<CompareRule>)}
-                                      >
-                                        <For each={COMPARE_OPS}>
-                                          {(o) => <option value={o}>{o}</option>}
-                                        </For>
-                                      </select>
-                                      {(() => {
-                                        // Right is a field reference if its current value matches a known field path,
-                                        // otherwise a literal. The toggle <select> swaps between the two input modes.
-                                        const cr = () => rule as CompareRule;
-                                        const knownPaths = () => new Set(scalarFields().map((f) => `${f.def}.${f.prop}`));
-                                        const isFieldRef = () => typeof cr().right === "string" && knownPaths().has(cr().right as string);
-                                        return (
-                                          <>
-                                            <select
-                                              class="bg-[#070c17] border border-gray-800 rounded px-1 py-1 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
-                                              value={isFieldRef() ? "field" : "literal"}
-                                              onChange={(e) => {
-                                                if (e.target.value === "field") {
-                                                  updateRule(i(), { right: firstFieldPath() } as Partial<CompareRule>);
-                                                } else {
-                                                  updateRule(i(), { right: "" } as Partial<CompareRule>);
-                                                }
-                                              }}
-                                            >
-                                              <option value="field">field</option>
-                                              <option value="literal">literal</option>
-                                            </select>
-                                            <Show when={isFieldRef()}>
-                                              <FieldSelect
-                                                value={typeof cr().right === "string" ? (cr().right as string) : ""}
-                                                onChange={(next) => updateRule(i(), { right: next } as Partial<CompareRule>)}
-                                              />
-                                            </Show>
-                                            <Show when={!isFieldRef()}>
-                                              <input
-                                                type="text"
-                                                placeholder="literal value"
-                                                value={String(cr().right ?? "")}
-                                                class="flex-1 min-w-[120px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                                onInput={(e) => updateRule(i(), { right: parseLiteral(e.currentTarget.value) } as Partial<CompareRule>)}
-                                              />
-                                            </Show>
-                                          </>
-                                        );
-                                      })()}
-                                    </Show>
-
-                                    <button
-                                      class="ml-auto text-gray-500 hover:text-red-400 text-sm w-6 h-6 flex items-center justify-center rounded hover:bg-red-500/10 transition-colors"
-                                      onClick={() => removeRule(i())}
-                                      title="Remove rule"
-                                      data-testid="rule-remove-btn"
-                                    >
-                                      ×
-                                    </button>
-                                  </div>
-                                )}
-                              </For>
-                            </div>
-                          </div>
-                        );
-                      })()}
-
-                      {!hasAnything() && recipeRules().length === 0 && (
-                        <p class="text-gray-400 mb-4">No shared entities, array properties, or scalar fields detected. You can proceed to name your recipe.</p>
-                      )}
-
-                    </div>
-                  );
-                })()}
+                <RecipeConfigStep
+                  recipeSharedPools={recipeSharedPools}
+                  setRecipeSharedPools={setRecipeSharedPools}
+                  recipeQuantityConfigs={recipeQuantityConfigs}
+                  setRecipeQuantityConfigs={setRecipeQuantityConfigs}
+                  recipeFakerRules={recipeFakerRules}
+                  setRecipeFakerRules={setRecipeFakerRules}
+                  recipeRules={recipeRules}
+                  setRecipeRules={setRecipeRules}
+                  entityGraph={entityGraph}
+                  configSearch={configSearch}
+                  setConfigSearch={setConfigSearch}
+                  configShowNonDefault={configShowNonDefault}
+                  setConfigShowNonDefault={setConfigShowNonDefault}
+                />
               </Show>
 
               {/* Step 5: Name + seed count + save & activate */}
@@ -2781,6 +1695,1179 @@ function App() {
           </Show>
         </div>
       </main>
+    </div>
+  );
+}
+
+type GroupedFields = Record<string, { def: string; prop: string; type: string; format: string | null }[]>;
+
+function FieldSelect(props: {
+  value: string;
+  onChange: (next: string) => void;
+  groupedFields: Accessor<GroupedFields>;
+}) {
+  return (
+    <select
+      value={props.value}
+      class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+      onChange={(e) => props.onChange(e.target.value)}
+    >
+      <Show when={!props.value}>
+        <option value="">-- field --</option>
+      </Show>
+      <For each={Object.entries(props.groupedFields()).sort(([a], [b]) => a.localeCompare(b))}>
+        {([def, ps]) => (
+          <optgroup label={def}>
+            <For each={ps}>
+              {(p) => (
+                <option value={`${def}.${p.prop}`}>
+                  {p.prop} <Show when={p.type}>({p.type}{p.format ? `/${p.format}` : ""})</Show>
+                </option>
+              )}
+            </For>
+          </optgroup>
+        )}
+      </For>
+    </select>
+  );
+}
+
+function SchemasPage(props: {
+  schemaGraph: Accessor<any>;
+  definitions: Accessor<Record<string, DefinitionInfo>>;
+  selectedEntity: Accessor<string | null>;
+  setSelectedEntity: Setter<string | null>;
+  schemaFilter: Accessor<string>;
+  setSchemaFilter: Setter<string>;
+  schemaGraphGroupBy: Accessor<"alpha" | "endpoint">;
+  setSchemaGraphGroupBy: Setter<"alpha" | "endpoint">;
+  schemaGraphHopDepth: Accessor<number>;
+  setSchemaGraphHopDepth: Setter<number>;
+  expandedDefs: Accessor<Set<string>>;
+  toggleDef: (name: string) => void;
+  selectEntity: (name: string) => void;
+  endpointsForDef: (defName: string) => RouteInfo[];
+  typeBadgeClass: (type: string, isRef: boolean, isEnum: boolean) => string;
+}) {
+  const graph = () => props.schemaGraph();
+  const nodes = () => (graph()?.nodes || []) as string[];
+  const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
+  const roots = () => (graph()?.roots || {}) as Record<string, { method: string; path: string }[]>;
+  const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
+  const [rightTab, setRightTab] = createSignal<"details" | "graph">("details");
+
+  const filteredNodes = () => {
+    const q = props.schemaFilter().toLowerCase();
+    const allNodes = nodes();
+    const defKeys = Object.keys(props.definitions());
+    const merged = [...new Set([...allNodes, ...defKeys])];
+    const filtered = q ? merged.filter((n: string) => n.toLowerCase().includes(q)) : merged;
+    if (props.schemaGraphGroupBy() === "alpha") return filtered.sort();
+    return filtered;
+  };
+
+  const endpointGroups = () => {
+    if (props.schemaGraphGroupBy() !== "endpoint") return {};
+    const groups: Record<string, string[]> = {};
+    const r = roots();
+    const assigned = new Set<string>();
+    for (const node of filteredNodes()) {
+      if (r[node]) {
+        for (const ep of r[node]) {
+          const key = `${ep.method.toUpperCase()} ${ep.path}`;
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(node);
+          assigned.add(node);
+        }
+      }
+    }
+    const unrooted = filteredNodes().filter((n: string) => !assigned.has(n));
+    if (unrooted.length > 0) groups["Referenced (no direct root)"] = unrooted;
+    return groups;
+  };
+
+  const neighborhood = createMemo(() => {
+    const sel = props.selectedEntity();
+    const depth = props.schemaGraphHopDepth();
+    if (!sel) return { nodes: [] as string[], edges: {} as Record<string, string[]>, roleMap: {} as Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> };
+    const e = edges();
+
+    // Role map: focused node + two directional BFS passes
+    const roleMap: Record<string, { role: 'focused' | 'parent' | 'child'; hop: number }> = {};
+    roleMap[sel] = { role: 'focused', hop: 0 };
+
+    // Outbound BFS (children): follow e[n] → targets
+    const outVisited = new Set<string>([sel]);
+    let outFrontier = new Set<string>([sel]);
+    for (let hop = 1; hop <= depth; hop++) {
+      const next = new Set<string>();
+      for (const n of outFrontier) {
+        for (const t of (e[n] || [])) {
+          if (!outVisited.has(t)) {
+            outVisited.add(t);
+            next.add(t);
+            roleMap[t] = { role: 'child', hop };
+          }
+        }
+      }
+      outFrontier = next;
+    }
+
+    // Inbound BFS (parents): find src where e[src] includes n
+    const inVisited = new Set<string>([sel]);
+    let inFrontier = new Set<string>([sel]);
+    for (let hop = 1; hop <= depth; hop++) {
+      const next = new Set<string>();
+      for (const n of inFrontier) {
+        for (const [src, targets] of Object.entries(e)) {
+          if (targets.includes(n) && !inVisited.has(src)) {
+            inVisited.add(src);
+            next.add(src);
+            const existing = roleMap[src];
+            if (!existing || (hop < existing.hop) || (hop === existing.hop && existing.role !== 'child')) {
+              if (!existing) {
+                roleMap[src] = { role: 'parent', hop };
+              } else if (hop < existing.hop) {
+                roleMap[src] = { role: 'parent', hop };
+              }
+            }
+          }
+        }
+      }
+      inFrontier = next;
+    }
+
+    // Collect all visited nodes
+    const visited = new Set<string>([...outVisited, ...inVisited]);
+    const allNodes = Array.from(visited);
+    const nbEdges: Record<string, string[]> = {};
+    for (const n of allNodes) {
+      const targets = (e[n] || []).filter(t => visited.has(t));
+      if (targets.length > 0) nbEdges[n] = targets;
+    }
+    return { nodes: allNodes, edges: nbEdges, roleMap };
+  });
+
+  createEffect(() => {
+    const sel = props.selectedEntity();
+    if (!sel) return;
+    const id = requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-entity="${CSS.escape(sel)}"]`);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+    onCleanup(() => cancelAnimationFrame(id));
+  });
+
+  return (
+    <div class="flex flex-col flex-1 min-h-0">
+      <div class="flex items-center justify-between mb-6 shrink-0">
+        <h2 class="text-2xl font-semibold">Schemas</h2>
+      </div>
+      <Show when={Object.keys(props.definitions()).length === 0}>
+        <p class="text-gray-500">No definitions available. Import a spec first.</p>
+      </Show>
+      <Show when={Object.keys(props.definitions()).length > 0}>
+        <div class="flex gap-6 flex-1 min-h-0">
+          {/* Left panel - Hybrid entity list */}
+          <div class="w-72 shrink-0 flex flex-col">
+            <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-hidden flex flex-col h-full">
+              <div class="px-4 py-3 border-b border-[#141b28] space-y-2">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-medium text-gray-500 uppercase tracking-wider">Definitions</span>
+                  <span class="text-xs text-gray-600 tabular-nums">{filteredNodes().length}</span>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Filter..."
+                  value={props.schemaFilter()}
+                  onInput={(e) => props.setSchemaFilter(e.currentTarget.value)}
+                  class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
+                />
+                <div class="flex gap-1">
+                  <button
+                    class={`px-2.5 py-1 text-xs rounded-md transition-colors ${props.schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                    onClick={() => props.setSchemaGraphGroupBy("alpha")}
+                  >A--Z</button>
+                  <button
+                    class={`px-2.5 py-1 text-xs rounded-md transition-colors ${props.schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                    onClick={() => props.setSchemaGraphGroupBy("endpoint")}
+                  >By endpoint</button>
+                </div>
+              </div>
+              <div class="flex-1 overflow-y-auto" style="scrollbar-width: thin;">
+                <Show when={props.schemaGraphGroupBy() === "alpha"}>
+                  <For each={filteredNodes()}>
+                    {(defName: string) => {
+                      const def = () => props.definitions()[defName];
+                      const epCount = () => props.endpointsForDef(defName).length;
+                      const isSelected = () => props.selectedEntity() === defName;
+                      const isExpanded = () => props.expandedDefs().has(defName);
+                      const isParent = () => Object.keys(roots()).includes(defName);
+                      return (
+                        <div data-entity={defName}>
+                          <button
+                            class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
+                              isSelected()
+                                ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
+                                : isParent()
+                                ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
+                                : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                            }`}
+                            onClick={() => props.selectEntity(defName)}
+                          >
+                            <svg
+                              class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
+                              fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                              onClick={(e: MouseEvent) => { e.stopPropagation(); props.toggleDef(defName); }}
+                            >
+                              <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                            </svg>
+                            <span class="truncate flex-1 text-left">{defName}</span>
+                            <Show when={epCount() > 0}>
+                              <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                            </Show>
+                            {(edges()[defName]?.length || 0) > 0 && (
+                              <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
+                            )}
+                          </button>
+                          <Show when={def()?.extends}>
+                            <div class="px-3 pl-8 pb-1">
+                              <span class="text-xs text-gray-600">extends </span>
+                              <span
+                                class="text-xs text-purple-400 cursor-pointer hover:underline"
+                                onClick={() => props.selectEntity(def()!.extends!)}
+                              >{def()!.extends}</span>
+                            </div>
+                          </Show>
+                          <Show when={isExpanded() && def()}>
+                            <div class="pb-1">
+                              <For each={Object.entries(def()?.properties || {})}>
+                                {([propName, prop]) => (
+                                  <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
+                                    <span class="text-gray-400 truncate">
+                                      {propName}
+                                      <Show when={prop.required}><span class="text-red-400">*</span></Show>
+                                    </span>
+                                    <Show when={prop.ref_name}>
+                                      <span
+                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                        onClick={() => props.selectEntity(prop.ref_name!)}
+                                      >{prop.ref_name}</span>
+                                    </Show>
+                                    <Show when={prop.is_array && prop.items_ref}>
+                                      <span
+                                        class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                        onClick={() => props.selectEntity(prop.items_ref!)}
+                                      >[{prop.items_ref}]</span>
+                                    </Show>
+                                    <Show when={prop.is_array && !prop.items_ref}>
+                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                    </Show>
+                                    <Show when={prop.enum_values}>
+                                      <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                    </Show>
+                                    <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                      <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${props.typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
+                                    </Show>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        </div>
+                      );
+                    }}
+                  </For>
+                </Show>
+                <Show when={props.schemaGraphGroupBy() === "endpoint"}>
+                  <For each={Object.entries(endpointGroups())}>
+                    {([endpoint, groupNodes]) => (
+                      <div class="mb-2">
+                        <div class="text-[10px] font-medium text-gray-500 px-2 py-1 sticky top-0 bg-[#0a101d] z-10">{endpoint}</div>
+                        <For each={groupNodes as string[]}>
+                          {(defName: string) => {
+                            const def = () => props.definitions()[defName];
+                            const epCount = () => props.endpointsForDef(defName).length;
+                            const isSelected = () => props.selectedEntity() === defName;
+                            const isExpanded = () => props.expandedDefs().has(defName);
+                            const isParent = () => Object.keys(roots()).includes(defName);
+                            return (
+                              <div data-entity={defName}>
+                                <button
+                                  class={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-all ${
+                                    isSelected()
+                                      ? "bg-blue-600/15 text-blue-400 font-medium ring-1 ring-blue-500/30"
+                                      : isParent()
+                                      ? "bg-yellow-900/20 text-gray-200 hover:bg-yellow-900/30 border-l-2 border-yellow-800/40"
+                                      : "text-gray-400 hover:text-gray-200 hover:bg-white/5"
+                                  }`}
+                                  onClick={() => props.selectEntity(defName)}
+                                >
+                                  <svg
+                                    class={`w-3 h-3 shrink-0 transition-transform ${isExpanded() ? "rotate-90" : ""}`}
+                                    fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                                    onClick={(e: MouseEvent) => { e.stopPropagation(); props.toggleDef(defName); }}
+                                  >
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                                  </svg>
+                                  <span class="truncate flex-1 text-left">{defName}</span>
+                                  <Show when={epCount() > 0}>
+                                    <span class="text-[10px] tabular-nums px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400">{epCount()}</span>
+                                  </Show>
+                                  {(edges()[defName]?.length || 0) > 0 && (
+                                    <span class="text-[10px] text-gray-600 shrink-0">{edges()[defName].length}</span>
+                                  )}
+                                </button>
+                                <Show when={def()?.extends}>
+                                  <div class="px-3 pl-8 pb-1">
+                                    <span class="text-xs text-gray-600">extends </span>
+                                    <span
+                                      class="text-xs text-purple-400 cursor-pointer hover:underline"
+                                      onClick={() => props.selectEntity(def()!.extends!)}
+                                    >{def()!.extends}</span>
+                                  </div>
+                                </Show>
+                                <Show when={isExpanded() && def()}>
+                                  <div class="pb-1">
+                                    <For each={Object.entries(def()?.properties || {})}>
+                                      {([propName, prop]) => (
+                                        <div class="flex items-center gap-1.5 px-3 pl-8 py-1 text-xs">
+                                          <span class="text-gray-400 truncate">
+                                            {propName}
+                                            <Show when={prop.required}><span class="text-red-400">*</span></Show>
+                                          </span>
+                                          <Show when={prop.ref_name}>
+                                            <span
+                                              class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                              onClick={() => props.selectEntity(prop.ref_name!)}
+                                            >{prop.ref_name}</span>
+                                          </Show>
+                                          <Show when={prop.is_array && prop.items_ref}>
+                                            <span
+                                              class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                              onClick={() => props.selectEntity(prop.items_ref!)}
+                                            >[{prop.items_ref}]</span>
+                                          </Show>
+                                          <Show when={prop.is_array && !prop.items_ref}>
+                                            <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                          </Show>
+                                          <Show when={prop.enum_values}>
+                                            <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                          </Show>
+                                          <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                            <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${props.typeBadgeClass(prop.type, false, false)}`}>{prop.type}</span>
+                                          </Show>
+                                        </div>
+                                      )}
+                                    </For>
+                                  </div>
+                                </Show>
+                              </div>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
+            </div>
+          </div>
+
+          {/* Right panel - Detail / Graph tabs */}
+          <div class="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto">
+            {/* Empty state — no tabs */}
+            <Show when={!props.selectedEntity()}>
+              <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
+                <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
+              </div>
+            </Show>
+
+            {/* Tabbed content — only when entity selected */}
+            <Show when={props.selectedEntity()}>
+              {/* Tab bar */}
+              <div class="flex items-center gap-1 mb-3 shrink-0">
+                <button
+                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                    rightTab() === "details"
+                      ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                      : "text-gray-400 hover:text-gray-200"
+                  }`}
+                  onClick={() => setRightTab("details")}
+                >Details</button>
+                <button
+                  class={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                    rightTab() === "graph"
+                      ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                      : "text-gray-400 hover:text-gray-200"
+                  }`}
+                  onClick={() => setRightTab("graph")}
+                >Graph</button>
+              </div>
+
+              {/* Details tab content */}
+              <Show when={rightTab() === "details" && props.definitions()[props.selectedEntity()!]}>
+                {(() => {
+                  const defName = () => props.selectedEntity()!;
+                  const def = () => props.definitions()[defName()];
+                  const eps = () => props.endpointsForDef(defName());
+                  return (
+                    <div class="rounded-xl bg-[#0a101d] border border-[#141b28] overflow-y-auto">
+                      <div class="px-6 py-5 border-b border-[#141b28]">
+                        <h3 class="text-xl font-semibold text-gray-100">{defName()}</h3>
+                        <Show when={def()?.description}>
+                          <p class="text-sm text-gray-500 mt-1">{def()!.description}</p>
+                        </Show>
+                        <Show when={def()?.extends}>
+                          <p class="text-sm text-gray-500 mt-1">
+                            Extends:{" "}
+                            <span
+                              class="text-purple-400 cursor-pointer hover:underline"
+                              onClick={() => props.selectEntity(def()!.extends!)}
+                            >{def()!.extends}</span>
+                          </p>
+                        </Show>
+                      </div>
+
+                      {/* Properties table */}
+                      <div class="px-6 py-4">
+                        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Properties</p>
+                        <Show when={Object.keys(def()?.properties || {}).length === 0}>
+                          <p class="text-sm text-gray-600">No properties defined.</p>
+                        </Show>
+                        <Show when={Object.keys(def()?.properties || {}).length > 0}>
+                          <div class="rounded-lg border border-[#141b28] overflow-hidden">
+                            <table class="w-full text-left">
+                              <thead>
+                                <tr class="bg-[#090e1a]">
+                                  <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                                  <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                  <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider w-20">Required</th>
+                                  <th class="py-2.5 px-4 text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <For each={Object.entries(def()?.properties || {})}>
+                                  {([propName, prop]) => (
+                                    <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
+                                      <td class="py-2.5 px-4 font-mono text-sm text-gray-300">
+                                        {propName}
+                                        <Show when={prop.required}><span class="text-red-400 ml-0.5">*</span></Show>
+                                      </td>
+                                      <td class="py-2.5 px-4">
+                                        <Show when={prop.ref_name}>
+                                          <span
+                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 cursor-pointer hover:underline"
+                                            onClick={() => props.selectEntity(prop.ref_name!)}
+                                          >{prop.ref_name}</span>
+                                        </Show>
+                                        <Show when={prop.is_array && prop.items_ref}>
+                                          <span
+                                            class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400 cursor-pointer hover:underline"
+                                            onClick={() => props.selectEntity(prop.items_ref!)}
+                                          >[{prop.items_ref}]</span>
+                                        </Show>
+                                        <Show when={prop.is_array && !prop.items_ref}>
+                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-orange-500/10 text-orange-400">[{prop.type}]</span>
+                                        </Show>
+                                        <Show when={prop.enum_values}>
+                                          <span class="px-1.5 py-0.5 rounded text-xs font-mono bg-pink-500/10 text-pink-400">enum</span>
+                                        </Show>
+                                        <Show when={!prop.ref_name && !prop.is_array && !prop.enum_values}>
+                                          <span class={`px-1.5 py-0.5 rounded text-xs font-mono ${props.typeBadgeClass(prop.type, false, false)}`}>
+                                            {prop.type}{prop.format ? ` (${prop.format})` : ""}
+                                          </span>
+                                        </Show>
+                                        <Show when={prop.enum_values}>
+                                          <div class="flex flex-wrap gap-1 mt-1">
+                                            <For each={prop.enum_values!}>
+                                              {(val) => (
+                                                <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-500/5 text-pink-300">{val}</span>
+                                              )}
+                                            </For>
+                                          </div>
+                                        </Show>
+                                      </td>
+                                      <td class="py-2.5 px-4 text-center">
+                                        <span class={`text-sm ${prop.required ? "text-green-400" : "text-gray-700"}`}>
+                                          {prop.required ? "\u2713" : "\u2014"}
+                                        </span>
+                                      </td>
+                                      <td class="py-2.5 px-4 text-sm text-gray-500">
+                                        {prop.description || "\u2014"}
+                                      </td>
+                                    </tr>
+                                  )}
+                                </For>
+                              </tbody>
+                            </table>
+                          </div>
+                        </Show>
+                      </div>
+
+                      {/* Used by endpoints */}
+                      <Show when={eps().length > 0}>
+                        <div class="px-6 py-4 border-t border-[#141b28]">
+                          <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Used by endpoints</p>
+                          <div class="space-y-1.5">
+                            <For each={eps()}>
+                              {(route) => (
+                                <div class="flex items-center gap-2">
+                                  <MethodBadge method={route.method} />
+                                  <span class="font-mono text-sm text-gray-400">{route.path}</span>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+                    </div>
+                  );
+                })()}
+              </Show>
+
+              {/* Graph tab content */}
+              <Show when={rightTab() === "graph"}>
+                <div class="flex items-center justify-between mb-1">
+                  <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-[10px] text-gray-500">Depth</span>
+                    <input
+                      type="range" min="1" max="3" step="1"
+                      value={props.schemaGraphHopDepth()}
+                      onInput={(e) => props.setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
+                      class="w-14 h-1 accent-blue-500"
+                    />
+                    <span class="text-[10px] text-gray-400 w-3">{props.schemaGraphHopDepth()}</span>
+                  </div>
+                </div>
+                <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
+                  <ForceGraph
+                    nodes={neighborhood().nodes}
+                    edges={neighborhood().edges}
+                    roleMap={neighborhood().roleMap}
+                    arrayTargets={arrayTargets()}
+                    selectedEntity={props.selectedEntity()}
+                    onSelectEntity={props.setSelectedEntity}
+                  />
+                </div>
+              </Show>
+            </Show>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function RecipeConfigStep(props: {
+  recipeSharedPools: Accessor<Record<string, { is_shared: boolean; pool_size: number }>>;
+  setRecipeSharedPools: Setter<Record<string, { is_shared: boolean; pool_size: number }>>;
+  recipeQuantityConfigs: Accessor<Record<string, { min: number; max: number }>>;
+  setRecipeQuantityConfigs: Setter<Record<string, { min: number; max: number }>>;
+  recipeFakerRules: Accessor<Record<string, string>>;
+  setRecipeFakerRules: Setter<Record<string, string>>;
+  recipeRules: Accessor<Rule[]>;
+  setRecipeRules: Setter<Rule[]>;
+  entityGraph: Accessor<any>;
+  configSearch: Accessor<string>;
+  setConfigSearch: Setter<string>;
+  configShowNonDefault: Accessor<boolean>;
+  setConfigShowNonDefault: Setter<boolean>;
+}) {
+  const hasPools = () => Object.keys(props.recipeSharedPools()).length > 0;
+  const hasConfigs = () => Object.keys(props.recipeQuantityConfigs()).length > 0;
+  const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
+  const hasAnything = () => hasPools() || hasConfigs() || hasRules();
+
+  // Group array quantity configs by entity (part before the dot)
+  const groupedConfigs = () => {
+    const groups: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
+    for (const [key, config] of Object.entries(props.recipeQuantityConfigs())) {
+      const dot = key.indexOf(".");
+      const entity = dot >= 0 ? key.slice(0, dot) : key;
+      if (!groups[entity]) groups[entity] = [];
+      groups[entity].push({ key, config });
+    }
+    return groups;
+  };
+
+  // Filter by search
+  const filteredPools = () => {
+    const q = props.configSearch().toLowerCase();
+    const entries = Object.entries(props.recipeSharedPools());
+    const filtered = q ? entries.filter(([e]) => e.toLowerCase().includes(q)) : entries;
+    if (props.configShowNonDefault()) return filtered.filter(([_, c]) => !c.is_shared || c.pool_size !== 10);
+    return filtered;
+  };
+
+  const filteredConfigGroups = () => {
+    const q = props.configSearch().toLowerCase();
+    const groups = groupedConfigs();
+    const result: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
+    for (const [entity, items] of Object.entries(groups)) {
+      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+      const visible = props.configShowNonDefault() ? matching.filter(i => i.config.min !== 1 || i.config.max !== 3) : matching;
+      if (visible.length > 0) result[entity] = visible;
+    }
+    return result;
+  };
+
+  const FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
+
+  const groupedRules = () => {
+    const groups: Record<string, { key: string; strategy: string; propType: string; format: string | null }[]> = {};
+    const graph = props.entityGraph();
+    const scalarMap: Record<string, { prop_type: string; format: string | null }> = {};
+    for (const sp of graph?.scalar_properties || []) {
+      scalarMap[`${sp.def_name}.${sp.prop_name}`] = { prop_type: sp.prop_type, format: sp.format };
+    }
+    for (const [key, strategy] of Object.entries(props.recipeFakerRules())) {
+      const dot = key.indexOf(".");
+      const entity = dot >= 0 ? key.slice(0, dot) : key;
+      if (!groups[entity]) groups[entity] = [];
+      const meta = scalarMap[key] || { prop_type: "string", format: null };
+      groups[entity].push({ key, strategy, propType: meta.prop_type, format: meta.format });
+    }
+    return groups;
+  };
+
+  const filteredRuleGroups = () => {
+    const q = props.configSearch().toLowerCase();
+    const groups = groupedRules();
+    const result: typeof groups = {};
+    for (const [entity, items] of Object.entries(groups)) {
+      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+      const visible = props.configShowNonDefault() ? matching.filter(i => i.strategy !== "auto") : matching;
+      if (visible.length > 0) result[entity] = visible;
+    }
+    return result;
+  };
+
+  // Collapsed state for entity groups
+  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  const toggleGroup = (entity: string) => {
+    const s = new Set(collapsedGroups());
+    if (s.has(entity)) s.delete(entity); else s.add(entity);
+    setCollapsedGroups(s);
+  };
+
+  return (
+    <div>
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="text-lg font-semibold">Configure Data Generation</h3>
+          <p class="text-sm text-gray-500">
+            {Object.keys(props.recipeSharedPools()).length} shared pools · {Object.keys(props.recipeQuantityConfigs()).length} array properties · {Object.keys(props.recipeFakerRules()).length} field rules · {props.recipeRules().length} constraint rules
+          </p>
+        </div>
+        <Show when={hasAnything()}>
+          <div class="flex items-center gap-3">
+            <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+              <input type="checkbox" checked={props.configShowNonDefault()} onChange={(e) => props.setConfigShowNonDefault(e.target.checked)} class="accent-blue-500 rounded" />
+              Changed only
+            </label>
+          </div>
+        </Show>
+      </div>
+
+      <Show when={hasAnything()}>
+        <input
+          type="text"
+          placeholder="Search pools, properties, and rules..."
+          value={props.configSearch()}
+          onInput={(e) => props.setConfigSearch(e.currentTarget.value)}
+          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
+        />
+      </Show>
+
+      {/* Shared Entity Pools */}
+      <Show when={hasPools() && filteredPools().length > 0}>
+        <div class="mb-6">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-medium text-gray-300">Shared Entity Pools</h4>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-gray-600">Set all to</span>
+              <input
+                type="number" min="1" max="100" placeholder="n"
+                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                onChange={(e) => {
+                  const val = parseInt(e.target.value);
+                  if (!val || val < 1) return;
+                  const pools = { ...props.recipeSharedPools() };
+                  for (const key of Object.keys(pools)) {
+                    pools[key] = { ...pools[key], pool_size: val };
+                  }
+                  props.setRecipeSharedPools(pools);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+          </div>
+          <div class="space-y-1">
+            <For each={filteredPools()}>
+              {([entity, config]) => (
+                <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md">
+                  <input type="checkbox" checked={config.is_shared}
+                    class="accent-blue-500 rounded"
+                    onChange={(e) => {
+                      const pools = { ...props.recipeSharedPools() };
+                      pools[entity] = { ...pools[entity], is_shared: e.target.checked };
+                      props.setRecipeSharedPools(pools);
+                    }} />
+                  <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
+                  <input type="number" min="1" max="100" value={config.pool_size}
+                    class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                    onInput={(e) => {
+                      const pools = { ...props.recipeSharedPools() };
+                      pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
+                      props.setRecipeSharedPools(pools);
+                    }} />
+                  <span class="text-xs text-gray-600 w-14">instances</span>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+
+      {/* Array Quantity Ranges — grouped by entity */}
+      <Show when={hasConfigs() && Object.keys(filteredConfigGroups()).length > 0}>
+        <div class="mb-6">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-medium text-gray-300">Array Quantity Ranges</h4>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-gray-600">Set all to</span>
+              <input
+                type="number" min="0" max="50" placeholder="min"
+                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                onChange={(e) => {
+                  const val = parseInt(e.target.value);
+                  if (isNaN(val) || val < 0) return;
+                  const configs = { ...props.recipeQuantityConfigs() };
+                  for (const key of Object.keys(configs)) {
+                    configs[key] = { ...configs[key], min: val };
+                  }
+                  props.setRecipeQuantityConfigs(configs);
+                  e.target.value = "";
+                }}
+              />
+              <span class="text-[10px] text-gray-600">–</span>
+              <input
+                type="number" min="1" max="50" placeholder="max"
+                class="w-12 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                onChange={(e) => {
+                  const val = parseInt(e.target.value);
+                  if (!val || val < 1) return;
+                  const configs = { ...props.recipeQuantityConfigs() };
+                  for (const key of Object.keys(configs)) {
+                    configs[key] = { ...configs[key], max: val };
+                  }
+                  props.setRecipeQuantityConfigs(configs);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+          </div>
+          <div class="space-y-1">
+            <For each={Object.entries(filteredConfigGroups()).sort(([a], [b]) => a.localeCompare(b))}>
+              {([entity, items]) => (
+                <div class="rounded-md overflow-hidden">
+                  <button
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                    onClick={() => toggleGroup(entity)}
+                  >
+                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>▶</span>
+                    <span class="font-medium">{entity}</span>
+                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
+                  </button>
+                  <Show when={!collapsedGroups().has(entity)}>
+                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                      <For each={items}>
+                        {(item) => {
+                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                          return (
+                            <div class="flex items-center gap-3 px-3 py-1.5">
+                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                              <input type="number" min="0" max="50" value={item.config.min}
+                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                onInput={(e) => {
+                                  const configs = { ...props.recipeQuantityConfigs() };
+                                  configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
+                                  props.setRecipeQuantityConfigs(configs);
+                                }} />
+                              <span class="text-gray-600 text-xs">–</span>
+                              <input type="number" min="1" max="50" value={item.config.max}
+                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                onInput={(e) => {
+                                  const configs = { ...props.recipeQuantityConfigs() };
+                                  configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
+                                  props.setRecipeQuantityConfigs(configs);
+                                }} />
+                              <span class="text-[10px] text-gray-600 w-10">items</span>
+                            </div>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+
+      {/* Field Generation Rules — grouped by entity */}
+      <Show when={hasRules() && Object.keys(filteredRuleGroups()).length > 0}>
+        <div class="mb-6">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-medium text-gray-300">Field Generation Rules</h4>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-gray-600">Set all to</span>
+              <select
+                class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (!val) return;
+                  const rules = { ...props.recipeFakerRules() };
+                  for (const key of Object.keys(rules)) {
+                    rules[key] = val;
+                  }
+                  props.setRecipeFakerRules(rules);
+                  e.target.value = "";
+                }}
+              >
+                <option value="">--</option>
+                <For each={FAKER_STRATEGIES}>
+                  {(s) => <option value={s}>{s}</option>}
+                </For>
+              </select>
+            </div>
+          </div>
+          <div class="space-y-1">
+            <For each={Object.entries(filteredRuleGroups()).sort(([a], [b]) => a.localeCompare(b))}>
+              {([entity, items]) => (
+                <div class="rounded-md overflow-hidden">
+                  <button
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                    onClick={() => toggleGroup(entity + "_rules")}
+                  >
+                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
+                    <span class="font-medium">{entity}</span>
+                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
+                  </button>
+                  <Show when={!collapsedGroups().has(entity + "_rules")}>
+                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                      <For each={items}>
+                        {(item) => {
+                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                          return (
+                            <div class="flex items-center gap-3 px-3 py-1.5">
+                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
+                              <select
+                                value={item.strategy}
+                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                onChange={(e) => {
+                                  const rules = { ...props.recipeFakerRules() };
+                                  rules[item.key] = e.target.value;
+                                  props.setRecipeFakerRules(rules);
+                                }}
+                              >
+                                <For each={FAKER_STRATEGIES}>
+                                  {(s) => <option value={s}>{s}</option>}
+                                </For>
+                              </select>
+                            </div>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+
+      {/* Constraint Rules — bounded values + cross-field compares */}
+      <ConstraintRulesEditor
+        recipeRules={props.recipeRules}
+        setRecipeRules={props.setRecipeRules}
+        entityGraph={props.entityGraph}
+      />
+
+      {!hasAnything() && props.recipeRules().length === 0 && (
+        <p class="text-gray-400 mb-4">No shared entities, array properties, or scalar fields detected. You can proceed to name your recipe.</p>
+      )}
+
+    </div>
+  );
+}
+
+function ConstraintRulesEditor(props: {
+  recipeRules: Accessor<Rule[]>;
+  setRecipeRules: Setter<Rule[]>;
+  entityGraph: Accessor<any>;
+}) {
+  // Field options derived from entityGraph().scalar_properties.
+  // Rendered as <optgroup> per def_name so the user can scan visually.
+  const scalarFields = (): { def: string; prop: string; type: string; format: string | null }[] => {
+    const g = props.entityGraph();
+    if (!g || !Array.isArray(g.scalar_properties)) return [];
+    return g.scalar_properties.map((sp: any) => ({
+      def: sp.def_name,
+      prop: sp.prop_name,
+      type: sp.prop_type,
+      format: sp.format,
+    }));
+  };
+  const groupedFields = (): GroupedFields => {
+    const groups: GroupedFields = {};
+    for (const f of scalarFields()) {
+      if (!groups[f.def]) groups[f.def] = [];
+      groups[f.def].push(f);
+    }
+    return groups;
+  };
+
+  const [newRuleKind, setNewRuleKind] = createSignal<RuleKind>("range");
+
+  const firstFieldPath = (): string => {
+    const fs = scalarFields();
+    return fs.length > 0 ? `${fs[0].def}.${fs[0].prop}` : "";
+  };
+
+  const makeRule = (kind: RuleKind): Rule => {
+    const f = firstFieldPath();
+    switch (kind) {
+      case "range": return { kind: "range", field: f, min: 0, max: 100 };
+      case "choice": return { kind: "choice", field: f, options: [] };
+      case "const": return { kind: "const", field: f, value: "" };
+      case "pattern": return { kind: "pattern", field: f, regex: "" };
+      case "compare": return { kind: "compare", left: f, op: "gt", right: f };
+    }
+  };
+
+  const addRule = () => {
+    props.setRecipeRules([...props.recipeRules(), makeRule(newRuleKind())]);
+  };
+
+  const removeRule = (idx: number) => {
+    const next = [...props.recipeRules()];
+    next.splice(idx, 1);
+    props.setRecipeRules(next);
+  };
+
+  const updateRule = (idx: number, patch: Partial<Rule>) => {
+    const next = [...props.recipeRules()];
+    next[idx] = { ...next[idx], ...patch } as Rule;
+    props.setRecipeRules(next);
+  };
+
+  // Parse a literal: number-literal -> number, "true"/"false" -> bool, else string.
+  const parseLiteral = (raw: string): string | number | boolean => {
+    const trimmed = raw.trim();
+    if (trimmed === "true") return true;
+    if (trimmed === "false") return false;
+    if (trimmed !== "" && !isNaN(Number(trimmed))) return Number(trimmed);
+    return raw;
+  };
+  const parseChoiceOptions = (raw: string): (string | number | boolean)[] => {
+    if (!raw.trim()) return [];
+    return raw.split(",").map((s) => parseLiteral(s.trim()));
+  };
+  const stringifyChoiceOptions = (opts: (string | number | boolean)[]): string => {
+    return opts.map((o) => String(o)).join(", ");
+  };
+
+  return (
+    <div class="mb-6" data-testid="constraint-rules-section">
+      <div class="flex items-center justify-between mb-2">
+        <h4 class="text-sm font-medium text-gray-300">Constraint Rules</h4>
+        <div class="flex items-center gap-2">
+          <select
+            value={newRuleKind()}
+            class="bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+            onChange={(e) => setNewRuleKind(e.target.value as RuleKind)}
+            data-testid="rule-kind-picker"
+          >
+            <For each={RULE_KINDS}>
+              {(k) => <option value={k}>{k}</option>}
+            </For>
+          </select>
+          <button
+            class="px-2 py-0.5 text-xs font-medium text-blue-300 hover:text-blue-200 border border-blue-500/30 hover:border-blue-500/60 rounded-md transition-colors disabled:opacity-50"
+            onClick={addRule}
+            disabled={scalarFields().length === 0}
+            data-testid="rule-add-btn"
+          >
+            + Add Rule
+          </button>
+        </div>
+      </div>
+
+      <Show when={scalarFields().length === 0}>
+        <p class="text-xs text-gray-600 mb-2">Load endpoint graph first — no scalar fields detected.</p>
+      </Show>
+
+      <Show when={props.recipeRules().length === 0 && scalarFields().length > 0}>
+        <p class="text-xs text-gray-600 mb-2">No constraint rules. Pick a kind and click Add Rule to bound a field, fix a value, restrict to a set, match a regex, or relate two fields.</p>
+      </Show>
+
+      <div class="space-y-2" data-testid="rule-list">
+        {/*
+          Use <Index> instead of <For>: SolidJS <For> is reference-keyed, so updateRule's
+          shallow array-with-spliced-element pattern disposes and recreates the row on every
+          keystroke, unmounting the focused <input>. <Index> is index-keyed — it updates an
+          internal signal at the same position without re-mounting DOM, preserving focus.
+        */}
+        <Index each={props.recipeRules()}>
+          {(rule, i) => {
+            // Compare right-side helpers — closed over the reactive `rule` accessor.
+            const cr = () => rule() as CompareRule;
+            const knownPaths = () => new Set(scalarFields().map((f) => `${f.def}.${f.prop}`));
+            const isFieldRef = () => typeof cr().right === "string" && knownPaths().has(cr().right as string);
+            return (
+              <div class="flex items-center gap-2 px-3 py-2 bg-gray-800/50 rounded-md flex-wrap" data-testid={`rule-row-${rule().kind}`}>
+                <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-medium w-16 text-center">
+                  {rule().kind}
+                </span>
+
+                {/* range: field min max */}
+                <Show when={rule().kind === "range"}>
+                  <FieldSelect
+                    value={(rule() as RangeRule).field}
+                    onChange={(next) => updateRule(i, { field: next } as Partial<RangeRule>)}
+                    groupedFields={groupedFields}
+                  />
+                  <span class="text-[10px] text-gray-500">min</span>
+                  <input
+                    type="number"
+                    value={(rule() as RangeRule).min}
+                    class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                    onInput={(e) => updateRule(i, { min: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                  />
+                  <span class="text-[10px] text-gray-500">max</span>
+                  <input
+                    type="number"
+                    value={(rule() as RangeRule).max}
+                    class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                    onInput={(e) => updateRule(i, { max: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                  />
+                </Show>
+
+                {/* choice: field options (comma list) */}
+                <Show when={rule().kind === "choice"}>
+                  <FieldSelect
+                    value={(rule() as ChoiceRule).field}
+                    onChange={(next) => updateRule(i, { field: next } as Partial<ChoiceRule>)}
+                    groupedFields={groupedFields}
+                  />
+                  <input
+                    type="text"
+                    placeholder="value1, value2, value3"
+                    value={stringifyChoiceOptions((rule() as ChoiceRule).options)}
+                    class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                    onInput={(e) => updateRule(i, { options: parseChoiceOptions(e.currentTarget.value) } as Partial<ChoiceRule>)}
+                  />
+                </Show>
+
+                {/* const: field value */}
+                <Show when={rule().kind === "const"}>
+                  <FieldSelect
+                    value={(rule() as ConstRule).field}
+                    onChange={(next) => updateRule(i, { field: next } as Partial<ConstRule>)}
+                    groupedFields={groupedFields}
+                  />
+                  <input
+                    type="text"
+                    placeholder="value"
+                    value={String((rule() as ConstRule).value ?? "")}
+                    class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                    onInput={(e) => updateRule(i, { value: parseLiteral(e.currentTarget.value) } as Partial<ConstRule>)}
+                  />
+                </Show>
+
+                {/* pattern: field regex */}
+                <Show when={rule().kind === "pattern"}>
+                  <FieldSelect
+                    value={(rule() as PatternRule).field}
+                    onChange={(next) => updateRule(i, { field: next } as Partial<PatternRule>)}
+                    groupedFields={groupedFields}
+                  />
+                  <input
+                    type="text"
+                    placeholder="[A-Z]{3}-[0-9]{4}"
+                    value={(rule() as PatternRule).regex}
+                    class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 font-mono focus:outline-none focus:border-gray-700"
+                    onInput={(e) => updateRule(i, { regex: e.currentTarget.value } as Partial<PatternRule>)}
+                  />
+                </Show>
+
+                {/* compare: left op right (right may be field or literal) */}
+                <Show when={rule().kind === "compare"}>
+                  <FieldSelect
+                    value={(rule() as CompareRule).left}
+                    onChange={(next) => updateRule(i, { left: next } as Partial<CompareRule>)}
+                    groupedFields={groupedFields}
+                  />
+                  <select
+                    value={(rule() as CompareRule).op}
+                    class="bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                    onChange={(e) => updateRule(i, { op: e.target.value as CompareOp } as Partial<CompareRule>)}
+                  >
+                    <For each={COMPARE_OPS}>
+                      {(o) => <option value={o}>{o}</option>}
+                    </For>
+                  </select>
+                  <select
+                    class="bg-[#070c17] border border-gray-800 rounded px-1 py-1 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
+                    value={isFieldRef() ? "field" : "literal"}
+                    onChange={(e) => {
+                      if (e.target.value === "field") {
+                        updateRule(i, { right: firstFieldPath() } as Partial<CompareRule>);
+                      } else {
+                        updateRule(i, { right: "" } as Partial<CompareRule>);
+                      }
+                    }}
+                  >
+                    <option value="field">field</option>
+                    <option value="literal">literal</option>
+                  </select>
+                  <Show when={isFieldRef()}>
+                    <FieldSelect
+                      value={typeof cr().right === "string" ? (cr().right as string) : ""}
+                      onChange={(next) => updateRule(i, { right: next } as Partial<CompareRule>)}
+                      groupedFields={groupedFields}
+                    />
+                  </Show>
+                  <Show when={!isFieldRef()}>
+                    <input
+                      type="text"
+                      placeholder="literal value"
+                      value={String(cr().right ?? "")}
+                      class="flex-1 min-w-[120px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                      onInput={(e) => updateRule(i, { right: parseLiteral(e.currentTarget.value) } as Partial<CompareRule>)}
+                    />
+                  </Show>
+                </Show>
+
+                <button
+                  class="ml-auto text-gray-500 hover:text-red-400 text-sm w-6 h-6 flex items-center justify-center rounded hover:bg-red-500/10 transition-colors"
+                  onClick={() => removeRule(i)}
+                  title="Remove rule"
+                  data-testid="rule-remove-btn"
+                >
+                  ×
+                </button>
+              </div>
+            );
+          }}
+        </Index>
+      </div>
     </div>
   );
 }
