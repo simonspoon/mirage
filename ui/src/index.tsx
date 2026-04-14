@@ -2280,6 +2280,91 @@ function RecipeConfigStep(props: {
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
   const hasAnything = () => hasPools() || hasConfigs() || hasRules();
 
+  // Invert graph.roots: defName→endpoints[] into endpointLabel→defNames[]
+  // Classify definitions into single-endpoint, shared, or nested buckets
+  type EndpointBucket = { label: string; defs: string[] };
+  const endpointBuckets = createMemo((): EndpointBucket[] => {
+    const graph = props.entityGraph();
+    const roots: Record<string, { method: string; path: string }[]> = graph?.roots || {};
+    const epToDefs: Record<string, Set<string>> = {};
+    const defToEps: Record<string, string[]> = {};
+
+    for (const [defName, eps] of Object.entries(roots)) {
+      for (const ep of eps) {
+        const label = `${ep.method.toUpperCase()} ${ep.path}`;
+        if (!epToDefs[label]) epToDefs[label] = new Set();
+        epToDefs[label].add(defName);
+        if (!defToEps[defName]) defToEps[defName] = [];
+        defToEps[defName].push(label);
+      }
+    }
+
+    // Collect all known definition names across pools, configs, faker rules
+    const allDefs = new Set<string>();
+    for (const name of Object.keys(props.recipeSharedPools())) allDefs.add(name);
+    for (const key of Object.keys(props.recipeQuantityConfigs())) {
+      const dot = key.indexOf(".");
+      allDefs.add(dot >= 0 ? key.slice(0, dot) : key);
+    }
+    for (const key of Object.keys(props.recipeFakerRules())) {
+      const dot = key.indexOf(".");
+      allDefs.add(dot >= 0 ? key.slice(0, dot) : key);
+    }
+
+    // Sort endpoint labels by path then method
+    const sortedLabels = Object.keys(epToDefs).sort((a, b) => {
+      const [am, ...ap] = a.split(" ");
+      const [bm, ...bp] = b.split(" ");
+      const pathCmp = ap.join(" ").localeCompare(bp.join(" "));
+      return pathCmp !== 0 ? pathCmp : am.localeCompare(bm);
+    });
+
+    const buckets: EndpointBucket[] = [];
+    const assignedSingle = new Set<string>();
+    const sharedDefs = new Set<string>();
+
+    // Single-endpoint roots go under their endpoint
+    for (const label of sortedLabels) {
+      const defs: string[] = [];
+      for (const d of epToDefs[label]) {
+        if ((defToEps[d] || []).length === 1) {
+          defs.push(d);
+          assignedSingle.add(d);
+        } else {
+          sharedDefs.add(d);
+        }
+      }
+      if (defs.length > 0) {
+        buckets.push({ label, defs: defs.sort() });
+      }
+    }
+
+    // Shared bucket: definitions that appear in 2+ endpoints
+    const sharedArr = [...sharedDefs].sort();
+    if (sharedArr.length > 0) {
+      buckets.push({ label: "Shared", defs: sharedArr });
+    }
+
+    // Nested bucket: definitions not in roots at all
+    const nestedDefs = [...allDefs].filter(d => !assignedSingle.has(d) && !sharedDefs.has(d)).sort();
+    if (nestedDefs.length > 0) {
+      buckets.push({ label: "Nested", defs: nestedDefs });
+    }
+
+    return buckets;
+  });
+
+  // Map from defName to its bucket label (for search matching)
+  const defToBucket = createMemo((): Record<string, string> => {
+    const map: Record<string, string> = {};
+    for (const bucket of endpointBuckets()) {
+      for (const d of bucket.defs) {
+        map[d] = bucket.label;
+      }
+    }
+    return map;
+  });
+
   // Group array quantity configs by entity (part before the dot)
   const groupedConfigs = () => {
     const groups: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
@@ -2292,13 +2377,42 @@ function RecipeConfigStep(props: {
     return groups;
   };
 
-  // Filter by search
+  // Check if search query matches an endpoint bucket label
+  const bucketMatchesSearch = (bucketLabel: string, q: string): boolean => {
+    if (!q) return true;
+    return bucketLabel.toLowerCase().includes(q);
+  };
+
+  // Filter by search — also match endpoint paths
   const filteredPools = () => {
     const q = props.configSearch().toLowerCase();
     const entries = Object.entries(props.recipeSharedPools());
-    const filtered = q ? entries.filter(([e]) => e.toLowerCase().includes(q)) : entries;
+    const filtered = q ? entries.filter(([e]) => {
+      const bucket = defToBucket()[e] || "";
+      return e.toLowerCase().includes(q) || bucket.toLowerCase().includes(q);
+    }) : entries;
     if (props.configShowNonDefault()) return filtered.filter(([_, c]) => !c.is_shared || c.pool_size !== 10);
     return filtered;
+  };
+
+  // Group filtered pools by endpoint bucket
+  const poolsByBucket = () => {
+    const pools = filteredPools();
+    const poolMap = new Map(pools);
+    const buckets = endpointBuckets();
+    const result: { label: string; pools: [string, { is_shared: boolean; pool_size: number }][] }[] = [];
+    for (const bucket of buckets) {
+      const bucketPools: [string, { is_shared: boolean; pool_size: number }][] = [];
+      for (const def of bucket.defs) {
+        if (poolMap.has(def)) {
+          bucketPools.push([def, poolMap.get(def)!]);
+        }
+      }
+      if (bucketPools.length > 0) {
+        result.push({ label: bucket.label, pools: bucketPools });
+      }
+    }
+    return result;
   };
 
   const filteredConfigGroups = () => {
@@ -2306,9 +2420,30 @@ function RecipeConfigStep(props: {
     const groups = groupedConfigs();
     const result: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
     for (const [entity, items] of Object.entries(groups)) {
-      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+      const bucket = defToBucket()[entity] || "";
+      const matchesBucket = bucketMatchesSearch(bucket, q);
+      const matching = items.filter(i => !q || matchesBucket || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
       const visible = props.configShowNonDefault() ? matching.filter(i => i.config.min !== 1 || i.config.max !== 3) : matching;
       if (visible.length > 0) result[entity] = visible;
+    }
+    return result;
+  };
+
+  // Group filtered config groups by endpoint bucket
+  const configsByBucket = () => {
+    const configs = filteredConfigGroups();
+    const buckets = endpointBuckets();
+    const result: { label: string; entities: [string, { key: string; config: { min: number; max: number } }[]][] }[] = [];
+    for (const bucket of buckets) {
+      const entities: [string, { key: string; config: { min: number; max: number } }[]][] = [];
+      for (const def of bucket.defs) {
+        if (configs[def]) {
+          entities.push([def, configs[def]]);
+        }
+      }
+      if (entities.length > 0) {
+        result.push({ label: bucket.label, entities });
+      }
     }
     return result;
   };
@@ -2337,20 +2472,47 @@ function RecipeConfigStep(props: {
     const groups = groupedRules();
     const result: typeof groups = {};
     for (const [entity, items] of Object.entries(groups)) {
-      const matching = items.filter(i => !q || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
+      const bucket = defToBucket()[entity] || "";
+      const matchesBucket = bucketMatchesSearch(bucket, q);
+      const matching = items.filter(i => !q || matchesBucket || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
       const visible = props.configShowNonDefault() ? matching.filter(i => i.strategy !== "auto") : matching;
       if (visible.length > 0) result[entity] = visible;
     }
     return result;
   };
 
-  // Collapsed state for entity groups
+  // Group filtered rule groups by endpoint bucket
+  const rulesByBucket = () => {
+    const rules = filteredRuleGroups();
+    const buckets = endpointBuckets();
+    const result: { label: string; entities: [string, { key: string; strategy: string; propType: string; format: string | null }[]][] }[] = [];
+    for (const bucket of buckets) {
+      const entities: [string, { key: string; strategy: string; propType: string; format: string | null }[]][] = [];
+      for (const def of bucket.defs) {
+        if (rules[def]) {
+          entities.push([def, rules[def]]);
+        }
+      }
+      if (entities.length > 0) {
+        result.push({ label: bucket.label, entities });
+      }
+    }
+    return result;
+  };
+
+  // Collapsed state for endpoint and entity groups (ep: prefix for endpoint-level)
   const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
-  const toggleGroup = (entity: string) => {
+  const toggleGroup = (key: string) => {
     const s = new Set(collapsedGroups());
-    if (s.has(entity)) s.delete(entity); else s.add(entity);
+    if (s.has(key)) s.delete(key); else s.add(key);
     setCollapsedGroups(s);
   };
+
+  // Reset collapse state when entityGraph changes
+  createEffect(() => {
+    props.entityGraph();
+    setCollapsedGroups(new Set());
+  });
 
   return (
     <div>
@@ -2374,7 +2536,7 @@ function RecipeConfigStep(props: {
       <Show when={hasAnything()}>
         <input
           type="text"
-          placeholder="Search pools, properties, and rules..."
+          placeholder="Search endpoints, pools, properties, and rules..."
           value={props.configSearch()}
           onInput={(e) => props.setConfigSearch(e.currentTarget.value)}
           class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
@@ -2404,26 +2566,45 @@ function RecipeConfigStep(props: {
               />
             </div>
           </div>
-          <div class="space-y-1">
-            <For each={filteredPools()}>
-              {([entity, config]) => (
-                <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md">
-                  <input type="checkbox" checked={config.is_shared}
-                    class="accent-blue-500 rounded"
-                    onChange={(e) => {
-                      const pools = { ...props.recipeSharedPools() };
-                      pools[entity] = { ...pools[entity], is_shared: e.target.checked };
-                      props.setRecipeSharedPools(pools);
-                    }} />
-                  <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
-                  <input type="number" min="1" max="100" value={config.pool_size}
-                    class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                    onInput={(e) => {
-                      const pools = { ...props.recipeSharedPools() };
-                      pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
-                      props.setRecipeSharedPools(pools);
-                    }} />
-                  <span class="text-xs text-gray-600 w-14">instances</span>
+          <div class="space-y-2">
+            <For each={poolsByBucket()}>
+              {(bucket) => (
+                <div class="rounded-md overflow-hidden">
+                  <button
+                    data-testid="endpoint-group-header"
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
+                    onClick={() => toggleGroup(`ep:pools:${bucket.label}`)}
+                  >
+                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:pools:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
+                    <span class="font-mono text-xs">{bucket.label}</span>
+                    <span class="text-xs text-gray-600 ml-auto">{bucket.pools.length} {bucket.pools.length === 1 ? "entity" : "entities"}</span>
+                  </button>
+                  <Show when={!collapsedGroups().has(`ep:pools:${bucket.label}`)}>
+                    <div class="space-y-1 py-1">
+                      <For each={bucket.pools}>
+                        {([entity, config]) => (
+                          <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-3">
+                            <input type="checkbox" checked={config.is_shared}
+                              class="accent-blue-500 rounded"
+                              onChange={(e) => {
+                                const pools = { ...props.recipeSharedPools() };
+                                pools[entity] = { ...pools[entity], is_shared: e.target.checked };
+                                props.setRecipeSharedPools(pools);
+                              }} />
+                            <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
+                            <input type="number" min="1" max="100" value={config.pool_size}
+                              class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                              onInput={(e) => {
+                                const pools = { ...props.recipeSharedPools() };
+                                pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
+                                props.setRecipeSharedPools(pools);
+                              }} />
+                            <span class="text-xs text-gray-600 w-14">instances</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
                 </div>
               )}
             </For>
@@ -2431,7 +2612,7 @@ function RecipeConfigStep(props: {
         </div>
       </Show>
 
-      {/* Array Quantity Ranges — grouped by entity */}
+      {/* Array Quantity Ranges — grouped by endpoint then entity */}
       <Show when={hasConfigs() && Object.keys(filteredConfigGroups()).length > 0}>
         <div class="mb-6">
           <div class="flex items-center justify-between mb-2">
@@ -2469,45 +2650,64 @@ function RecipeConfigStep(props: {
               />
             </div>
           </div>
-          <div class="space-y-1">
-            <For each={Object.entries(filteredConfigGroups()).sort(([a], [b]) => a.localeCompare(b))}>
-              {([entity, items]) => (
+          <div class="space-y-2">
+            <For each={configsByBucket()}>
+              {(bucket) => (
                 <div class="rounded-md overflow-hidden">
                   <button
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                    onClick={() => toggleGroup(entity)}
+                    data-testid="endpoint-group-header"
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
+                    onClick={() => toggleGroup(`ep:configs:${bucket.label}`)}
                   >
-                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>▶</span>
-                    <span class="font-medium">{entity}</span>
-                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
+                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:configs:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
+                    <span class="font-mono text-xs">{bucket.label}</span>
+                    <span class="text-xs text-gray-600 ml-auto">{bucket.entities.length} {bucket.entities.length === 1 ? "entity" : "entities"}</span>
                   </button>
-                  <Show when={!collapsedGroups().has(entity)}>
-                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                      <For each={items}>
-                        {(item) => {
-                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                          return (
-                            <div class="flex items-center gap-3 px-3 py-1.5">
-                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                              <input type="number" min="0" max="50" value={item.config.min}
-                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                onInput={(e) => {
-                                  const configs = { ...props.recipeQuantityConfigs() };
-                                  configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
-                                  props.setRecipeQuantityConfigs(configs);
-                                }} />
-                              <span class="text-gray-600 text-xs">–</span>
-                              <input type="number" min="1" max="50" value={item.config.max}
-                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                onInput={(e) => {
-                                  const configs = { ...props.recipeQuantityConfigs() };
-                                  configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
-                                  props.setRecipeQuantityConfigs(configs);
-                                }} />
-                              <span class="text-[10px] text-gray-600 w-10">items</span>
-                            </div>
-                          );
-                        }}
+                  <Show when={!collapsedGroups().has(`ep:configs:${bucket.label}`)}>
+                    <div class="space-y-1 ml-3">
+                      <For each={bucket.entities}>
+                        {([entity, items]) => (
+                          <div class="rounded-md overflow-hidden">
+                            <button
+                              class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                              onClick={() => toggleGroup(entity)}
+                            >
+                              <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity) ? "" : "rotate-90"}`}>&#9654;</span>
+                              <span class="font-medium">{entity}</span>
+                              <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
+                            </button>
+                            <Show when={!collapsedGroups().has(entity)}>
+                              <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                <For each={items}>
+                                  {(item) => {
+                                    const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                    return (
+                                      <div class="flex items-center gap-3 px-3 py-1.5">
+                                        <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                        <input type="number" min="0" max="50" value={item.config.min}
+                                          class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                          onInput={(e) => {
+                                            const configs = { ...props.recipeQuantityConfigs() };
+                                            configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
+                                            props.setRecipeQuantityConfigs(configs);
+                                          }} />
+                                        <span class="text-gray-600 text-xs">–</span>
+                                        <input type="number" min="1" max="50" value={item.config.max}
+                                          class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                          onInput={(e) => {
+                                            const configs = { ...props.recipeQuantityConfigs() };
+                                            configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
+                                            props.setRecipeQuantityConfigs(configs);
+                                          }} />
+                                        <span class="text-[10px] text-gray-600 w-10">items</span>
+                                      </div>
+                                    );
+                                  }}
+                                </For>
+                              </div>
+                            </Show>
+                          </div>
+                        )}
                       </For>
                     </div>
                   </Show>
@@ -2518,7 +2718,7 @@ function RecipeConfigStep(props: {
         </div>
       </Show>
 
-      {/* Field Generation Rules — grouped by entity */}
+      {/* Field Generation Rules — grouped by endpoint then entity */}
       <Show when={hasRules() && Object.keys(filteredRuleGroups()).length > 0}>
         <div class="mb-6">
           <div class="flex items-center justify-between mb-2">
@@ -2545,43 +2745,62 @@ function RecipeConfigStep(props: {
               </select>
             </div>
           </div>
-          <div class="space-y-1">
-            <For each={Object.entries(filteredRuleGroups()).sort(([a], [b]) => a.localeCompare(b))}>
-              {([entity, items]) => (
+          <div class="space-y-2">
+            <For each={rulesByBucket()}>
+              {(bucket) => (
                 <div class="rounded-md overflow-hidden">
                   <button
-                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                    onClick={() => toggleGroup(entity + "_rules")}
+                    data-testid="endpoint-group-header"
+                    class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors border-b border-gray-800/50"
+                    onClick={() => toggleGroup(`ep:rules:${bucket.label}`)}
                   >
-                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
-                    <span class="font-medium">{entity}</span>
-                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
+                    <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(`ep:rules:${bucket.label}`) ? "" : "rotate-90"}`}>&#9654;</span>
+                    <span class="font-mono text-xs">{bucket.label}</span>
+                    <span class="text-xs text-gray-600 ml-auto">{bucket.entities.length} {bucket.entities.length === 1 ? "entity" : "entities"}</span>
                   </button>
-                  <Show when={!collapsedGroups().has(entity + "_rules")}>
-                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                      <For each={items}>
-                        {(item) => {
-                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                          return (
-                            <div class="flex items-center gap-3 px-3 py-1.5">
-                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
-                              <select
-                                value={item.strategy}
-                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                onChange={(e) => {
-                                  const rules = { ...props.recipeFakerRules() };
-                                  rules[item.key] = e.target.value;
-                                  props.setRecipeFakerRules(rules);
-                                }}
-                              >
-                                <For each={FAKER_STRATEGIES}>
-                                  {(s) => <option value={s}>{s}</option>}
+                  <Show when={!collapsedGroups().has(`ep:rules:${bucket.label}`)}>
+                    <div class="space-y-1 ml-3">
+                      <For each={bucket.entities}>
+                        {([entity, items]) => (
+                          <div class="rounded-md overflow-hidden">
+                            <button
+                              class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
+                              onClick={() => toggleGroup(entity + "_rules")}
+                            >
+                              <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(entity + "_rules") ? "" : "rotate-90"}`}>&#9654;</span>
+                              <span class="font-medium">{entity}</span>
+                              <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
+                            </button>
+                            <Show when={!collapsedGroups().has(entity + "_rules")}>
+                              <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
+                                <For each={items}>
+                                  {(item) => {
+                                    const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                                    return (
+                                      <div class="flex items-center gap-3 px-3 py-1.5">
+                                        <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
+                                        <select
+                                          value={item.strategy}
+                                          class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                          onChange={(e) => {
+                                            const rules = { ...props.recipeFakerRules() };
+                                            rules[item.key] = e.target.value;
+                                            props.setRecipeFakerRules(rules);
+                                          }}
+                                        >
+                                          <For each={FAKER_STRATEGIES}>
+                                            {(s) => <option value={s}>{s}</option>}
+                                          </For>
+                                        </select>
+                                      </div>
+                                    );
+                                  }}
                                 </For>
-                              </select>
-                            </div>
-                          );
-                        }}
+                              </div>
+                            </Show>
+                          </div>
+                        )}
                       </For>
                     </div>
                   </Show>

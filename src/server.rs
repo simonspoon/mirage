@@ -83,7 +83,7 @@ fn truncate_for_log(s: &str) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = String::with_capacity(end + 32);
+    let mut out = String::with_capacity(end + 48);
     out.push_str(&s[..end]);
     out.push_str(&format!("[truncated: {total} bytes total]"));
     out
@@ -2035,7 +2035,7 @@ async fn logging_middleware(
     // forward the response with an empty body (matching the prior failure
     // mode). The 16 MB ceiling makes this branch a safeguard, not a hot
     // path; very-large responses remain a known theoretical hole.
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
     let (response_body, forward_bytes) = match axum::body::to_bytes(body, LOG_BODY_LIMIT_BYTES)
         .await
     {
@@ -2061,6 +2061,8 @@ async fn logging_middleware(
             }
             let sentinel =
                 format!("<body too large to log: exceeded {LOG_BODY_LIMIT_BYTES} bytes>");
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
             (Some(sentinel), axum::body::Bytes::new())
         }
     };
@@ -2121,11 +2123,12 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             logging_middleware,
         ))
-        // Raise axum's 2 MB default body limit for `Json`/`String`/`Bytes`
-        // extractors so admin endpoints (e.g. recipe import with a large
-        // OpenAPI spec) can accept payloads up to `LOG_BODY_LIMIT_BYTES`.
-        // The logging middleware is the first line of defense against bodies
-        // larger than that.
+        // Raise axum's 2 MB default body limit so the `Json` extractor
+        // accepts payloads up to `LOG_BODY_LIMIT_BYTES`.  Note:
+        // `DefaultBodyLimit` only sets a request extension that extractors
+        // check — it does NOT eagerly cap the body stream.  Our logging
+        // middleware calls `to_bytes` first (with the same limit), so it is
+        // the actual first line of enforcement.
         .layer(DefaultBodyLimit::max(LOG_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -3328,7 +3331,7 @@ mod tests {
         let target = 16 * 1024 * 1024 - 256 * 1024;
         let body = padded_recipe_body("Padded ~16MB", target);
         let payload = serde_json::to_string(&body).unwrap();
-        assert!(payload.len() > 8 * 1024 * 1024);
+        assert!(payload.len() > 15 * 1024 * 1024);
         assert!(payload.len() < 16 * 1024 * 1024);
         let req = Request::builder()
             .method("POST")
