@@ -1358,6 +1358,63 @@ async fn admin_delete_recipe(
     }
 }
 
+async fn admin_clone_recipe(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let conn = state.recipe_db.lock().unwrap();
+    let recipe = match crate::recipe::get_recipe(&conn, id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "recipe not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to load recipe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let clone_name = match crate::recipe::find_unique_clone_name(&conn, &recipe.name) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to compute clone name: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::recipe::create_recipe(
+        &conn,
+        &clone_name,
+        &recipe.spec_source,
+        &recipe.selected_endpoints,
+        recipe.seed_count,
+        Some(&recipe.shared_pools),
+        Some(&recipe.quantity_configs),
+        Some(&recipe.faker_rules),
+        Some(&recipe.rules),
+        Some(&recipe.frozen_rows),
+    ) {
+        Ok(new_recipe) => {
+            (StatusCode::CREATED, Json(serde_json::json!(new_recipe))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to clone recipe: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 async fn admin_update_recipe(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -2433,6 +2490,7 @@ pub fn build_router(state: AppState) -> Router {
                 .put(admin_update_recipe),
         )
         .route("/recipes/{id}/export", get(admin_export_recipe))
+        .route("/recipes/{id}/clone", post(admin_clone_recipe))
         .route("/recipes/import", post(admin_import_recipe))
         .route("/recipes/{id}/activate", post(admin_activate_recipe))
         .route(
@@ -4509,5 +4567,204 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty(), "expected empty body for 204");
+    }
+
+    // -------------------------------------------------------------------
+    // Clone recipe tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_clone_recipe_basic() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Clone
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/clone"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let cloned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cloned["name"], "My Petstore (copy)");
+        assert_ne!(cloned["id"], created["id"]);
+        assert_eq!(cloned["seed_count"], created["seed_count"]);
+        assert_eq!(cloned["spec_source"], created["spec_source"]);
+        assert_eq!(cloned["selected_endpoints"], created["selected_endpoints"]);
+        assert_eq!(cloned["shared_pools"], created["shared_pools"]);
+        assert_eq!(cloned["quantity_configs"], created["quantity_configs"]);
+        assert_eq!(cloned["faker_rules"], created["faker_rules"]);
+        assert_eq!(cloned["rules"], created["rules"]);
+        assert_eq!(cloned["frozen_rows"], created["frozen_rows"]);
+    }
+
+    #[tokio::test]
+    async fn test_clone_recipe_name_disambiguation() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Clone first time -> "(copy)"
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/clone"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let cloned1: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cloned1["name"], "My Petstore (copy)");
+
+        // Clone second time -> "(copy 2)"
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/clone"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let cloned2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cloned2["name"], "My Petstore (copy 2)");
+    }
+
+    #[tokio::test]
+    async fn test_clone_recipe_not_found() {
+        let router = setup_empty();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/99999/clone")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_clone_does_not_activate() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create and activate recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate the original
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // /pet should work
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let before: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let count_before = before.as_array().unwrap().len();
+
+        // Clone the recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/clone"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // /pet should still have the same rows (clone did not re-activate)
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let after: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            after.as_array().unwrap().len(),
+            count_before,
+            "clone should not change active mock data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clone_appears_in_list() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Clone
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/clone"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // List recipes -> should have 2
+        let req = Request::builder()
+            .uri("/_api/admin/recipes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert_eq!(arr.len(), 2);
+        let names: Vec<&str> = arr.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"My Petstore"));
+        assert!(names.contains(&"My Petstore (copy)"));
     }
 }

@@ -806,6 +806,23 @@ function App() {
     setLoading(false);
   };
 
+  const handleRecipeClone = async (id: number) => {
+    setError(null);
+    try {
+      const res = await fetch(`/_api/admin/recipes/${id}/clone`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        return;
+      }
+      await refreshRecipes();
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+  };
+
   const handleRecipeDelete = async (id: number) => {
     setError(null);
     try {
@@ -1889,6 +1906,13 @@ function App() {
                               onClick={() => handleRecipeExport(recipe.id)}
                             >
                               Export
+                            </button>
+                            <button
+                              class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors disabled:opacity-50"
+                              onClick={() => handleRecipeClone(recipe.id)}
+                              disabled={loading()}
+                            >
+                              Clone
                             </button>
                             <button
                               class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"

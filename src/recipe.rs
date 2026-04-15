@@ -209,3 +209,91 @@ pub fn delete_recipe(conn: &Connection, id: i64) -> Result<bool, rusqlite::Error
     let changes = conn.execute("DELETE FROM \"recipes\" WHERE \"id\" = ?1", [id])?;
     Ok(changes > 0)
 }
+
+/// Return a unique clone name for the given base recipe name.
+///
+/// Queries existing recipe names once via `list_recipes`, then checks
+/// candidates in-memory:  `"<name> (copy)"`, `"<name> (copy 2)"`, etc.
+pub fn find_unique_clone_name(
+    conn: &Connection,
+    base_name: &str,
+) -> Result<String, rusqlite::Error> {
+    let recipes = list_recipes(conn)?;
+    let existing: std::collections::HashSet<String> = recipes.into_iter().map(|r| r.name).collect();
+
+    let candidate = format!("{base_name} (copy)");
+    if !existing.contains(&candidate) {
+        return Ok(candidate);
+    }
+
+    let mut n = 2u64;
+    loop {
+        let candidate = format!("{base_name} (copy {n})");
+        if !existing.contains(&candidate) {
+            return Ok(candidate);
+        }
+        n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_recipe_db(&conn).unwrap();
+        conn
+    }
+
+    fn insert_recipe(conn: &Connection, name: &str) {
+        create_recipe(conn, name, "spec", "[]", 10, None, None, None, None, None).unwrap();
+    }
+
+    #[test]
+    fn test_clone_name_no_conflict() {
+        let conn = setup_db();
+        insert_recipe(&conn, "My Recipe");
+        let name = find_unique_clone_name(&conn, "My Recipe").unwrap();
+        assert_eq!(name, "My Recipe (copy)");
+    }
+
+    #[test]
+    fn test_clone_name_first_conflict() {
+        let conn = setup_db();
+        insert_recipe(&conn, "My Recipe");
+        insert_recipe(&conn, "My Recipe (copy)");
+        let name = find_unique_clone_name(&conn, "My Recipe").unwrap();
+        assert_eq!(name, "My Recipe (copy 2)");
+    }
+
+    #[test]
+    fn test_clone_name_multiple_conflicts() {
+        let conn = setup_db();
+        insert_recipe(&conn, "My Recipe");
+        insert_recipe(&conn, "My Recipe (copy)");
+        insert_recipe(&conn, "My Recipe (copy 2)");
+        insert_recipe(&conn, "My Recipe (copy 3)");
+        let name = find_unique_clone_name(&conn, "My Recipe").unwrap();
+        assert_eq!(name, "My Recipe (copy 4)");
+    }
+
+    #[test]
+    fn test_clone_name_gap_in_sequence() {
+        let conn = setup_db();
+        insert_recipe(&conn, "My Recipe");
+        insert_recipe(&conn, "My Recipe (copy)");
+        // skip (copy 2)
+        insert_recipe(&conn, "My Recipe (copy 3)");
+        let name = find_unique_clone_name(&conn, "My Recipe").unwrap();
+        assert_eq!(name, "My Recipe (copy 2)");
+    }
+
+    #[test]
+    fn test_clone_name_source_is_already_copy() {
+        let conn = setup_db();
+        insert_recipe(&conn, "My Recipe (copy)");
+        let name = find_unique_clone_name(&conn, "My Recipe (copy)").unwrap();
+        assert_eq!(name, "My Recipe (copy) (copy)");
+    }
+}
