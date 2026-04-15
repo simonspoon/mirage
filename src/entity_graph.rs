@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::parser::{SchemaObject, SwaggerSpec, collect_schema_refs};
+use crate::parser::{self, ResponseShape, SchemaObject, SwaggerSpec, collect_schema_refs};
 use crate::server::EndpointInfo;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +20,12 @@ pub struct ScalarPropInfo {
     pub format: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualRoot {
+    pub endpoint: EndpointInfo,
+    pub shape: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityGraph {
     pub nodes: Vec<String>,
@@ -28,6 +34,7 @@ pub struct EntityGraph {
     pub shared_entities: Vec<String>,
     pub array_properties: Vec<ArrayPropInfo>,
     pub scalar_properties: Vec<ScalarPropInfo>,
+    pub virtual_roots: Vec<VirtualRoot>,
 }
 
 /// Extract the root definition name from a schema's $ref (or items.$ref for arrays).
@@ -162,10 +169,21 @@ fn find_scalar_properties(
     result
 }
 
+fn shape_to_label(shape: &ResponseShape) -> String {
+    match shape {
+        ResponseShape::Primitive(t) => t.clone(),
+        ResponseShape::PrimitiveArray(t) => format!("array<{t}>"),
+        ResponseShape::FreeformObject => "object<freeform>".to_string(),
+        ResponseShape::Empty => "empty".to_string(),
+        ResponseShape::Definition(n) => n.clone(),
+    }
+}
+
 pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> EntityGraph {
     let spec_defs = spec.definitions.as_ref();
     let mut all_nodes: HashSet<String> = HashSet::new();
     let mut roots: HashMap<String, Vec<EndpointInfo>> = HashMap::new();
+    let mut virtual_roots: Vec<VirtualRoot> = Vec::new();
 
     for (path, method) in selected {
         let path_item = match spec.paths.get(path.as_str()) {
@@ -226,6 +244,23 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
                     && !endpoint_roots.contains(&name)
                 {
                     endpoint_roots.push(name);
+                }
+            }
+        }
+
+        // If no definition-based roots found, check for virtual root
+        if endpoint_roots.is_empty() {
+            let shape = parser::primary_response_shape(op);
+            match shape {
+                ResponseShape::Definition(_) | ResponseShape::Empty => {}
+                _ => {
+                    virtual_roots.push(VirtualRoot {
+                        endpoint: EndpointInfo {
+                            method: method.clone(),
+                            path: path.clone(),
+                        },
+                        shape: shape_to_label(&shape),
+                    });
                 }
             }
         }
@@ -301,6 +336,11 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         children.sort();
     }
 
+    // Sort virtual_roots by (path, method)
+    virtual_roots.sort_by(|a, b| {
+        (&a.endpoint.path, &a.endpoint.method).cmp(&(&b.endpoint.path, &b.endpoint.method))
+    });
+
     EntityGraph {
         nodes,
         roots,
@@ -308,6 +348,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         shared_entities,
         array_properties,
         scalar_properties,
+        virtual_roots,
     }
 }
 
@@ -347,6 +388,7 @@ mod tests {
         assert_eq!(graph.array_properties[0].prop_name, "tags");
         assert_eq!(graph.array_properties[0].target_def, "Tag");
         // photoUrls is a primitive array (string) -> should NOT appear
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -362,6 +404,7 @@ mod tests {
             "Category should have no outbound edges"
         );
         assert!(tag_edges.is_empty(), "Tag should have no outbound edges");
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -374,6 +417,7 @@ mod tests {
         assert!(graph.edges.is_empty());
         assert!(graph.shared_entities.is_empty());
         assert!(graph.array_properties.is_empty());
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -385,6 +429,7 @@ mod tests {
         assert!(graph.nodes.contains(&"Pet".to_string()));
         assert!(graph.nodes.contains(&"Category".to_string()));
         assert!(graph.nodes.contains(&"Tag".to_string()));
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -400,6 +445,7 @@ mod tests {
         assert_eq!(pet_roots.len(), 2);
         // Still only 3 unique nodes
         assert_eq!(graph.nodes.len(), 3);
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -409,6 +455,7 @@ mod tests {
         let graph = build_entity_graph(&spec, &selected);
         assert!(graph.nodes.is_empty());
         assert!(graph.roots.is_empty());
+        assert!(graph.virtual_roots.is_empty());
     }
 
     #[test]
@@ -465,5 +512,97 @@ definitions:
         assert!(graph.nodes.contains(&"A".to_string()));
         assert!(graph.nodes.contains(&"B".to_string()));
         assert_eq!(graph.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_graph_primitive_array_virtual_root() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Array Test
+  version: "1.0"
+paths:
+  /numbers:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: array
+            items:
+              type: integer
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/numbers".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.virtual_roots.len(), 1);
+        assert_eq!(graph.virtual_roots[0].shape, "array<integer>");
+        assert!(graph.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_graph_scalar_virtual_root() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Scalar Test
+  version: "1.0"
+paths:
+  /name:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/name".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.virtual_roots.len(), 1);
+        assert_eq!(graph.virtual_roots[0].shape, "string");
+    }
+
+    #[test]
+    fn test_graph_freeform_object_virtual_root() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Freeform Test
+  version: "1.0"
+paths:
+  /data:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: object
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/data".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.virtual_roots.len(), 1);
+        assert_eq!(graph.virtual_roots[0].shape, "object<freeform>");
+    }
+
+    #[test]
+    fn test_graph_empty_response() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Empty Test
+  version: "1.0"
+paths:
+  /ping:
+    get:
+      responses:
+        "200":
+          description: ok
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/ping".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(graph.virtual_roots.is_empty());
     }
 }

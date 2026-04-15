@@ -2069,7 +2069,7 @@ async fn admin_graph_current(State(state): State<AppState>) -> impl IntoResponse
     let raw_spec = match &reg.raw_spec {
         Some(s) => s,
         None => {
-            return Json(serde_json::json!({"nodes":[],"edges":{},"shared_entities":[],"roots":{},"array_properties":[]})).into_response();
+            return Json(serde_json::json!({"nodes":[],"edges":{},"shared_entities":[],"roots":{},"array_properties":[],"virtual_roots":[]})).into_response();
         }
     };
     let selected: Vec<(String, String)> = if reg.endpoints.is_empty() {
