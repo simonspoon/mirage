@@ -1,6 +1,6 @@
 import { render } from "solid-js/web";
 import type { Accessor, Setter } from "solid-js";
-import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo } from "solid-js";
+import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
 import "./index.css";
 import ForceGraph from "./ForceGraph";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
@@ -207,6 +207,10 @@ function App() {
   const [schemaGraph, setSchemaGraph] = createSignal<any>(null);
   const [schemaGraphGroupBy, setSchemaGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
   const [schemaGraphHopDepth, setSchemaGraphHopDepth] = createSignal(1);
+
+  // Progressive exploration graph state
+  const [graphFocused, setGraphFocused] = createSignal<string | null>(null);
+  const [graphExpanded, setGraphExpanded] = createSignal<Set<string>>(new Set());
 
   onMount(async () => {
     try {
@@ -999,11 +1003,22 @@ function App() {
       setLastSelectedEntity(name);
       if (!expandedDefs().has(name)) toggleDef(name);
     }
+    // Progressive exploration: focus the clicked entity in the graph (only on select, not deselect)
+    if (!wasSelected && graphFocused() !== name) {
+      batch(() => {
+        setGraphFocused(name);
+        setGraphExpanded(new Set<string>());
+      });
+    }
   };
 
   const collapseGraph = () => {
-    setSelectedEntities(new Set<string>());
-    setLastSelectedEntity(null);
+    batch(() => {
+      setSelectedEntities(new Set<string>());
+      setLastSelectedEntity(null);
+      setGraphFocused(null);
+      setGraphExpanded(new Set<string>());
+    });
   };
 
   const endpointsForDef = (defName: string) =>
@@ -1659,6 +1674,10 @@ function App() {
               selectEntity={selectEntity}
               endpointsForDef={endpointsForDef}
               typeBadgeClass={typeBadgeClass}
+              graphFocused={graphFocused}
+              setGraphFocused={setGraphFocused}
+              graphExpanded={graphExpanded}
+              setGraphExpanded={setGraphExpanded}
             />
           </Show>
 
@@ -2098,6 +2117,10 @@ function SchemasPage(props: {
   selectEntity: (name: string) => void;
   endpointsForDef: (defName: string) => RouteInfo[];
   typeBadgeClass: (type: string, isRef: boolean, isEnum: boolean) => string;
+  graphFocused: Accessor<string | null>;
+  setGraphFocused: Setter<string | null>;
+  graphExpanded: Accessor<Set<string>>;
+  setGraphExpanded: Setter<Set<string>>;
 }) {
   const graph = () => props.schemaGraph();
   const nodes = () => (graph()?.nodes || []) as string[];
@@ -2695,26 +2718,71 @@ function SchemasPage(props: {
               <Show when={rightTab() === "graph"}>
                 <div class="flex items-center justify-between mb-1">
                   <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
-                  <Show when={props.selectedEntities().size > 0}>
+                  <Show when={props.graphFocused() !== null}>
                     <button
                       class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
                       onClick={() => props.collapseGraph()}
                     >Clear</button>
                   </Show>
                 </div>
-                <Show when={props.selectedEntities().size === 0}>
+                <Show when={props.graphFocused() === null}>
                   <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center" style="height: 400px;">
                     <p class="text-sm text-gray-600">Select a schema to view its ERD box</p>
                   </div>
                 </Show>
-                <Show when={props.selectedEntities().size > 0}>
+                <Show when={props.graphFocused() !== null}>
                   {(() => {
-                    const selectedList = createMemo(() => [...props.selectedEntities()]);
+                    const focused = createMemo(() => props.graphFocused()!);
+                    const expandedSet = createMemo(() => props.graphExpanded());
+
+                    // Derive immediate neighbors (one-hop) from relationship data
+                    const immediateNeighbors = createMemo(() => {
+                      const f = focused();
+                      const defs = props.definitions();
+                      const neighbors = new Set<string>();
+
+                      // Outbound: properties and extends of the focused entity
+                      const focusedDef = defs[f];
+                      if (focusedDef) {
+                        if (focusedDef.extends && defs[focusedDef.extends] && focusedDef.extends !== f) {
+                          neighbors.add(focusedDef.extends);
+                        }
+                        for (const prop of Object.values(focusedDef.properties)) {
+                          const ref = prop.ref_name || prop.items_ref;
+                          if (ref && defs[ref] && ref !== f) neighbors.add(ref);
+                        }
+                      }
+
+                      // Inbound: other entities that reference the focused entity
+                      for (const [entityName, def] of Object.entries(defs)) {
+                        if (entityName === f) continue;
+                        if (def.extends === f) { neighbors.add(entityName); continue; }
+                        for (const prop of Object.values(def.properties)) {
+                          const ref = prop.ref_name || prop.items_ref;
+                          if (ref === f) { neighbors.add(entityName); break; }
+                        }
+                      }
+
+                      return [...neighbors];
+                    });
+
+                    // Stubs = neighbors not in expandedSet; expanded = neighbors in expandedSet
+                    const stubList = createMemo(() => {
+                      const exp = expandedSet();
+                      return immediateNeighbors().filter(n => !exp.has(n));
+                    });
+                    // All visible entities: focused + all neighbors
+                    const visibleList = createMemo(() => [focused(), ...immediateNeighbors()]);
+                    const stubSet = createMemo(() => new Set(stubList()));
+
                     const boxWidth = 260;
                     const boxSpacing = 300;
-                    const cols = () => selectedList().length > 3 ? Math.ceil(Math.sqrt(selectedList().length)) : selectedList().length;
+                    const cols = () => {
+                      const len = visibleList().length;
+                      return len > 3 ? Math.ceil(Math.sqrt(len)) : len;
+                    };
                     const svgWidth = () => cols() * boxSpacing + 40;
-                    const rowCount = () => Math.ceil(selectedList().length / cols());
+                    const rowCount = () => Math.ceil(visibleList().length / cols());
                     const svgHeight = () => Math.max(400, rowCount() * 340 + 40);
 
                     const [hoveredEdgeId, setHoveredEdgeId] = createSignal<string | null>(null);
@@ -2722,7 +2790,7 @@ function SchemasPage(props: {
                     // Compute position map for each entity
                     const entityPositions = createMemo(() => {
                       const positions: Record<string, { x: number; y: number }> = {};
-                      const list = selectedList();
+                      const list = visibleList();
                       const c = cols();
                       for (let i = 0; i < list.length; i++) {
                         positions[list[i]] = {
@@ -2745,7 +2813,7 @@ function SchemasPage(props: {
 
                     // Compute edges between visible entities
                     const graphEdges = createMemo(() => {
-                      const list = selectedList();
+                      const list = visibleList();
                       const visibleSet = new Set(list);
                       const defs = props.definitions();
                       const edgeList: EdgeInfo[] = [];
@@ -2794,6 +2862,21 @@ function SchemasPage(props: {
                       return edgeList;
                     });
 
+                    // Click handlers
+                    const handleStubClick = (entityName: string) => {
+                      const next = new Set(props.graphExpanded());
+                      next.add(entityName);
+                      props.setGraphExpanded(next);
+                      setHoveredEdgeId(null);
+                    };
+
+                    const handleExpandedNeighborClick = (entityName: string) => {
+                      const next = new Set(props.graphExpanded());
+                      next.delete(entityName);
+                      props.setGraphExpanded(next);
+                      setHoveredEdgeId(null);
+                    };
+
                     return (
                       <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-auto" style="height: 400px;">
                         <svg width={svgWidth()} height={svgHeight()} xmlns="http://www.w3.org/2000/svg">
@@ -2801,94 +2884,122 @@ function SchemasPage(props: {
                           <g data-relationship-edges>
                             <For each={graphEdges()}>
                               {(edge) => {
-                                const positions = entityPositions();
-                                const sourcePos = positions[edge.source];
-                                const targetPos = positions[edge.target];
-                                if (!sourcePos || !targetPos) return null;
+                                // Use reactive getters so SolidJS tracks stubSet()/entityPositions() as dependencies
+                                const sourcePos = () => entityPositions()[edge.source];
+                                const targetPos = () => entityPositions()[edge.target];
 
-                                // Source Y: field row position
-                                const fieldRowOffset = edge.hasExtends ? edge.sourceFieldIndex + 1 : edge.sourceFieldIndex;
-                                // For extends pseudo-row, sourceFieldIndex is 0 and hasExtends is true, so fieldRowOffset becomes 0
-                                const effectiveRow = edge.sourceField === "extends" ? 0 : fieldRowOffset;
-                                const sy = sourcePos.y + HEADER_HEIGHT + (effectiveRow + 0.5) * ROW_HEIGHT;
-                                const sx = sourcePos.x + boxWidth;
+                                // Source Y: field row position, or HEADER_HEIGHT/2 if collapsed
+                                const sy = () => {
+                                  const pos = sourcePos();
+                                  if (!pos) return 0;
+                                  if (stubSet().has(edge.source)) {
+                                    return pos.y + HEADER_HEIGHT / 2;
+                                  }
+                                  const fieldRowOffset = edge.hasExtends ? edge.sourceFieldIndex + 1 : edge.sourceFieldIndex;
+                                  const effectiveRow = edge.sourceField === "extends" ? 0 : fieldRowOffset;
+                                  return pos.y + HEADER_HEIGHT + (effectiveRow + 0.5) * ROW_HEIGHT;
+                                };
+                                const sx = () => {
+                                  const pos = sourcePos();
+                                  return pos ? pos.x + boxWidth : 0;
+                                };
 
-                                // Target Y: header center, staggered for fan-in
-                                const allEdgesToTarget = graphEdges().filter(e => e.target === edge.target);
-                                const fanIdx = allEdgesToTarget.indexOf(edge);
-                                const fanCount = allEdgesToTarget.length;
-                                const stagger = fanCount > 1 ? (fanIdx - (fanCount - 1) / 2) * 6 : 0;
-                                const ty = targetPos.y + HEADER_HEIGHT / 2 + stagger;
-                                const tx = targetPos.x;
+                                // Target Y: header center (staggered for fan-in), or HEADER_HEIGHT/2 if collapsed
+                                const ty = () => {
+                                  const pos = targetPos();
+                                  if (!pos) return 0;
+                                  if (stubSet().has(edge.target)) {
+                                    return pos.y + HEADER_HEIGHT / 2;
+                                  }
+                                  const allEdgesToTarget = graphEdges().filter(e => e.target === edge.target);
+                                  const fanIdx = allEdgesToTarget.indexOf(edge);
+                                  const fanCount = allEdgesToTarget.length;
+                                  const stagger = fanCount > 1 ? (fanIdx - (fanCount - 1) / 2) * 6 : 0;
+                                  return pos.y + HEADER_HEIGHT / 2 + stagger;
+                                };
+                                const tx = () => {
+                                  const pos = targetPos();
+                                  return pos ? pos.x : 0;
+                                };
 
                                 // Elbow connector: horizontal out, vertical bend, horizontal in
-                                const midX = (sx + tx) / 2;
-                                const d = `M ${sx} ${sy} H ${midX} V ${ty} H ${tx}`;
+                                const d = () => {
+                                  const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
+                                  const midX = (_sx + _tx) / 2;
+                                  return `M ${_sx} ${_sy} H ${midX} V ${_ty} H ${_tx}`;
+                                };
 
                                 const isHovered = () => hoveredEdgeId() === edge.id;
+                                const hasPositions = () => sourcePos() && targetPos();
 
                                 return (
-                                  <g>
-                                    {/* Wider invisible hit area */}
-                                    <path
-                                      d={d}
-                                      fill="none"
-                                      stroke="transparent"
-                                      stroke-width={12}
-                                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
-                                      onMouseLeave={() => setHoveredEdgeId(null)}
-                                    />
-                                    {/* Visible path */}
-                                    <path
-                                      d={d}
-                                      fill="none"
-                                      stroke={isHovered() ? "#60a5fa" : "#4b5563"}
-                                      stroke-width={isHovered() ? 2 : 1}
-                                      stroke-dasharray={edge.cardinality === "1:N" ? "none" : "none"}
-                                      data-relationship-line
-                                      data-source-entity={edge.source}
-                                      data-source-field={edge.sourceField}
-                                      data-target-entity={edge.target}
-                                      data-cardinality={edge.cardinality}
-                                      data-edge-id={edge.id}
-                                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
-                                      onMouseLeave={() => setHoveredEdgeId(null)}
-                                    />
-                                    {/* Cardinality label near source */}
-                                    <text
-                                      x={sx + 6}
-                                      y={sy - 6}
-                                      fill={isHovered() ? "#93c5fd" : "#6b7280"}
-                                      font-size="10"
-                                      font-family="ui-monospace, monospace"
-                                    >1</text>
-                                    {/* Cardinality label near target */}
-                                    <text
-                                      x={tx - 14}
-                                      y={ty - 6}
-                                      fill={isHovered() ? "#93c5fd" : "#6b7280"}
-                                      font-size="10"
-                                      font-family="ui-monospace, monospace"
-                                      text-anchor="end"
-                                    >{edge.cardinality === "1:N" ? "N" : "1"}</text>
-                                    {/* Arrow marker at target end */}
-                                    <polygon
-                                      points={`${tx},${ty} ${tx - 6},${ty - 3} ${tx - 6},${ty + 3}`}
-                                      fill={isHovered() ? "#60a5fa" : "#4b5563"}
-                                    />
-                                  </g>
+                                  <Show when={hasPositions()}>
+                                    <g>
+                                      {/* Wider invisible hit area */}
+                                      <path
+                                        d={d()}
+                                        fill="none"
+                                        stroke="transparent"
+                                        stroke-width={12}
+                                        onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                                        onMouseLeave={() => setHoveredEdgeId(null)}
+                                      />
+                                      {/* Visible path */}
+                                      <path
+                                        d={d()}
+                                        fill="none"
+                                        stroke={isHovered() ? "#60a5fa" : "#4b5563"}
+                                        stroke-width={isHovered() ? 2 : 1}
+                                        stroke-dasharray="none"
+                                        data-relationship-line
+                                        data-source-entity={edge.source}
+                                        data-source-field={edge.sourceField}
+                                        data-target-entity={edge.target}
+                                        data-cardinality={edge.cardinality}
+                                        data-edge-id={edge.id}
+                                        onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                                        onMouseLeave={() => setHoveredEdgeId(null)}
+                                      />
+                                      {/* Cardinality label near source */}
+                                      <text
+                                        x={sx() + 6}
+                                        y={sy() - 6}
+                                        fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                        font-size="10"
+                                        font-family="ui-monospace, monospace"
+                                      >1</text>
+                                      {/* Cardinality label near target */}
+                                      <text
+                                        x={tx() - 14}
+                                        y={ty() - 6}
+                                        fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                        font-size="10"
+                                        font-family="ui-monospace, monospace"
+                                        text-anchor="end"
+                                      >{edge.cardinality === "1:N" ? "N" : "1"}</text>
+                                      {/* Arrow marker at target end */}
+                                      <polygon
+                                        points={`${tx()},${ty()} ${tx() - 6},${ty() - 3} ${tx() - 6},${ty() + 3}`}
+                                        fill={isHovered() ? "#60a5fa" : "#4b5563"}
+                                      />
+                                    </g>
+                                  </Show>
                                 );
                               }}
                             </For>
                           </g>
                           {/* Entity boxes */}
-                          <For each={selectedList()}>
+                          <For each={visibleList()}>
                             {(entityName, idx) => {
                               const def = () => props.definitions()[entityName];
                               const col = () => idx() % cols();
                               const row = () => Math.floor(idx() / cols());
                               const xPos = () => 20 + col() * boxSpacing;
                               const yPos = () => 20 + row() * 320;
+
+                              const isFocused = () => entityName === focused();
+                              const isStub = () => stubSet().has(entityName);
+                              const isExpandedNeighbor = () => !isFocused() && !isStub();
 
                               // Check if any hovered edge involves this entity
                               const isHighlighted = () => {
@@ -2899,18 +3010,26 @@ function SchemasPage(props: {
                                 return edge.source === entityName || edge.target === entityName;
                               };
 
+                              const boxTotalHeight = () => {
+                                if (isStub()) return HEADER_HEIGHT;
+                                const d = def();
+                                if (!d) return HEADER_HEIGHT;
+                                const rowCt = Object.keys(d.properties).length + (d.extends ? 1 : 0) || 1;
+                                return HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+                              };
+
                               return (
                                 <Show when={def()}>
-                                  <g data-entity-highlighted={isHighlighted() ? "true" : undefined}>
+                                  <g
+                                    data-entity-highlighted={isHighlighted() ? "true" : undefined}
+                                    {...(isStub() ? { "data-neighbor-stub": "true", "data-entity-name": entityName } : {})}
+                                  >
                                     <Show when={isHighlighted()}>
                                       <rect
                                         x={xPos() - 2}
                                         y={yPos() - 2}
                                         width={boxWidth + 4}
-                                        height={HEADER_HEIGHT + Math.min(
-                                          Object.keys(def()?.properties || {}).length + (def()?.extends ? 1 : 0) || 1,
-                                          10
-                                        ) * ROW_HEIGHT + 4}
+                                        height={boxTotalHeight() + 4}
                                         rx={6}
                                         ry={6}
                                         fill="none"
@@ -2926,6 +3045,14 @@ function SchemasPage(props: {
                                       x={xPos()}
                                       y={yPos()}
                                       width={boxWidth}
+                                      collapsed={isStub()}
+                                      onHeaderClick={
+                                        isStub()
+                                          ? () => handleStubClick(entityName)
+                                          : isExpandedNeighbor()
+                                          ? () => handleExpandedNeighborClick(entityName)
+                                          : undefined
+                                      }
                                       onSelectRef={(refName) => props.selectEntity(refName)}
                                     />
                                   </g>
@@ -3283,7 +3410,7 @@ function RecipeConfigStep(props: {
   // Reset collapse state when entityGraph changes
   createEffect(() => {
     props.entityGraph();
-    setCollapsedGroups(new Set());
+    setCollapsedGroups(new Set<string>());
   });
 
   return (

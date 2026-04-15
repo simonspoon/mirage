@@ -20,6 +20,8 @@ interface EntityBoxProps {
   width?: number;
   maxVisibleRows?: number;
   onSelectRef?: (refName: string) => void;
+  collapsed?: boolean;
+  onHeaderClick?: () => void;
 }
 
 export const ROW_HEIGHT = 24;
@@ -34,8 +36,8 @@ export default function EntityBox(props: EntityBoxProps) {
   // Row count: fields + extends pseudo-row (if any) + "No properties" empty-state row (if nothing else)
   const totalRows = () => entries().length + (hasExtends() ? 1 : 0) + (entries().length === 0 && !hasExtends() ? 1 : 0);
   const visibleRows = () => Math.min(totalRows(), maxRows());
-  const bodyHeight = () => visibleRows() * ROW_HEIGHT;
-  const totalHeight = () => HEADER_HEIGHT + bodyHeight();
+  const bodyHeight = () => props.collapsed ? 0 : visibleRows() * ROW_HEIGHT;
+  const totalHeight = () => props.collapsed ? HEADER_HEIGHT : HEADER_HEIGHT + bodyHeight();
 
   return (
     <g data-entity-box transform={`translate(${props.x}, ${props.y})`}>
@@ -45,12 +47,18 @@ export default function EntityBox(props: EntityBoxProps) {
         width={width()} height={HEADER_HEIGHT}
         rx={4} ry={4}
         fill="#1a365d"
+        pointer-events={props.onHeaderClick ? "all" : undefined}
+        cursor={props.onHeaderClick ? "pointer" : undefined}
+        onClick={(e: MouseEvent) => { if (props.onHeaderClick) { e.stopPropagation(); props.onHeaderClick(); } }}
       />
       {/* Square off bottom corners of header */}
       <rect
         x={0} y={HEADER_HEIGHT - 4}
-        width={width()} height={4}
+        width={width()} height={props.collapsed ? 0 : 4}
         fill="#1a365d"
+        pointer-events={props.onHeaderClick ? "all" : undefined}
+        cursor={props.onHeaderClick ? "pointer" : undefined}
+        onClick={(e: MouseEvent) => { if (props.onHeaderClick) { e.stopPropagation(); props.onHeaderClick(); } }}
       />
       {/* Header text */}
       <text
@@ -60,10 +68,14 @@ export default function EntityBox(props: EntityBoxProps) {
         font-size="13"
         font-weight="600"
         font-family="system-ui, -apple-system, sans-serif"
+        pointer-events={props.onHeaderClick ? "all" : undefined}
+        cursor={props.onHeaderClick ? "pointer" : undefined}
+        onClick={(e: MouseEvent) => { if (props.onHeaderClick) { e.stopPropagation(); props.onHeaderClick(); } }}
       >
         {props.name.length > 30 ? props.name.slice(0, 28) + "\u2026" : props.name}
       </text>
 
+      <Show when={!props.collapsed}>
       {/* Body background */}
       <rect
         x={0} y={HEADER_HEIGHT}
@@ -247,6 +259,7 @@ export default function EntityBox(props: EntityBoxProps) {
           </For>
         </div>
       </foreignObject>
+      </Show>
 
       {/* Outer border */}
       <rect
