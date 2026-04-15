@@ -155,6 +155,7 @@ function App() {
   const [tableLoading, setTableLoading] = createSignal(false);
   const [tableFilter, setTableFilter] = createSignal("");
   const [selectedCellValue, setSelectedCellValue] = createSignal<any>(null);
+  const [editingCell, setEditingCell] = createSignal<{rowid: string|number, col: string} | null>(null);
   const filteredTables = () => {
     const q = tableFilter().toLowerCase();
     return q ? tables().filter((t) => t.name.toLowerCase().includes(q)) : tables();
@@ -240,6 +241,7 @@ function App() {
   createEffect(() => {
     selectedTable();
     setSelectedCellValue(null);
+    setEditingCell(null);
   });
 
   const refreshLog = async () => {
@@ -324,6 +326,19 @@ function App() {
       setTableData(null);
     }
     setTableLoading(false);
+  };
+
+  const putCellValue = async (rowid: string | number, column: string, value: unknown): Promise<boolean> => {
+    try {
+      const res = await fetch(`/_api/admin/tables/${encodeURIComponent(selectedTable()!)}/${rowid}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [column]: value }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
   };
 
   const handleImport = async () => {
@@ -1383,7 +1398,7 @@ function App() {
                           <table class="w-full text-left">
                             <thead>
                               <tr class="bg-[#090e1a]">
-                                <For each={tableData()!.columns}>
+                                <For each={tableData()!.columns.filter(c => c.name !== "rowid")}>
                                   {(col) => (
                                     <th class="py-3 px-4 text-xs font-medium text-gray-500 whitespace-nowrap" title={col.name}>
                                       {humanizeColumn(col.name)}
@@ -1396,17 +1411,67 @@ function App() {
                               <For each={tableData()!.rows}>
                                 {(row) => (
                                   <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
-                                    <For each={tableData()!.columns}>
+                                    <For each={tableData()!.columns.filter(c => c.name !== "rowid")}>
                                       {(col) => {
                                         const val = row[col.name];
                                         const isComplex = typeof val === "object" && val !== null;
+                                        const editing = () => {
+                                          const ec = editingCell();
+                                          return ec !== null && ec.rowid === row.rowid && ec.col === col.name;
+                                        };
+                                        const commitEdit = async (newValue: string) => {
+                                          let coerced: unknown = newValue;
+                                          if (typeof val === "number" && newValue.trim() !== "" && !isNaN(Number(newValue))) {
+                                            coerced = Number(newValue);
+                                          } else if (typeof val === "boolean") {
+                                            if (newValue.toLowerCase() === "true") coerced = true;
+                                            else if (newValue.toLowerCase() === "false") coerced = false;
+                                          }
+                                          const ok = await putCellValue(row.rowid, col.name, coerced);
+                                          if (ok) {
+                                            setTableData(prev => {
+                                              if (!prev) return prev;
+                                              return {
+                                                ...prev,
+                                                rows: prev.rows.map(r =>
+                                                  r.rowid === row.rowid ? { ...r, [col.name]: coerced } : r
+                                                ),
+                                              };
+                                            });
+                                          }
+                                        };
                                         return (
                                           <td
                                             class={`py-2.5 px-4 font-mono text-xs whitespace-nowrap max-w-[200px] truncate ${isComplex ? "text-blue-400 underline decoration-blue-400/40 cursor-pointer hover:text-blue-300" : "text-gray-300"}`}
                                             title={rawValue(val)}
-                                            onClick={isComplex ? () => setSelectedCellValue(val) : undefined}
+                                            onClick={isComplex ? () => setSelectedCellValue(val) : !editing() ? () => setEditingCell({ rowid: row.rowid as string | number, col: col.name }) : undefined}
                                           >
-                                            {formatCell(val)}
+                                            {editing() ? (
+                                              <input
+                                                type="text"
+                                                value={rawValue(val)}
+                                                ref={(el) => setTimeout(() => el.focus(), 0)}
+                                                class="bg-[#070c17] border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-200 font-mono w-full focus:outline-none focus:border-blue-500"
+                                                onBlur={(e) => {
+                                                  if (!editingCell()) return;
+                                                  commitEdit(e.currentTarget.value);
+                                                  setEditingCell(prev =>
+                                                    prev?.rowid === row.rowid && prev?.col === col.name ? null : prev
+                                                  );
+                                                }}
+                                                onKeyDown={(e) => {
+                                                  if (e.key === "Enter") {
+                                                    commitEdit(e.currentTarget.value);
+                                                    setEditingCell(null);
+                                                  } else if (e.key === "Escape") {
+                                                    setEditingCell(null);
+                                                  }
+                                                }}
+                                                onClick={(e) => e.stopPropagation()}
+                                              />
+                                            ) : (
+                                              formatCell(val)
+                                            )}
                                           </td>
                                         );
                                       }}
