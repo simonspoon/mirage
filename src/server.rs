@@ -20,6 +20,9 @@ use crate::parser::{ResponseShape, SwaggerSpec};
 use crate::schema;
 use crate::seeder;
 
+use fake::Fake;
+use rand::RngExt;
+
 pub type Db = Arc<Mutex<rusqlite::Connection>>;
 
 #[derive(Embed)]
@@ -491,6 +494,18 @@ fn doc_delete_single(table: String, documents: Arc<RwLock<DocumentStore>>, id: S
         .into_response()
 }
 
+const PRIMITIVE_ARRAY_LEN: usize = 3;
+
+fn generate_primitive_value(t: &str) -> serde_json::Value {
+    match t {
+        "integer" => serde_json::Value::Number(rand::rng().random_range(1..1000).into()),
+        "number" => serde_json::json!(rand::rng().random_range(0.0f64..100.0)),
+        "string" => serde_json::Value::String(fake::faker::lorem::en::Word().fake()),
+        "boolean" => serde_json::Value::Bool(rand::rng().random::<bool>()),
+        _ => serde_json::Value::Null,
+    }
+}
+
 async fn catch_all_handler(
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -500,7 +515,7 @@ async fn catch_all_handler(
     let path = uri.path();
     let m = method_str(&method);
 
-    let (table, has_path_param, param_value) = {
+    let (table, has_path_param, param_value, shape) = {
         let registry = state.registry.read().unwrap();
         let mut found = None;
         for route in &registry.routes {
@@ -508,7 +523,12 @@ async fn catch_all_handler(
                 continue;
             }
             if let Some(param_value) = match_route(&route.pattern, path) {
-                found = Some((route.table.clone(), route.has_path_param, param_value));
+                found = Some((
+                    route.table.clone(),
+                    route.has_path_param,
+                    param_value,
+                    route.shape.clone(),
+                ));
                 break;
             }
         }
@@ -517,6 +537,28 @@ async fn catch_all_handler(
             None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
+
+    match shape {
+        ResponseShape::Definition(_) => { /* fall through to docs/db path below */ }
+        ResponseShape::Primitive(ref t) => {
+            return Json(generate_primitive_value(t)).into_response();
+        }
+        ResponseShape::PrimitiveArray(ref t) => {
+            return Json(
+                (0..PRIMITIVE_ARRAY_LEN)
+                    .map(|_| generate_primitive_value(t))
+                    .collect::<Vec<_>>(),
+            )
+            .into_response();
+        }
+        ResponseShape::FreeformObject => {
+            return Json(serde_json::Map::new()).into_response();
+        }
+        ResponseShape::Empty if table.is_empty() => {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        ResponseShape::Empty => { /* fall through — DELETE/POST with a backing table */ }
+    }
 
     // Check if document store has data for this definition
     let has_documents = {
@@ -4324,5 +4366,122 @@ mod tests {
         assert_eq!(pets.len(), 2);
         assert_eq!(pets[0]["name"], "Glacier");
         assert_eq!(pets[1]["name"], "Tundra");
+    }
+
+    /// Build a router with a single manually-registered route for a given shape.
+    fn setup_with_shape(method: &str, pattern: &str, shape: ResponseShape) -> Router {
+        let conn = Connection::open_in_memory().unwrap();
+        let db: Db = Arc::new(Mutex::new(conn));
+        let registry = Arc::new(RwLock::new(RouteRegistry::new()));
+        {
+            let mut reg = registry.write().unwrap();
+            reg.routes.push(RouteEntry {
+                method: method.to_string(),
+                pattern: pattern.to_string(),
+                table: String::new(),
+                has_path_param: false,
+                shape,
+            });
+        }
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+        build_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_catch_all_primitive_integer() {
+        let router = setup_with_shape(
+            "get",
+            "/health/count",
+            ResponseShape::Primitive("integer".into()),
+        );
+        let req = Request::builder()
+            .uri("/health/count")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_number(), "expected a JSON number, got {json}");
+    }
+
+    #[tokio::test]
+    async fn test_catch_all_primitive_string() {
+        let router = setup_with_shape(
+            "get",
+            "/health/name",
+            ResponseShape::Primitive("string".into()),
+        );
+        let req = Request::builder()
+            .uri("/health/name")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_string(), "expected a JSON string, got {json}");
+    }
+
+    #[tokio::test]
+    async fn test_catch_all_primitive_array_integer() {
+        let router = setup_with_shape(
+            "get",
+            "/health/counts",
+            ResponseShape::PrimitiveArray("integer".into()),
+        );
+        let req = Request::builder()
+            .uri("/health/counts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("expected a JSON array");
+        assert_eq!(arr.len(), 3, "expected 3 elements in array");
+        for item in arr {
+            assert!(
+                item.is_number(),
+                "expected a JSON number in array, got {item}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_catch_all_freeform_object() {
+        let router = setup_with_shape("get", "/health/meta", ResponseShape::FreeformObject);
+        let req = Request::builder()
+            .uri("/health/meta")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_object(), "expected a JSON object, got {json}");
+    }
+
+    #[tokio::test]
+    async fn test_catch_all_empty() {
+        let router = setup_with_shape("get", "/health/ping", ResponseShape::Empty);
+        let req = Request::builder()
+            .uri("/health/ping")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "expected empty body for 204");
     }
 }
