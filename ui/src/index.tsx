@@ -154,6 +154,7 @@ function App() {
   const [tableData, setTableData] = createSignal<TableData | null>(null);
   const [tableLoading, setTableLoading] = createSignal(false);
   const [tableFilter, setTableFilter] = createSignal("");
+  const [selectedCellValue, setSelectedCellValue] = createSignal<any>(null);
   const filteredTables = () => {
     const q = tableFilter().toLowerCase();
     return q ? tables().filter((t) => t.name.toLowerCase().includes(q)) : tables();
@@ -234,6 +235,11 @@ function App() {
     if (page() === "tables" || page() === "dashboard") {
       refreshTables();
     }
+  });
+
+  createEffect(() => {
+    selectedTable();
+    setSelectedCellValue(null);
   });
 
   const refreshLog = async () => {
@@ -1391,11 +1397,19 @@ function App() {
                                 {(row) => (
                                   <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
                                     <For each={tableData()!.columns}>
-                                      {(col) => (
-                                        <td class="py-2.5 px-4 font-mono text-xs text-gray-300 whitespace-nowrap max-w-[200px] truncate" title={rawValue(row[col.name])}>
-                                          {formatCell(row[col.name])}
-                                        </td>
-                                      )}
+                                      {(col) => {
+                                        const val = row[col.name];
+                                        const isComplex = typeof val === "object" && val !== null;
+                                        return (
+                                          <td
+                                            class={`py-2.5 px-4 font-mono text-xs whitespace-nowrap max-w-[200px] truncate ${isComplex ? "text-blue-400 underline decoration-blue-400/40 cursor-pointer hover:text-blue-300" : "text-gray-300"}`}
+                                            title={rawValue(val)}
+                                            onClick={isComplex ? () => setSelectedCellValue(val) : undefined}
+                                          >
+                                            {formatCell(val)}
+                                          </td>
+                                        );
+                                      }}
                                     </For>
                                   </tr>
                                 )}
@@ -1783,6 +1797,24 @@ function App() {
                         {entry().response_body ? tryFormatJson(entry().response_body!) : <span class="text-gray-600 italic">No body</span>}
                       </pre>
                     </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </Show>
+          <Show when={selectedCellValue()}>
+            {(cellVal) => (
+              <div class="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setSelectedCellValue(null)}>
+                <div class="absolute inset-0 bg-black/60" />
+                <div class="relative bg-[#0a1020] border border-[#141b28] rounded-xl shadow-2xl w-[90vw] max-w-3xl max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                  <div class="flex items-center justify-between px-5 py-4 border-b border-[#141b28] shrink-0">
+                    <span class="text-sm font-medium text-gray-300">{Array.isArray(cellVal()) ? "Array" : "Object"} Detail</span>
+                    <button class="text-gray-500 hover:text-gray-300 text-lg leading-none px-1" onClick={() => setSelectedCellValue(null)}>&times;</button>
+                  </div>
+                  <div class="p-5 overflow-auto min-h-0">
+                    <pre class="bg-[#070c17] rounded-lg p-4 text-xs text-gray-300 font-mono overflow-auto whitespace-pre-wrap">
+                      {(() => { try { return JSON.stringify(cellVal(), null, 2); } catch { return "Unable to display value"; } })()}
+                    </pre>
                   </div>
                 </div>
               </div>
