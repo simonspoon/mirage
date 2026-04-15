@@ -1007,7 +1007,28 @@ function App() {
     if (!wasSelected && graphFocused() !== name) {
       batch(() => {
         setGraphFocused(name);
-        setGraphExpanded(new Set<string>());
+        // Pre-populate expanded set with all immediate neighbors so they render with fields visible
+        const defs = definitions();
+        const neighbors = new Set<string>();
+        const focusedDef = defs[name];
+        if (focusedDef) {
+          if (focusedDef.extends && defs[focusedDef.extends] && focusedDef.extends !== name) {
+            neighbors.add(focusedDef.extends);
+          }
+          for (const prop of Object.values(focusedDef.properties)) {
+            const ref = prop.ref_name || prop.items_ref;
+            if (ref && defs[ref] && ref !== name) neighbors.add(ref);
+          }
+        }
+        for (const [entityName, def] of Object.entries(defs)) {
+          if (entityName === name) continue;
+          if (def.extends === name) { neighbors.add(entityName); continue; }
+          for (const prop of Object.values(def.properties)) {
+            const ref = prop.ref_name || prop.items_ref;
+            if (ref === name) { neighbors.add(entityName); break; }
+          }
+        }
+        setGraphExpanded(neighbors);
       });
     }
   };
