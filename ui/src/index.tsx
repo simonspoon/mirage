@@ -385,8 +385,11 @@ function App() {
         return;
       }
       const data = await res.json();
-      setRecipeAvailableEndpoints(data.endpoints);
-      setRecipeSelectedEndpoints(data.endpoints.map(() => true));
+      const sortedEndpoints = [...data.endpoints].sort((a: Endpoint, b: Endpoint) =>
+        a.path.localeCompare(b.path) || a.method.localeCompare(b.method)
+      );
+      setRecipeAvailableEndpoints(sortedEndpoints);
+      setRecipeSelectedEndpoints(sortedEndpoints.map(() => true));
       setRecipeStep("select");
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -673,7 +676,9 @@ function App() {
         return;
       }
       const data = await res.json();
-      const availableEps: Endpoint[] = data.endpoints;
+      const availableEps: Endpoint[] = [...data.endpoints].sort((a, b) =>
+        a.path.localeCompare(b.path) || a.method.localeCompare(b.method)
+      );
 
       // Parse selected endpoints from recipe
       let selectedEps: Endpoint[] = [];
