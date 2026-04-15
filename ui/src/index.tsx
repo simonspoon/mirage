@@ -2079,6 +2079,8 @@ function SchemasPage(props: {
   const edges = () => (graph()?.edges || {}) as Record<string, string[]>;
   const roots = () => (graph()?.roots || {}) as Record<string, { method: string; path: string }[]>;
   const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
+  const virtualRoots = () => (graph()?.virtual_roots || []) as { endpoint: { method: string; path: string }; shape: string }[];
+  const [vrCollapsed, setVrCollapsed] = createSignal(true);
   const [rightTab, setRightTab] = createSignal<"details" | "graph">("details");
 
   const filteredNodes = () => {
@@ -2443,6 +2445,70 @@ function SchemasPage(props: {
                       </div>
                     )}
                   </For>
+                </Show>
+                <Show when={virtualRoots().length > 0}>
+                  <div class="mt-3 border-t border-gray-800/50 pt-2">
+                    <button
+                      class="w-full flex items-center gap-2 px-3 py-2 text-sm text-orange-300 hover:bg-orange-900/10 transition-colors"
+                      onClick={() => setVrCollapsed(!vrCollapsed())}
+                    >
+                      <svg
+                        class={`w-3 h-3 shrink-0 transition-transform ${vrCollapsed() ? "" : "rotate-90"}`}
+                        fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+                      >
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                      </svg>
+                      <span class="text-xs font-medium uppercase tracking-wider">Endpoints without schemas</span>
+                      <span class="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded text-xs ml-auto">{virtualRoots().length}</span>
+                    </button>
+                    <Show when={!vrCollapsed()}>
+                      <div class="space-y-1 px-1 pb-2">
+                        <Show when={virtualRoots().length <= 10}>
+                          <For each={virtualRoots()}>
+                            {(vr) => (
+                              <div class="rounded-md overflow-hidden border border-gray-800/50">
+                                <div class="flex items-center gap-2 px-3 py-2 bg-orange-900/20 text-sm text-orange-300">
+                                  <span class="font-mono text-xs">{vr.endpoint.method.toUpperCase()} {vr.endpoint.path}</span>
+                                  <span class="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded text-xs ml-auto">{vr.shape}</span>
+                                </div>
+                              </div>
+                            )}
+                          </For>
+                        </Show>
+                        <Show when={virtualRoots().length > 10}>
+                          {(() => {
+                            const grouped = createMemo(() => {
+                              const groups: Record<string, typeof virtualRoots extends () => (infer T)[] ? T[] : never> = {};
+                              for (const vr of virtualRoots()) {
+                                if (!groups[vr.shape]) groups[vr.shape] = [];
+                                groups[vr.shape].push(vr);
+                              }
+                              return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
+                            });
+                            return (
+                              <For each={grouped()}>
+                                {([shape, entries]) => (
+                                  <div class="mb-2">
+                                    <div class="text-[10px] font-medium text-gray-500 px-2 py-1">{shape} ({(entries as any[]).length})</div>
+                                    <For each={entries as { endpoint: { method: string; path: string }; shape: string }[]}>
+                                      {(vr) => (
+                                        <div class="rounded-md overflow-hidden border border-gray-800/50">
+                                          <div class="flex items-center gap-2 px-3 py-2 bg-orange-900/20 text-sm text-orange-300">
+                                            <span class="font-mono text-xs">{vr.endpoint.method.toUpperCase()} {vr.endpoint.path}</span>
+                                            <span class="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded text-xs ml-auto">{vr.shape}</span>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </For>
+                                  </div>
+                                )}
+                              </For>
+                            );
+                          })()}
+                        </Show>
+                      </div>
+                    </Show>
+                  </div>
                 </Show>
               </div>
             </div>
