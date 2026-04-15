@@ -16,7 +16,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
 use crate::composer::DocumentStore;
-use crate::parser::SwaggerSpec;
+use crate::parser::{ResponseShape, SwaggerSpec};
 use crate::schema;
 use crate::seeder;
 
@@ -51,6 +51,7 @@ pub struct RouteEntry {
     pub pattern: String,
     pub table: String,
     pub has_path_param: bool,
+    pub shape: ResponseShape,
 }
 
 pub type Registry = Arc<RwLock<RouteRegistry>>;
@@ -705,10 +706,25 @@ async fn admin_routes(State(state): State<AppState>) -> Response {
         .routes
         .iter()
         .map(|r| {
+            let (kind, detail) = match &r.shape {
+                ResponseShape::Definition(name) => ("definition", Some(name.as_str())),
+                ResponseShape::Primitive(t) => ("primitive", Some(t.as_str())),
+                ResponseShape::PrimitiveArray(t) => ("primitive_array", Some(t.as_str())),
+                ResponseShape::FreeformObject => ("freeform_object", None),
+                ResponseShape::Empty => ("empty", None),
+            };
             serde_json::json!({
                 "method": r.method,
                 "path": r.pattern,
-                "definition": r.table,
+                "definition": if matches!(r.shape, ResponseShape::Definition(_)) {
+                    serde_json::Value::String(r.table.clone())
+                } else {
+                    serde_json::Value::Null
+                },
+                "shape": {
+                    "kind": kind,
+                    "detail": detail,
+                },
             })
         })
         .collect();
@@ -1025,15 +1041,19 @@ async fn admin_configure(
         .iter()
         .filter(|(path, method, _)| selected.contains(&(method.to_string(), path.to_string())))
         .map(|(path, method, _)| {
-            let table = raw_op_map
-                .get(&(*path, *method))
-                .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+            let raw_op = raw_op_map.get(&(*path, *method));
+            let shape = raw_op
+                .map(|op| crate::parser::primary_response_shape(op))
+                .unwrap_or(ResponseShape::Empty);
+            let table = raw_op
+                .and_then(|op| crate::parser::primary_response_def(op))
                 .unwrap_or_else(|| table_name_from_path(path));
             RouteEntry {
                 method: method.to_string(),
                 pattern: path.to_string(),
                 table,
                 has_path_param: path.contains('{'),
+                shape,
             }
         })
         .collect();
@@ -1056,6 +1076,7 @@ async fn admin_configure(
                 pattern: base,
                 table: route.table.clone(),
                 has_path_param: false,
+                shape: route.shape.clone(),
             });
         }
     }
@@ -1691,15 +1712,19 @@ async fn admin_activate_recipe(
         .iter()
         .filter(|(path, method, _)| selected.contains(&(method.to_string(), path.to_string())))
         .map(|(path, method, _)| {
-            let table = raw_op_map
-                .get(&(*path, *method))
-                .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+            let raw_op = raw_op_map.get(&(*path, *method));
+            let shape = raw_op
+                .map(|op| crate::parser::primary_response_shape(op))
+                .unwrap_or(ResponseShape::Empty);
+            let table = raw_op
+                .and_then(|op| crate::parser::primary_response_def(op))
                 .unwrap_or_else(|| table_name_from_path(path));
             RouteEntry {
                 method: method.to_string(),
                 pattern: path.to_string(),
                 table,
                 has_path_param: path.contains('{'),
+                shape,
             }
         })
         .collect();
@@ -1721,6 +1746,7 @@ async fn admin_activate_recipe(
                 pattern: base,
                 table: route.table.clone(),
                 has_path_param: false,
+                shape: route.shape.clone(),
             });
         }
     }
@@ -2149,9 +2175,12 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec, raw_spec: 
         .collect();
 
     for (path, method, _op) in spec.path_operations() {
-        let table = raw_op_map
-            .get(&(path, method))
-            .and_then(|raw_op| crate::parser::primary_response_def(raw_op))
+        let raw_op = raw_op_map.get(&(path, method));
+        let shape = raw_op
+            .map(|op| crate::parser::primary_response_shape(op))
+            .unwrap_or(ResponseShape::Empty);
+        let table = raw_op
+            .and_then(|op| crate::parser::primary_response_def(op))
             .unwrap_or_else(|| table_name_from_path(path));
         let has_path_param = path.contains('{');
 
@@ -2166,6 +2195,7 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec, raw_spec: 
             pattern: path.to_string(),
             table: table.clone(),
             has_path_param,
+            shape: shape.clone(),
         });
 
         // Auto-register collection GET for any table that has routes
@@ -2181,6 +2211,7 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec, raw_spec: 
                     pattern: base,
                     table: table.clone(),
                     has_path_param: false,
+                    shape: shape.clone(),
                 });
                 registered.insert(coll_key);
             }
