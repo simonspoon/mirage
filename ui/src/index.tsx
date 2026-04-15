@@ -2656,7 +2656,6 @@ function RecipeConfigStep(props: {
   const hasPools = () => Object.keys(props.recipeSharedPools()).length > 0;
   const hasConfigs = () => Object.keys(props.recipeQuantityConfigs()).length > 0;
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
-  const hasAnything = () => hasPools() || hasConfigs() || hasRules();
 
   // Invert graph.roots: defName→endpoints[] into endpointLabel→defNames[]
   // Classify definitions into single-endpoint, shared, or nested buckets
@@ -2741,6 +2740,27 @@ function RecipeConfigStep(props: {
       }
     }
     return map;
+  });
+
+  // Virtual buckets: unmapped endpoints with non-$ref response shapes
+  type VirtualBucket = { label: string; shape_label: string };
+  const virtualBuckets = createMemo((): VirtualBucket[] => {
+    const graph = props.entityGraph();
+    const vrs: { endpoint: { method: string; path: string }; shape: string }[] = graph?.virtual_roots || [];
+    const existingLabels = new Set(endpointBuckets().map(b => b.label));
+    return vrs
+      .map(vr => ({ label: `${vr.endpoint.method.toUpperCase()} ${vr.endpoint.path}`, shape_label: vr.shape }))
+      .filter(vb => !existingLabels.has(vb.label));
+  });
+
+  const hasAnything = () => hasPools() || hasConfigs() || hasRules() || virtualBuckets().length > 0;
+
+  const filteredVirtualBuckets = createMemo((): VirtualBucket[] => {
+    const q = props.configSearch().toLowerCase();
+    if (!q) return virtualBuckets();
+    return virtualBuckets().filter(vb =>
+      vb.label.toLowerCase().includes(q) || vb.shape_label.toLowerCase().includes(q)
+    );
   });
 
   // Group array quantity configs by entity (part before the dot)
@@ -3259,6 +3279,25 @@ function RecipeConfigStep(props: {
             );
           }}
         </For>
+
+        {/* Unmapped endpoints — display-only, non-$ref response shapes */}
+        <Show when={filteredVirtualBuckets().length > 0}>
+          <div class="mt-4">
+            <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-2">Unmapped Endpoints</div>
+            <div class="space-y-1">
+              <For each={filteredVirtualBuckets()}>
+                {(vb) => (
+                  <div class="rounded-md overflow-hidden border border-gray-800/50">
+                    <div class="flex items-center gap-2 px-3 py-2 bg-orange-900/20 text-sm text-orange-300">
+                      <span class="font-mono text-xs">{vb.label}</span>
+                      <span class="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded text-xs ml-auto">{vb.shape_label}</span>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          </div>
+        </Show>
       </div>
 
       {!hasAnything() && props.recipeRules().length === 0 && (
