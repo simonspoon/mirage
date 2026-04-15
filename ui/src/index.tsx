@@ -3,7 +3,7 @@ import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo } from "solid-js";
 import "./index.css";
 import ForceGraph from "./ForceGraph";
-import EntityBox from "./EntityBox";
+import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
 
 interface Endpoint {
   method: string;
@@ -2714,11 +2714,174 @@ function SchemasPage(props: {
                     const boxSpacing = 300;
                     const cols = () => selectedList().length > 3 ? Math.ceil(Math.sqrt(selectedList().length)) : selectedList().length;
                     const svgWidth = () => cols() * boxSpacing + 40;
-                    const rows = () => Math.ceil(selectedList().length / cols());
-                    const svgHeight = () => Math.max(400, rows() * 340 + 40);
+                    const rowCount = () => Math.ceil(selectedList().length / cols());
+                    const svgHeight = () => Math.max(400, rowCount() * 340 + 40);
+
+                    const [hoveredEdgeId, setHoveredEdgeId] = createSignal<string | null>(null);
+
+                    // Compute position map for each entity
+                    const entityPositions = createMemo(() => {
+                      const positions: Record<string, { x: number; y: number }> = {};
+                      const list = selectedList();
+                      const c = cols();
+                      for (let i = 0; i < list.length; i++) {
+                        positions[list[i]] = {
+                          x: 20 + (i % c) * boxSpacing,
+                          y: 20 + Math.floor(i / c) * 320,
+                        };
+                      }
+                      return positions;
+                    });
+
+                    interface EdgeInfo {
+                      id: string;
+                      source: string;
+                      sourceField: string;
+                      sourceFieldIndex: number;
+                      target: string;
+                      cardinality: "1:1" | "1:N";
+                      hasExtends: boolean;
+                    }
+
+                    // Compute edges between visible entities
+                    const graphEdges = createMemo(() => {
+                      const list = selectedList();
+                      const visibleSet = new Set(list);
+                      const defs = props.definitions();
+                      const edgeList: EdgeInfo[] = [];
+
+                      for (const entityName of list) {
+                        const def = defs[entityName];
+                        if (!def) continue;
+                        const hasExtends = !!def.extends;
+
+                        // extends pseudo-edge
+                        if (def.extends && visibleSet.has(def.extends) && def.extends !== entityName) {
+                          if (defs[def.extends]) {
+                            edgeList.push({
+                              id: `${entityName}::extends::${def.extends}`,
+                              source: entityName,
+                              sourceField: "extends",
+                              sourceFieldIndex: 0,
+                              target: def.extends,
+                              cardinality: "1:1",
+                              hasExtends: true,
+                            });
+                          }
+                        }
+
+                        // Property edges
+                        const entries = Object.entries(def.properties);
+                        for (let fi = 0; fi < entries.length; fi++) {
+                          const [fieldName, prop] = entries[fi];
+                          const refName = prop.ref_name || prop.items_ref;
+                          if (!refName) continue;
+                          if (!visibleSet.has(refName)) continue;
+                          if (refName === entityName) continue;
+                          if (!defs[refName]) continue;
+                          edgeList.push({
+                            id: `${entityName}::${fieldName}::${refName}`,
+                            source: entityName,
+                            sourceField: fieldName,
+                            sourceFieldIndex: fi,
+                            target: refName,
+                            cardinality: prop.is_array || !!prop.items_ref ? "1:N" : "1:1",
+                            hasExtends,
+                          });
+                        }
+                      }
+
+                      return edgeList;
+                    });
+
                     return (
                       <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-auto" style="height: 400px;">
                         <svg width={svgWidth()} height={svgHeight()} xmlns="http://www.w3.org/2000/svg">
+                          {/* Relationship edges (rendered before boxes for correct z-order) */}
+                          <g data-relationship-edges>
+                            <For each={graphEdges()}>
+                              {(edge) => {
+                                const positions = entityPositions();
+                                const sourcePos = positions[edge.source];
+                                const targetPos = positions[edge.target];
+                                if (!sourcePos || !targetPos) return null;
+
+                                // Source Y: field row position
+                                const fieldRowOffset = edge.hasExtends ? edge.sourceFieldIndex + 1 : edge.sourceFieldIndex;
+                                // For extends pseudo-row, sourceFieldIndex is 0 and hasExtends is true, so fieldRowOffset becomes 0
+                                const effectiveRow = edge.sourceField === "extends" ? 0 : fieldRowOffset;
+                                const sy = sourcePos.y + HEADER_HEIGHT + (effectiveRow + 0.5) * ROW_HEIGHT;
+                                const sx = sourcePos.x + boxWidth;
+
+                                // Target Y: header center, staggered for fan-in
+                                const allEdgesToTarget = graphEdges().filter(e => e.target === edge.target);
+                                const fanIdx = allEdgesToTarget.indexOf(edge);
+                                const fanCount = allEdgesToTarget.length;
+                                const stagger = fanCount > 1 ? (fanIdx - (fanCount - 1) / 2) * 6 : 0;
+                                const ty = targetPos.y + HEADER_HEIGHT / 2 + stagger;
+                                const tx = targetPos.x;
+
+                                // Elbow connector: horizontal out, vertical bend, horizontal in
+                                const midX = (sx + tx) / 2;
+                                const d = `M ${sx} ${sy} H ${midX} V ${ty} H ${tx}`;
+
+                                const isHovered = () => hoveredEdgeId() === edge.id;
+
+                                return (
+                                  <g>
+                                    {/* Wider invisible hit area */}
+                                    <path
+                                      d={d}
+                                      fill="none"
+                                      stroke="transparent"
+                                      stroke-width={12}
+                                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                                      onMouseLeave={() => setHoveredEdgeId(null)}
+                                    />
+                                    {/* Visible path */}
+                                    <path
+                                      d={d}
+                                      fill="none"
+                                      stroke={isHovered() ? "#60a5fa" : "#4b5563"}
+                                      stroke-width={isHovered() ? 2 : 1}
+                                      stroke-dasharray={edge.cardinality === "1:N" ? "none" : "none"}
+                                      data-relationship-line
+                                      data-source-entity={edge.source}
+                                      data-source-field={edge.sourceField}
+                                      data-target-entity={edge.target}
+                                      data-cardinality={edge.cardinality}
+                                      data-edge-id={edge.id}
+                                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                                      onMouseLeave={() => setHoveredEdgeId(null)}
+                                    />
+                                    {/* Cardinality label near source */}
+                                    <text
+                                      x={sx + 6}
+                                      y={sy - 6}
+                                      fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                      font-size="10"
+                                      font-family="ui-monospace, monospace"
+                                    >1</text>
+                                    {/* Cardinality label near target */}
+                                    <text
+                                      x={tx - 14}
+                                      y={ty - 6}
+                                      fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                      font-size="10"
+                                      font-family="ui-monospace, monospace"
+                                      text-anchor="end"
+                                    >{edge.cardinality === "1:N" ? "N" : "1"}</text>
+                                    {/* Arrow marker at target end */}
+                                    <polygon
+                                      points={`${tx},${ty} ${tx - 6},${ty - 3} ${tx - 6},${ty + 3}`}
+                                      fill={isHovered() ? "#60a5fa" : "#4b5563"}
+                                    />
+                                  </g>
+                                );
+                              }}
+                            </For>
+                          </g>
+                          {/* Entity boxes */}
                           <For each={selectedList()}>
                             {(entityName, idx) => {
                               const def = () => props.definitions()[entityName];
@@ -2726,17 +2889,46 @@ function SchemasPage(props: {
                               const row = () => Math.floor(idx() / cols());
                               const xPos = () => 20 + col() * boxSpacing;
                               const yPos = () => 20 + row() * 320;
+
+                              // Check if any hovered edge involves this entity
+                              const isHighlighted = () => {
+                                const hId = hoveredEdgeId();
+                                if (!hId) return false;
+                                const edge = graphEdges().find(e => e.id === hId);
+                                if (!edge) return false;
+                                return edge.source === entityName || edge.target === entityName;
+                              };
+
                               return (
                                 <Show when={def()}>
-                                  <EntityBox
-                                    name={entityName}
-                                    properties={def()?.properties || {}}
-                                    extends={def()?.extends}
-                                    x={xPos()}
-                                    y={yPos()}
-                                    width={boxWidth}
-                                    onSelectRef={(refName) => props.selectEntity(refName)}
-                                  />
+                                  <g data-entity-highlighted={isHighlighted() ? "true" : undefined}>
+                                    <Show when={isHighlighted()}>
+                                      <rect
+                                        x={xPos() - 2}
+                                        y={yPos() - 2}
+                                        width={boxWidth + 4}
+                                        height={HEADER_HEIGHT + Math.min(
+                                          Object.keys(def()?.properties || {}).length + (def()?.extends ? 1 : 0) || 1,
+                                          10
+                                        ) * ROW_HEIGHT + 4}
+                                        rx={6}
+                                        ry={6}
+                                        fill="none"
+                                        stroke="#3b82f6"
+                                        stroke-width={1.5}
+                                        stroke-opacity={0.5}
+                                      />
+                                    </Show>
+                                    <EntityBox
+                                      name={entityName}
+                                      properties={def()?.properties || {}}
+                                      extends={def()?.extends}
+                                      x={xPos()}
+                                      y={yPos()}
+                                      width={boxWidth}
+                                      onSelectRef={(refName) => props.selectEntity(refName)}
+                                    />
+                                  </g>
                                 </Show>
                               );
                             }}

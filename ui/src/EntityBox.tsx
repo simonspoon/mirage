@@ -22,8 +22,8 @@ interface EntityBoxProps {
   onSelectRef?: (refName: string) => void;
 }
 
-const ROW_HEIGHT = 24;
-const HEADER_HEIGHT = 32;
+export const ROW_HEIGHT = 24;
+export const HEADER_HEIGHT = 32;
 
 export default function EntityBox(props: EntityBoxProps) {
   const width = () => props.width ?? 260;
