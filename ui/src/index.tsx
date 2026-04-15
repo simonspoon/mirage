@@ -112,6 +112,8 @@ function App() {
   const [trySending, setTrySending] = createSignal(false);
   const [endpointFilter, setEndpointFilter] = createSignal("");
   const [endpointMethodFilter, setEndpointMethodFilter] = createSignal<string | null>(null);
+  const [selectingFilter, setSelectingFilter] = createSignal("");
+  const [selectingMethodFilter, setSelectingMethodFilter] = createSignal<string | null>(null);
   const filteredEndpoints = () => {
     const q = endpointFilter().toLowerCase();
     const m = endpointMethodFilter();
@@ -120,6 +122,16 @@ function App() {
       (!m || ep.method.toLowerCase() === m)
     );
   };
+  const filteredAvailableEndpoints = createMemo(() => {
+    const q = selectingFilter().toLowerCase();
+    const m = selectingMethodFilter();
+    return availableEndpoints()
+      .map((ep, index) => ({ ep, originalIndex: index }))
+      .filter(({ ep }) =>
+        (!q || ep.path.toLowerCase().includes(q)) &&
+        (!m || ep.method.toLowerCase() === m)
+      );
+  });
 
   const [tables, setTables] = createSignal<TableInfo[]>([]);
   const [selectedTable, setSelectedTable] = createSignal<string | null>(null);
@@ -318,6 +330,8 @@ function App() {
       setAvailableEndpoints(data.endpoints);
       setSelected(data.endpoints.map(() => true));
       setSeedCount(10);
+      setSelectingFilter("");
+      setSelectingMethodFilter(null);
       setState("selecting");
       setPage("endpoints");
     } catch (e: any) {
@@ -334,6 +348,8 @@ function App() {
     });
   };
 
+  // selected[] is always indexed against the full availableEndpoints() array,
+  // not the filtered view. When filtering is active, use originalIndex to map back.
   const handleConfigure = async () => {
     const endpoints = availableEndpoints().filter((_, i) => selected()[i]);
     if (endpoints.length === 0) {
@@ -1033,33 +1049,70 @@ function App() {
             <Show when={state() === "selecting"}>
               <div class="flex items-center justify-between mb-6">
                 <h2 class="text-2xl font-semibold">Select Endpoints</h2>
-                <div class="flex gap-2">
-                  <button
-                    class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
-                    onClick={() => setSelected(availableEndpoints().map(() => true))}
-                  >
-                    Select All
-                  </button>
-                  <button
-                    class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
-                    onClick={() => setSelected(availableEndpoints().map(() => false))}
-                  >
-                    Deselect All
-                  </button>
+                <div class="flex items-center gap-3">
+                  <span class="text-xs text-gray-500">{filteredAvailableEndpoints().length} / {availableEndpoints().length}</span>
+                  <div class="flex gap-2">
+                    <button
+                      class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                      onClick={() => setSelected(prev => {
+                        const next = [...prev];
+                        filteredAvailableEndpoints().forEach(({ originalIndex }) => {
+                          next[originalIndex] = true;
+                        });
+                        return next;
+                      })}
+                    >
+                      Select All
+                    </button>
+                    <button
+                      class="px-3 py-1 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-800 hover:border-gray-700 rounded-md transition-colors"
+                      onClick={() => setSelected(prev => {
+                        const next = [...prev];
+                        filteredAvailableEndpoints().forEach(({ originalIndex }) => {
+                          next[originalIndex] = false;
+                        });
+                        return next;
+                      })}
+                    >
+                      Deselect All
+                    </button>
+                  </div>
                 </div>
               </div>
+              <div class="flex items-center gap-2 mb-4">
+                <input
+                  type="text"
+                  placeholder="Filter by path..."
+                  value={selectingFilter()}
+                  onInput={(e) => setSelectingFilter(e.currentTarget.value)}
+                  class="flex-1 bg-[#070c17] border border-gray-800 rounded-md px-3 py-1.5 text-sm text-gray-100 font-mono placeholder:text-gray-600 focus:outline-none focus:border-gray-600"
+                />
+                <For each={["get", "post", "put", "delete", "patch"]}>
+                  {(m) => {
+                    const active = () => selectingMethodFilter() === m;
+                    return (
+                      <button
+                        class={`px-2 py-1 text-xs font-mono rounded-md border transition-colors ${active() ? "border-gray-600 bg-white/[0.06] text-gray-200" : "border-gray-800 text-gray-500 hover:text-gray-400 hover:border-gray-700"}`}
+                        onClick={() => setSelectingMethodFilter(active() ? null : m)}
+                      >
+                        {m.toUpperCase()}
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
               <div id="endpoint-list" class="space-y-0.5 mb-6">
-                <For each={availableEndpoints()}>
-                  {(ep, i) => (
+                <For each={filteredAvailableEndpoints()}>
+                  {(item) => (
                     <label class="flex items-center gap-3 px-3 py-2.5 rounded-md cursor-pointer hover:bg-white/[0.03] transition-colors">
                       <input
                         type="checkbox"
-                        checked={selected()[i()]}
-                        onChange={() => toggleEndpoint(i())}
+                        checked={selected()[item.originalIndex]}
+                        onChange={() => toggleEndpoint(item.originalIndex)}
                         class="endpoint-checkbox accent-blue-500 rounded"
                       />
-                      <MethodBadge method={ep.method} />
-                      <span class="font-mono text-sm text-gray-300">{ep.path}</span>
+                      <MethodBadge method={item.ep.method} />
+                      <span class="font-mono text-sm text-gray-300">{item.ep.path}</span>
                     </label>
                   )}
                 </For>
