@@ -1411,7 +1411,7 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
 
             let export = serde_json::json!({
-                "mirage_recipe": 1,
+                "mirage_recipe": 2,
                 "name": recipe.name,
                 "spec_source": recipe.spec_source,
                 "selected_endpoints": endpoints,
@@ -1465,8 +1465,8 @@ async fn admin_import_recipe(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     // Validate format marker
-    match body.get("mirage_recipe").and_then(|v| v.as_i64()) {
-        Some(1) => {}
+    let _import_version = match body.get("mirage_recipe").and_then(|v| v.as_i64()) {
+        Some(v @ (1 | 2)) => v,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1474,7 +1474,7 @@ async fn admin_import_recipe(
             )
                 .into_response();
         }
-    }
+    };
 
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
@@ -4110,5 +4110,188 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_export_recipe_includes_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Export Frozen",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Snowball", "status": "available"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/export"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(export["mirage_recipe"], 2);
+        let frozen = &export["frozen_rows"];
+        assert!(frozen.is_object(), "frozen_rows should be an object");
+        let pets = frozen["Pet"].as_array().unwrap();
+        assert_eq!(pets.len(), 1);
+        assert_eq!(pets[0]["name"], "Snowball");
+    }
+
+    #[tokio::test]
+    async fn test_import_recipe_v2_with_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let import_body = serde_json::json!({
+            "mirage_recipe": 2,
+            "name": "Imported V2",
+            "spec_source": spec_yaml,
+            "selected_endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Icicle", "status": "pending"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let frozen: serde_json::Value =
+            serde_json::from_str(created["frozen_rows"].as_str().unwrap()).unwrap();
+        let pets = frozen["Pet"].as_array().unwrap();
+        assert_eq!(pets.len(), 1);
+        assert_eq!(pets[0]["name"], "Icicle");
+        assert_eq!(pets[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn test_import_recipe_v1_no_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let import_body = serde_json::json!({
+            "mirage_recipe": 1,
+            "name": "Imported V1",
+            "spec_source": spec_yaml,
+            "selected_endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": []
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let frozen: serde_json::Value =
+            serde_json::from_str(created["frozen_rows"].as_str().unwrap()).unwrap();
+        assert!(frozen.is_object(), "frozen_rows should default to object");
+        assert_eq!(
+            frozen,
+            serde_json::json!({}),
+            "v1 import should default frozen_rows to empty object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+
+        // Create a recipe with frozen_rows
+        let body = serde_json::json!({
+            "name": "Roundtrip Export",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 2,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Glacier", "status": "sold"},
+                    {"name": "Tundra", "status": "available"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Export the recipe
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/export"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let original_frozen = &export["frozen_rows"];
+
+        // Import the exported recipe (change name to avoid collision concerns)
+        let mut import_body = export.clone();
+        import_body["name"] = serde_json::json!("Roundtrip Imported");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let imported: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let imported_frozen: serde_json::Value =
+            serde_json::from_str(imported["frozen_rows"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            *original_frozen, imported_frozen,
+            "frozen_rows should survive export/import roundtrip"
+        );
+        let pets = imported_frozen["Pet"].as_array().unwrap();
+        assert_eq!(pets.len(), 2);
+        assert_eq!(pets[0]["name"], "Glacier");
+        assert_eq!(pets[1]["name"], "Tundra");
     }
 }
