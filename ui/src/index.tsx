@@ -49,6 +49,7 @@ interface Recipe {
   quantity_configs: string;
   faker_rules: string;
   rules: string;
+  frozen_rows: string;
 }
 
 // Recipe rule data model — mirrors the Rust serde tagged union in src/rules.rs.
@@ -190,6 +191,8 @@ function App() {
   const [configSearch, setConfigSearch] = createSignal("");
   const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
   const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
+  const [activeRecipeId, setActiveRecipeId] = createSignal<number | null>(null);
+  const [frozenRows, setFrozenRows] = createSignal<Record<string, Record<string, unknown>[]>>({});
 
   // Schema state
   const [definitions, setDefinitions] = createSignal<Record<string, DefinitionInfo>>({});
@@ -235,6 +238,27 @@ function App() {
   createEffect(() => {
     if (page() === "tables" || page() === "dashboard") {
       refreshTables();
+    }
+  });
+
+  createEffect(() => {
+    if (page() === "tables") {
+      const recipeId = activeRecipeId();
+      if (recipeId !== null) {
+        (async () => {
+          try {
+            const res = await fetch(`/_api/admin/recipes/${recipeId}/config`);
+            if (res.ok) {
+              const config = await res.json();
+              setFrozenRows(config.frozen_rows || {});
+            }
+          } catch {
+            // ignore — frozen rows just won't be available
+          }
+        })();
+      } else {
+        setFrozenRows({});
+      }
     }
   });
 
@@ -341,6 +365,90 @@ function App() {
     }
   };
 
+  const toggleFreezeRow = async (tableName: string, row: Record<string, unknown>) => {
+    const recipeId = activeRecipeId();
+    if (recipeId === null) return;
+
+    // First fetch current config to get all fields
+    let currentConfig: Record<string, unknown>;
+    try {
+      const configRes = await fetch(`/_api/admin/recipes/${recipeId}/config`);
+      if (!configRes.ok) return;
+      currentConfig = await configRes.json();
+    } catch {
+      return;
+    }
+
+    const currentFrozen = frozenRows();
+    const tableRows = currentFrozen[tableName] || [];
+
+    // Build row snapshot without rowid
+    const rowSnapshot: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(row)) {
+      if (key !== "rowid") rowSnapshot[key] = val;
+    }
+
+    // Check if this row is already frozen (match by all non-rowid fields)
+    const existingIndex = tableRows.findIndex((fr) => {
+      if (Object.keys(fr).length !== Object.keys(rowSnapshot).length) return false;
+      for (const key of Object.keys(rowSnapshot)) {
+        if (JSON.stringify(fr[key]) !== JSON.stringify(rowSnapshot[key])) return false;
+      }
+      return true;
+    });
+
+    let updatedTableRows: Record<string, unknown>[];
+    if (existingIndex >= 0) {
+      // Unfreeze: remove the row
+      updatedTableRows = tableRows.filter((_, i) => i !== existingIndex);
+    } else {
+      // Freeze: add the row
+      updatedTableRows = [...tableRows, rowSnapshot];
+    }
+
+    const updatedFrozen = { ...currentFrozen };
+    if (updatedTableRows.length === 0) {
+      delete updatedFrozen[tableName];
+    } else {
+      updatedFrozen[tableName] = updatedTableRows;
+    }
+
+    // PUT to backend with full config
+    try {
+      const res = await fetch(`/_api/admin/recipes/${recipeId}/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shared_pools: currentConfig.shared_pools || {},
+          quantity_configs: currentConfig.quantity_configs || {},
+          faker_rules: currentConfig.faker_rules || {},
+          rules: currentConfig.rules || [],
+          frozen_rows: updatedFrozen,
+        }),
+      });
+      if (res.ok) {
+        setFrozenRows(updatedFrozen);
+      }
+    } catch {
+      // ignore — don't update local state on failure
+    }
+  };
+
+  const isRowFrozen = (tableName: string, row: Record<string, unknown>): boolean => {
+    const tableRows = frozenRows()[tableName] || [];
+    const rowSnapshot: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(row)) {
+      if (key !== "rowid") rowSnapshot[key] = val;
+    }
+    return tableRows.some((fr) => {
+      if (Object.keys(fr).length !== Object.keys(rowSnapshot).length) return false;
+      for (const key of Object.keys(rowSnapshot)) {
+        if (JSON.stringify(fr[key]) !== JSON.stringify(rowSnapshot[key])) return false;
+      }
+      return true;
+    });
+  };
+
   const handleImport = async () => {
     const textarea = document.getElementById("spec-input") as HTMLTextAreaElement;
     const value = textarea?.value?.trim();
@@ -410,6 +518,7 @@ function App() {
       const epRes = await fetch("/_api/admin/endpoints");
       const activeEps: Endpoint[] = await epRes.json();
       setActiveEndpoints(activeEps);
+      setActiveRecipeId(null);
       setState("running");
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -641,6 +750,7 @@ function App() {
       }
       const data = await res.json();
       setActiveEndpoints(data.endpoints);
+      setActiveRecipeId(id);
       const specRes = await fetch("/_api/admin/spec");
       const spec: SpecInfo = await specRes.json();
       setSpecInfo(spec);
@@ -684,6 +794,7 @@ function App() {
       }
       const data = await res.json();
       setActiveEndpoints(data.endpoints);
+      setActiveRecipeId(id);
       // Refresh spec info
       const specRes = await fetch("/_api/admin/spec");
       const spec: SpecInfo = await specRes.json();
@@ -707,6 +818,7 @@ function App() {
         return;
       }
       await refreshRecipes();
+      if (id === activeRecipeId()) setActiveRecipeId(null);
     } catch (e: any) {
       setError(String(e?.message || e));
     }
@@ -1405,12 +1517,17 @@ function App() {
                                     </th>
                                   )}
                                 </For>
+                                <Show when={activeRecipeId() !== null}>
+                                  <th class="py-3 px-4 text-xs font-medium text-gray-500 whitespace-nowrap"></th>
+                                </Show>
                               </tr>
                             </thead>
                             <tbody>
                               <For each={tableData()!.rows}>
-                                {(row) => (
-                                  <tr class="border-t border-[#0e1521] hover:bg-white/[0.02] transition-colors">
+                                {(row) => {
+                                  const frozen = () => selectedTable() ? isRowFrozen(selectedTable()!, row as Record<string, unknown>) : false;
+                                  return (
+                                  <tr class={`border-t border-[#0e1521] transition-colors ${frozen() ? "bg-blue-500/[0.08]" : "hover:bg-white/[0.02]"}`}>
                                     <For each={tableData()!.columns.filter(c => c.name !== "rowid")}>
                                       {(col) => {
                                         const val = row[col.name];
@@ -1476,8 +1593,23 @@ function App() {
                                         );
                                       }}
                                     </For>
+                                    <Show when={activeRecipeId() !== null}>
+                                      <td class="py-2.5 px-4 whitespace-nowrap">
+                                        <button
+                                          class={`text-xs px-2 py-1 rounded transition-colors ${
+                                            frozen()
+                                              ? "bg-blue-500/20 text-blue-300 hover:bg-blue-500/30"
+                                              : "bg-gray-700/30 text-gray-500 hover:bg-gray-700/50 hover:text-gray-300"
+                                          }`}
+                                          onClick={() => selectedTable() && toggleFreezeRow(selectedTable()!, row as Record<string, unknown>)}
+                                        >
+                                          {frozen() ? "Unfreeze" : "Freeze"}
+                                        </button>
+                                      </td>
+                                    </Show>
                                   </tr>
-                                )}
+                                  );
+                                }}
                               </For>
                             </tbody>
                           </table>
