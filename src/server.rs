@@ -1129,6 +1129,7 @@ struct CreateRecipeRequest {
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
+    frozen_rows: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1141,6 +1142,7 @@ struct UpdateRecipeRequest {
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
+    frozen_rows: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -1187,6 +1189,10 @@ async fn admin_create_recipe(
         .rules
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
+    let frozen_rows_str = body
+        .frozen_rows
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules against the spec (resolve refs first so field lookups work)
     if let Some(ref rs) = rules_str
@@ -1211,6 +1217,7 @@ async fn admin_create_recipe(
             quantity_configs_str.as_deref(),
             faker_rules_str.as_deref(),
             rules_str.as_deref(),
+            frozen_rows_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1337,6 +1344,11 @@ async fn admin_update_recipe(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
         .unwrap_or_else(|| "[]".to_string());
+    let frozen_rows_str = body
+        .frozen_rows
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
 
     // Validate rules with the same checks as create_recipe.
     if let Err(e) = validate_recipe_rules(&rules_str, &parsed_spec) {
@@ -1359,6 +1371,7 @@ async fn admin_update_recipe(
         &quantity_configs_str,
         &faker_rules_str,
         &rules_str,
+        &frozen_rows_str,
     ) {
         Ok(true) => match crate::recipe::get_recipe(&conn, id) {
             Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
@@ -1394,6 +1407,8 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
             let rules: serde_json::Value =
                 serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
+            let frozen_rows: serde_json::Value =
+                serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
 
             let export = serde_json::json!({
                 "mirage_recipe": 1,
@@ -1405,6 +1420,7 @@ async fn admin_export_recipe(
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
                 "rules": rules,
+                "frozen_rows": frozen_rows,
             });
 
             let filename = format!(
@@ -1524,6 +1540,9 @@ async fn admin_import_recipe(
     let rules_str = body
         .get("rules")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
+    let frozen_rows_str = body
+        .get("frozen_rows")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules from the imported recipe.
     if let Some(ref rs) = rules_str
@@ -1547,6 +1566,7 @@ async fn admin_import_recipe(
         quantity_configs_str.as_deref(),
         faker_rules_str.as_deref(),
         rules_str.as_deref(),
+        frozen_rows_str.as_deref(),
     ) {
         Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
         Err(e) => (
@@ -1731,6 +1751,94 @@ async fn admin_activate_recipe(
             )
                 .into_response();
         }
+
+        // Insert frozen rows before seeding
+        let frozen: crate::recipe::FrozenRows = match serde_json::from_str(&recipe.frozen_rows) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to parse frozen_rows for recipe {}: {e}",
+                    recipe.id
+                );
+                std::collections::HashMap::new()
+            }
+        };
+        if !frozen.is_empty() {
+            let spec_defs = spec.definitions.as_ref();
+            for (table_name, rows) in &frozen {
+                if !needed_defs.contains(table_name) {
+                    eprintln!(
+                        "Warning: frozen_rows references unknown table \"{table_name}\", skipping"
+                    );
+                    continue;
+                }
+                let valid_columns: HashSet<String> = spec_defs
+                    .and_then(|defs| defs.get(table_name))
+                    .and_then(|schema| schema.properties.as_ref())
+                    .map(|props| props.keys().cloned().collect())
+                    .unwrap_or_default();
+                let safe_table = table_name.replace('"', "\"\"");
+                for row in rows {
+                    let obj = match row.as_object() {
+                        Some(o) => o,
+                        None => {
+                            eprintln!(
+                                "Warning: frozen_rows entry for \"{table_name}\" is not an object, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    let mut col_names: Vec<String> = Vec::new();
+                    let mut col_values: Vec<String> = Vec::new();
+                    for (col, val) in obj {
+                        if !valid_columns.contains(col) {
+                            eprintln!(
+                                "Warning: frozen_rows column \"{col}\" not in spec for \"{table_name}\", skipping column"
+                            );
+                            continue;
+                        }
+                        let safe_col = col.replace('"', "\"\"");
+                        col_names.push(format!("\"{}\"", safe_col));
+                        let sql_val = match val {
+                            serde_json::Value::Null => "NULL".to_string(),
+                            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::String(s) => {
+                                format!("'{}'", s.replace('\'', "''"))
+                            }
+                            other => {
+                                format!(
+                                    "'{}'",
+                                    serde_json::to_string(other)
+                                        .unwrap_or_default()
+                                        .replace('\'', "''")
+                                )
+                            }
+                        };
+                        col_values.push(sql_val);
+                    }
+                    if !col_names.is_empty() {
+                        let sql = format!(
+                            "INSERT INTO \"{}\" ({}) VALUES ({})",
+                            safe_table,
+                            col_names.join(", "),
+                            col_values.join(", ")
+                        );
+                        if let Err(e) = conn.execute(&sql, []) {
+                            eprintln!(
+                                "Warning: failed to insert frozen row into \"{table_name}\": {e}"
+                            );
+                        }
+                    } else if !obj.is_empty() {
+                        eprintln!(
+                            "[frozen] Skipping row for table '{}': all columns were invalid",
+                            table_name
+                        );
+                    }
+                }
+            }
+        }
+
         if let Err(e) = seeder::seed_tables_filtered(
             &conn,
             &spec,
@@ -1819,11 +1927,14 @@ async fn admin_get_recipe_config(
                 serde_json::from_str(&recipe.faker_rules).unwrap_or(serde_json::json!({}));
             let rules: serde_json::Value =
                 serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
+            let frozen_rows: serde_json::Value =
+                serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
             Json(serde_json::json!({
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
                 "rules": rules,
+                "frozen_rows": frozen_rows,
             }))
             .into_response()
         }
@@ -1847,6 +1958,12 @@ struct UpdateRecipeConfigRequest {
     faker_rules: serde_json::Value,
     #[serde(default)]
     rules: serde_json::Value,
+    #[serde(default = "default_frozen_rows")]
+    frozen_rows: serde_json::Value,
+}
+
+fn default_frozen_rows() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 async fn admin_put_recipe_config(
@@ -1864,6 +1981,11 @@ async fn admin_put_recipe_config(
         "[]".to_string()
     } else {
         serde_json::to_string(&body.rules).unwrap_or_else(|_| "[]".to_string())
+    };
+    let frozen_rows_str = if body.frozen_rows.is_null() {
+        "{}".to_string()
+    } else {
+        serde_json::to_string(&body.frozen_rows).unwrap_or_else(|_| "{}".to_string())
     };
 
     // Validate rules against the recipe's spec.
@@ -1913,12 +2035,14 @@ async fn admin_put_recipe_config(
         &quantity_configs_str,
         &faker_rules_str,
         &rules_str,
+        &frozen_rows_str,
     ) {
         Ok(true) => Json(serde_json::json!({
             "shared_pools": body.shared_pools,
             "quantity_configs": body.quantity_configs,
             "faker_rules": body.faker_rules,
             "rules": serde_json::from_str::<serde_json::Value>(&rules_str).unwrap_or(serde_json::json!([])),
+            "frozen_rows": serde_json::from_str::<serde_json::Value>(&frozen_rows_str).unwrap_or(serde_json::json!({})),
         }))
         .into_response(),
         Ok(false) => (
@@ -3584,5 +3708,407 @@ mod tests {
             error.contains("bogus_col"),
             "error should mention the invalid column name"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_recipe_with_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Frozen Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 2,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Frosty", "status": "available"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("id").is_some());
+        let frozen: serde_json::Value =
+            serde_json::from_str(json["frozen_rows"].as_str().unwrap()).unwrap();
+        let pets = frozen["Pet"].as_array().unwrap();
+        assert_eq!(pets.len(), 1);
+        assert_eq!(pets[0]["name"], "Frosty");
+    }
+
+    #[tokio::test]
+    async fn test_frozen_rows_crud_roundtrip() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Roundtrip",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Alpha", "status": "pending"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // GET recipe should include frozen_rows
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let frozen: serde_json::Value =
+            serde_json::from_str(got["frozen_rows"].as_str().unwrap()).unwrap();
+        assert_eq!(frozen["Pet"][0]["name"], "Alpha");
+
+        // GET config should include frozen_rows
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let config: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(config["frozen_rows"]["Pet"][0]["name"], "Alpha");
+
+        // PUT config with updated frozen_rows
+        let new_config = serde_json::json!({
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Beta", "status": "sold"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&new_config).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let updated: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(updated["frozen_rows"]["Pet"][0]["name"], "Beta");
+
+        // GET config again to confirm persistence
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let final_config: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(final_config["frozen_rows"]["Pet"][0]["name"], "Beta");
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_with_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Frozen Activate",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 2,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "Glacier", "status": "available"},
+                    {"name": "Iceberg", "status": "sold"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify frozen rows are in the DB via admin tables endpoint
+        let req = Request::builder()
+            .uri("/_api/admin/tables/Pet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let table_data: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rows = table_data["rows"].as_array().unwrap();
+        // Should have frozen rows + seeded rows (2 frozen + 2 seeded = 4)
+        assert!(
+            rows.len() >= 4,
+            "expected at least 4 rows (2 frozen + 2 seeded), got {}",
+            rows.len()
+        );
+        // Check that the frozen rows are present (they were inserted first)
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            names.contains(&"Glacier"),
+            "should contain frozen row 'Glacier'"
+        );
+        assert!(
+            names.contains(&"Iceberg"),
+            "should contain frozen row 'Iceberg'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_frozen_rows_skips_invalid_table() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Bad Table",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 1,
+            "frozen_rows": {
+                "NonExistentTable": [
+                    {"col": "val"}
+                ],
+                "Pet": [
+                    {"name": "Survivor", "status": "available"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate should succeed (bad table is skipped with warning)
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The valid frozen row should be in the DB
+        let req = Request::builder()
+            .uri("/_api/admin/tables/Pet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let table_data: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rows = table_data["rows"].as_array().unwrap();
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            names.contains(&"Survivor"),
+            "should contain frozen row 'Survivor'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_frozen_rows_skips_invalid_column() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Bad Column",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 1,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "ValidPet", "status": "available", "bogus_column": "should_be_skipped"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate should succeed (invalid column is skipped)
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Valid columns should have been inserted into the DB
+        let req = Request::builder()
+            .uri("/_api/admin/tables/Pet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let table_data: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rows = table_data["rows"].as_array().unwrap();
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(
+            names.contains(&"ValidPet"),
+            "should contain frozen row 'ValidPet'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_default_frozen_rows() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Default Frozen",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 2
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activation with default empty frozen_rows should succeed
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_malformed_frozen_rows() {
+        // Build state manually so we can access recipe_db directly
+        let conn = Connection::open_in_memory().unwrap();
+        let db: Db = Arc::new(Mutex::new(conn));
+        let registry = Arc::new(RwLock::new(RouteRegistry::new()));
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db: recipe_db.clone(),
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+        let router = build_router(state);
+
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Malformed Frozen",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 2
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Write corrupt JSON directly into the frozen_rows column
+        {
+            let rdb = recipe_db.lock().unwrap();
+            rdb.execute(
+                "UPDATE \"recipes\" SET \"frozen_rows\" = ?1 WHERE \"id\" = ?2",
+                rusqlite::params!["not valid json {{{", id],
+            )
+            .unwrap();
+        }
+
+        // Activation should still succeed — malformed frozen_rows falls back to empty
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

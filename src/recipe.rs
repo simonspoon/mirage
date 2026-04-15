@@ -1,5 +1,8 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+pub type FrozenRows = HashMap<String, Vec<serde_json::Value>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipe {
@@ -13,6 +16,7 @@ pub struct Recipe {
     pub quantity_configs: String,
     pub faker_rules: String,
     pub rules: String,
+    pub frozen_rows: String,
 }
 
 pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -63,6 +67,15 @@ pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             if msg.contains("duplicate column") => {}
         Err(e) => return Err(e),
     }
+    match conn.execute(
+        "ALTER TABLE \"recipes\" ADD COLUMN \"frozen_rows\" TEXT NOT NULL DEFAULT '{}'",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column") => {}
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -77,15 +90,17 @@ pub fn create_recipe(
     quantity_configs: Option<&str>,
     faker_rules: Option<&str>,
     rules: Option<&str>,
+    frozen_rows: Option<&str>,
 ) -> Result<Recipe, rusqlite::Error> {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let shared_pools = shared_pools.unwrap_or("{}");
     let quantity_configs = quantity_configs.unwrap_or("{}");
     let faker_rules = faker_rules.unwrap_or("{}");
     let rules = rules.unwrap_or("[]");
+    let frozen_rows = frozen_rows.unwrap_or("{}");
     conn.execute(
-        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, shared_pools, quantity_configs, faker_rules, rules],
+        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, shared_pools, quantity_configs, faker_rules, rules, frozen_rows],
     )?;
     let id = conn.last_insert_rowid();
     Ok(Recipe {
@@ -99,12 +114,13 @@ pub fn create_recipe(
         quantity_configs: quantity_configs.to_string(),
         faker_rules: faker_rules.to_string(),
         rules: rules.to_string(),
+        frozen_rows: frozen_rows.to_string(),
     })
 }
 
 pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\" FROM \"recipes\" ORDER BY \"id\"",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\" FROM \"recipes\" ORDER BY \"id\"",
     )?;
     let recipes = stmt
         .query_map([], |row| {
@@ -119,6 +135,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
                 quantity_configs: row.get(7)?,
                 faker_rules: row.get(8)?,
                 rules: row.get(9)?,
+                frozen_rows: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -127,7 +144,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
 
 pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\" FROM \"recipes\" WHERE \"id\" = ?1",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\" FROM \"recipes\" WHERE \"id\" = ?1",
     )?;
     match stmt.query_row([id], |row| {
         Ok(Recipe {
@@ -141,6 +158,7 @@ pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite
             quantity_configs: row.get(7)?,
             faker_rules: row.get(8)?,
             rules: row.get(9)?,
+            frozen_rows: row.get(10)?,
         })
     }) {
         Ok(recipe) => Ok(Some(recipe)),
@@ -157,10 +175,11 @@ pub fn update_recipe_config(
     quantity_configs: &str,
     faker_rules: &str,
     rules: &str,
+    frozen_rows: &str,
 ) -> Result<bool, rusqlite::Error> {
     let changes = conn.execute(
-        "UPDATE \"recipes\" SET \"shared_pools\" = ?1, \"quantity_configs\" = ?2, \"faker_rules\" = ?3, \"rules\" = ?4 WHERE \"id\" = ?5",
-        rusqlite::params![shared_pools, quantity_configs, faker_rules, rules, id],
+        "UPDATE \"recipes\" SET \"shared_pools\" = ?1, \"quantity_configs\" = ?2, \"faker_rules\" = ?3, \"rules\" = ?4, \"frozen_rows\" = ?5 WHERE \"id\" = ?6",
+        rusqlite::params![shared_pools, quantity_configs, faker_rules, rules, frozen_rows, id],
     )?;
     Ok(changes > 0)
 }
@@ -177,10 +196,11 @@ pub fn update_recipe(
     quantity_configs: &str,
     faker_rules: &str,
     rules: &str,
+    frozen_rows: &str,
 ) -> Result<bool, rusqlite::Error> {
     let changes = conn.execute(
-        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"shared_pools\" = ?5, \"quantity_configs\" = ?6, \"faker_rules\" = ?7, \"rules\" = ?8 WHERE \"id\" = ?9",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, shared_pools, quantity_configs, faker_rules, rules, id],
+        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"shared_pools\" = ?5, \"quantity_configs\" = ?6, \"faker_rules\" = ?7, \"rules\" = ?8, \"frozen_rows\" = ?9 WHERE \"id\" = ?10",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, shared_pools, quantity_configs, faker_rules, rules, frozen_rows, id],
     )?;
     Ok(changes > 0)
 }
