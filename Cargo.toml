@@ -1,6 +1,6 @@
 [package]
 name = "mirage"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Swagger 2.0 mock API server with SQLite-backed fake data"
