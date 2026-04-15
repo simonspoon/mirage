@@ -8,7 +8,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use http_body_util::LengthLimitError;
 use rusqlite::types::Value as SqlValue;
@@ -798,6 +798,139 @@ async fn admin_table_data(
         .collect();
 
     Json(serde_json::json!({"columns": columns, "rows": rows})).into_response()
+}
+
+async fn admin_update_table_row(
+    State(state): State<AppState>,
+    axum::extract::Path((name, rowid)): axum::extract::Path<(String, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let updates = match body.as_object() {
+        Some(map) if !map.is_empty() => map.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "body must be a non-empty JSON object"})),
+            )
+                .into_response();
+        }
+    };
+
+    let conn = state.db.lock().unwrap();
+
+    // Check table exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            [&name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "table not found"})),
+        )
+            .into_response();
+    }
+
+    // Get valid column names from PRAGMA table_info (SQL injection prevention)
+    let valid_columns: HashSet<String> = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", name))
+            .unwrap();
+        stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            Ok(col_name)
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    // Validate all column names in the request body
+    let mut invalid_cols: Vec<String> = Vec::new();
+    for key in updates.keys() {
+        if !valid_columns.contains(key) {
+            invalid_cols.push(key.clone());
+        }
+    }
+    if !invalid_cols.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown columns: {}", invalid_cols.join(", "))
+            })),
+        )
+            .into_response();
+    }
+
+    // Build parameterized UPDATE statement with validated column names
+    let set_clauses: Vec<String> = updates
+        .keys()
+        .enumerate()
+        .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+        .collect();
+    let sql = format!(
+        "UPDATE \"{}\" SET {} WHERE rowid = ?{}",
+        name,
+        set_clauses.join(", "),
+        updates.len() + 1
+    );
+
+    // Build parameter values
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for val in updates.values() {
+        match val {
+            serde_json::Value::Null => params.push(Box::new(rusqlite::types::Null)),
+            serde_json::Value::Bool(b) => params.push(Box::new(*b)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    params.push(Box::new(i));
+                } else if let Some(f) = n.as_f64() {
+                    params.push(Box::new(f));
+                } else {
+                    params.push(Box::new(n.to_string()));
+                }
+            }
+            serde_json::Value::String(s) => params.push(Box::new(s.clone())),
+            // Objects and arrays stored as JSON text
+            other => params.push(Box::new(other.to_string())),
+        }
+    }
+    params.push(Box::new(rowid));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let affected = match conn.execute(&sql, param_refs.as_slice()) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if affected == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "row not found"})),
+        )
+            .into_response();
+    }
+
+    // Re-query the updated row
+    let select_sql = format!("SELECT rowid, * FROM \"{}\" WHERE rowid = ?", name);
+    let mut stmt = conn.prepare(&select_sql).unwrap();
+    let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let row = stmt
+        .query_row([rowid], |row| row_to_json(&col_names, row))
+        .unwrap();
+
+    Json(row).into_response()
 }
 
 async fn admin_import(State(state): State<AppState>, body: String) -> Response {
@@ -2087,6 +2220,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/routes", get(admin_routes))
         .route("/tables", get(admin_tables))
         .route("/tables/{name}", get(admin_table_data))
+        .route("/tables/{name}/{rowid}", put(admin_update_table_row))
         .route("/log", get(admin_log))
         .route("/import", post(admin_import))
         .route("/configure", post(admin_configure))
@@ -3377,5 +3511,78 @@ mod tests {
         assert!(out.starts_with(&"a".repeat(LOG_BODY_STORE_MAX)));
         assert!(out.contains("[truncated:"));
         assert!(out.len() < s.len());
+    }
+
+    #[tokio::test]
+    async fn test_admin_update_row_happy_path() {
+        let router = setup();
+        let body = serde_json::json!({"name": "UpdatedPetName"});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_api/admin/tables/Pet/1")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("rowid").is_some(), "response should contain rowid");
+        assert_eq!(json["name"], "UpdatedPetName");
+    }
+
+    #[tokio::test]
+    async fn test_admin_update_row_unknown_table() {
+        let router = setup();
+        let body = serde_json::json!({"name": "x"});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_api/admin/tables/nonexistent/1")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "table not found");
+    }
+
+    #[tokio::test]
+    async fn test_admin_update_row_unknown_rowid() {
+        let router = setup();
+        let body = serde_json::json!({"name": "x"});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_api/admin/tables/Pet/99999")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "row not found");
+    }
+
+    #[tokio::test]
+    async fn test_admin_update_row_unknown_column() {
+        let router = setup();
+        let body = serde_json::json!({"bogus_col": "x"});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_api/admin/tables/Pet/1")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.contains("bogus_col"),
+            "error should mention the invalid column name"
+        );
     }
 }
