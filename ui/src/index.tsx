@@ -3,6 +3,7 @@ import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo } from "solid-js";
 import "./index.css";
 import ForceGraph from "./ForceGraph";
+import EntityBox from "./EntityBox";
 
 interface Endpoint {
   method: string;
@@ -2694,31 +2695,57 @@ function SchemasPage(props: {
               <Show when={rightTab() === "graph"}>
                 <div class="flex items-center justify-between mb-1">
                   <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
-                  <div class="flex items-center gap-1.5">
-                    <span class="text-[10px] text-gray-500">Depth</span>
-                    <input
-                      type="range" min="1" max="3" step="1"
-                      value={props.schemaGraphHopDepth()}
-                      onInput={(e) => props.setSchemaGraphHopDepth(parseInt(e.currentTarget.value))}
-                      class="w-14 h-1 accent-blue-500"
-                    />
-                    <span class="text-[10px] text-gray-400 w-3">{props.schemaGraphHopDepth()}</span>
+                  <Show when={props.selectedEntities().size > 0}>
                     <button
-                      class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50 ml-2"
+                      class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
                       onClick={() => props.collapseGraph()}
-                    >Collapse</button>
+                    >Clear</button>
+                  </Show>
+                </div>
+                <Show when={props.selectedEntities().size === 0}>
+                  <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center" style="height: 400px;">
+                    <p class="text-sm text-gray-600">Select a schema to view its ERD box</p>
                   </div>
-                </div>
-                <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden" style="height: 400px;">
-                  <ForceGraph
-                    nodes={neighborhood().nodes}
-                    edges={neighborhood().edges}
-                    roleMap={neighborhood().roleMap}
-                    arrayTargets={arrayTargets()}
-                    selectedEntities={props.selectedEntities()}
-                    onSelectEntity={(name) => props.selectEntity(name)}
-                  />
-                </div>
+                </Show>
+                <Show when={props.selectedEntities().size > 0}>
+                  {(() => {
+                    const selectedList = createMemo(() => [...props.selectedEntities()]);
+                    const boxWidth = 260;
+                    const boxSpacing = 300;
+                    const cols = () => selectedList().length > 3 ? Math.ceil(Math.sqrt(selectedList().length)) : selectedList().length;
+                    const svgWidth = () => cols() * boxSpacing + 40;
+                    const rows = () => Math.ceil(selectedList().length / cols());
+                    const svgHeight = () => Math.max(400, rows() * 340 + 40);
+                    return (
+                      <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-auto" style="height: 400px;">
+                        <svg width={svgWidth()} height={svgHeight()} xmlns="http://www.w3.org/2000/svg">
+                          <For each={selectedList()}>
+                            {(entityName, idx) => {
+                              const def = () => props.definitions()[entityName];
+                              const col = () => idx() % cols();
+                              const row = () => Math.floor(idx() / cols());
+                              const xPos = () => 20 + col() * boxSpacing;
+                              const yPos = () => 20 + row() * 320;
+                              return (
+                                <Show when={def()}>
+                                  <EntityBox
+                                    name={entityName}
+                                    properties={def()?.properties || {}}
+                                    extends={def()?.extends}
+                                    x={xPos()}
+                                    y={yPos()}
+                                    width={boxWidth}
+                                    onSelectRef={(refName) => props.selectEntity(refName)}
+                                  />
+                                </Show>
+                              );
+                            }}
+                          </For>
+                        </svg>
+                      </div>
+                    );
+                  })()}
+                </Show>
               </Show>
             </Show>
           </div>
