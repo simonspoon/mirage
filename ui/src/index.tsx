@@ -67,6 +67,22 @@ type Rule = RangeRule | ChoiceRule | ConstRule | PatternRule | CompareRule;
 const RULE_KINDS: RuleKind[] = ["range", "choice", "const", "pattern", "compare"];
 const COMPARE_OPS: CompareOp[] = ["eq", "neq", "gt", "gte", "lt", "lte"];
 
+// Pure helpers for constraint rule value parsing (hoisted from ConstraintRulesEditor)
+const parseLiteral = (raw: string): string | number | boolean => {
+  const trimmed = raw.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed !== "" && !isNaN(Number(trimmed))) return Number(trimmed);
+  return raw;
+};
+const parseChoiceOptions = (raw: string): (string | number | boolean)[] => {
+  if (!raw.trim()) return [];
+  return raw.split(",").map((s) => parseLiteral(s.trim()));
+};
+const stringifyChoiceOptions = (opts: (string | number | boolean)[]): string => {
+  return opts.map((o) => String(o)).join(", ");
+};
+
 interface PropertyInfo {
   type: string;
   format: string | null;
@@ -2652,14 +2668,50 @@ function RecipeConfigStep(props: {
     return map;
   });
 
+  // Bucket constraint rules (recipeRules) by endpoint, preserving global indices for mutations
+  const constraintsByBucket = createMemo((): { label: string; rules: { rule: Rule; globalIndex: number }[] }[] => {
+    const allRules = props.recipeRules();
+    const dtb = defToBucket();
+    const buckets = endpointBuckets();
+    // Build a map: bucket label → entries
+    const bucketMap: Record<string, { rule: Rule; globalIndex: number }[]> = {};
+    for (let i = 0; i < allRules.length; i++) {
+      const rule = allRules[i];
+      const defName = rule.kind === "compare"
+        ? (rule as CompareRule).left.split(".")[0]
+        : (rule as Exclude<Rule, CompareRule>).field.split(".")[0];
+      const bucketLabel = dtb[defName] || "Shared";
+      if (!bucketMap[bucketLabel]) bucketMap[bucketLabel] = [];
+      bucketMap[bucketLabel].push({ rule, globalIndex: i });
+    }
+    const result: { label: string; rules: { rule: Rule; globalIndex: number }[] }[] = [];
+    for (const bucket of buckets) {
+      if (bucketMap[bucket.label]) {
+        result.push({ label: bucket.label, rules: bucketMap[bucket.label] });
+      }
+    }
+    // Include rules for labels not matched to any bucket (fallback to Shared)
+    if (bucketMap["Shared"] && !result.some(r => r.label === "Shared")) {
+      result.push({ label: "Shared", rules: bucketMap["Shared"] });
+    }
+    return result;
+  });
+
+  const constraintsByLabel = createMemo((): Record<string, { rule: Rule; globalIndex: number }[]> => {
+    const map: Record<string, { rule: Rule; globalIndex: number }[]> = {};
+    for (const b of constraintsByBucket()) map[b.label] = b.rules;
+    return map;
+  });
+
   // Combined list of endpoint labels that have any visible data
   const activeEndpoints = createMemo((): string[] => {
     const pools = poolsByLabel();
     const configs = configsByLabel();
     const rules = rulesByLabel();
+    const constraints = constraintsByLabel();
     return endpointBuckets()
       .map(b => b.label)
-      .filter(label => (pools[label]?.length ?? 0) > 0 || (configs[label]?.length ?? 0) > 0 || (rules[label]?.length ?? 0) > 0);
+      .filter(label => (pools[label]?.length ?? 0) > 0 || (configs[label]?.length ?? 0) > 0 || (rules[label]?.length ?? 0) > 0 || (constraints[label]?.length ?? 0) > 0);
   });
 
   // Collapsed state for endpoint and entity groups
@@ -2794,6 +2846,8 @@ function RecipeConfigStep(props: {
             const epPools = () => poolsByLabel()[label] || [];
             const epConfigs = () => configsByLabel()[label] || [];
             const epRules = () => rulesByLabel()[label] || [];
+            const epConstraints = () => constraintsByLabel()[label] || [];
+            const epBucket = () => endpointBuckets().find(b => b.label === label);
             const epKey = () => `ep:${label}`;
 
             return (
@@ -2808,10 +2862,12 @@ function RecipeConfigStep(props: {
                   <span class="font-mono text-xs">{label}</span>
                   <span class="text-xs text-gray-600 ml-auto">
                     {epPools().length > 0 ? `${epPools().length} pools` : ""}
-                    {epPools().length > 0 && (epConfigs().length > 0 || epRules().length > 0) ? " · " : ""}
+                    {epPools().length > 0 && (epConfigs().length > 0 || epRules().length > 0 || epConstraints().length > 0) ? " · " : ""}
                     {epConfigs().length > 0 ? `${epConfigs().reduce((n, [, items]) => n + items.length, 0)} arrays` : ""}
-                    {epConfigs().length > 0 && epRules().length > 0 ? " · " : ""}
+                    {epConfigs().length > 0 && (epRules().length > 0 || epConstraints().length > 0) ? " · " : ""}
                     {epRules().length > 0 ? `${epRules().reduce((n, [, items]) => n + items.length, 0)} rules` : ""}
+                    {epRules().length > 0 && epConstraints().length > 0 ? " · " : ""}
+                    {epConstraints().length > 0 ? `${epConstraints().length} constraints` : ""}
                   </span>
                 </button>
 
@@ -2959,6 +3015,15 @@ function RecipeConfigStep(props: {
                       </div>
                     </Show>
 
+                    {/* Constraint Rules sub-section */}
+                    <ConstraintRulesEditor
+                      rules={epConstraints}
+                      recipeRules={props.recipeRules}
+                      setRecipeRules={props.setRecipeRules}
+                      entityGraph={props.entityGraph}
+                      scopedDefs={epBucket()?.defs}
+                    />
+
                   </div>
                 </Show>
               </div>
@@ -2966,13 +3031,6 @@ function RecipeConfigStep(props: {
           }}
         </For>
       </div>
-
-      {/* Constraint Rules — bounded values + cross-field compares */}
-      <ConstraintRulesEditor
-        recipeRules={props.recipeRules}
-        setRecipeRules={props.setRecipeRules}
-        entityGraph={props.entityGraph}
-      />
 
       {!hasAnything() && props.recipeRules().length === 0 && (
         <p class="text-gray-400 mb-4">No shared entities, array properties, or scalar fields detected. You can proceed to name your recipe.</p>
@@ -2983,21 +3041,28 @@ function RecipeConfigStep(props: {
 }
 
 function ConstraintRulesEditor(props: {
+  rules: Accessor<{ rule: Rule; globalIndex: number }[]>;
   recipeRules: Accessor<Rule[]>;
   setRecipeRules: Setter<Rule[]>;
   entityGraph: Accessor<any>;
+  scopedDefs?: string[];
 }) {
   // Field options derived from entityGraph().scalar_properties.
-  // Rendered as <optgroup> per def_name so the user can scan visually.
+  // When scopedDefs is provided, filter to only fields whose def is in the scope.
   const scalarFields = (): { def: string; prop: string; type: string; format: string | null }[] => {
     const g = props.entityGraph();
     if (!g || !Array.isArray(g.scalar_properties)) return [];
-    return g.scalar_properties.map((sp: any) => ({
+    const all = g.scalar_properties.map((sp: any) => ({
       def: sp.def_name,
       prop: sp.prop_name,
       type: sp.prop_type,
       format: sp.format,
     }));
+    if (props.scopedDefs) {
+      const scopeSet = new Set(props.scopedDefs);
+      return all.filter((f: { def: string }) => scopeSet.has(f.def));
+    }
+    return all;
   };
   const groupedFields = (): GroupedFields => {
     const groups: GroupedFields = {};
@@ -3030,38 +3095,25 @@ function ConstraintRulesEditor(props: {
     props.setRecipeRules([...props.recipeRules(), makeRule(newRuleKind())]);
   };
 
-  const removeRule = (idx: number) => {
-    const next = [...props.recipeRules()];
-    next.splice(idx, 1);
-    props.setRecipeRules(next);
+  const removeRule = (globalIdx: number) => {
+    props.setRecipeRules(props.recipeRules().filter((_, i) => i !== globalIdx));
   };
 
-  const updateRule = (idx: number, patch: Partial<Rule>) => {
+  const updateRule = (globalIdx: number, patch: Partial<Rule>) => {
     const next = [...props.recipeRules()];
-    next[idx] = { ...next[idx], ...patch } as Rule;
+    next[globalIdx] = { ...next[globalIdx], ...patch } as Rule;
     props.setRecipeRules(next);
-  };
-
-  // Parse a literal: number-literal -> number, "true"/"false" -> bool, else string.
-  const parseLiteral = (raw: string): string | number | boolean => {
-    const trimmed = raw.trim();
-    if (trimmed === "true") return true;
-    if (trimmed === "false") return false;
-    if (trimmed !== "" && !isNaN(Number(trimmed))) return Number(trimmed);
-    return raw;
-  };
-  const parseChoiceOptions = (raw: string): (string | number | boolean)[] => {
-    if (!raw.trim()) return [];
-    return raw.split(",").map((s) => parseLiteral(s.trim()));
-  };
-  const stringifyChoiceOptions = (opts: (string | number | boolean)[]): string => {
-    return opts.map((o) => String(o)).join(", ");
   };
 
   return (
-    <div class="mb-6" data-testid="constraint-rules-section">
-      <div class="flex items-center justify-between mb-2">
-        <h4 class="text-sm font-medium text-gray-300">Constraint Rules</h4>
+    <div data-testid="constraint-rules-section">
+      <div class="flex items-center justify-between mb-1">
+        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">
+          Constraint Rules
+          <Show when={props.rules().length > 0}>
+            <span class="text-xs text-gray-600 ml-1">{props.rules().length}</span>
+          </Show>
+        </div>
         <div class="flex items-center gap-2">
           <select
             value={newRuleKind()}
@@ -3084,23 +3136,17 @@ function ConstraintRulesEditor(props: {
         </div>
       </div>
 
-      <Show when={scalarFields().length === 0}>
-        <p class="text-xs text-gray-600 mb-2">Load endpoint graph first — no scalar fields detected.</p>
-      </Show>
-
-      <Show when={props.recipeRules().length === 0 && scalarFields().length > 0}>
-        <p class="text-xs text-gray-600 mb-2">No constraint rules. Pick a kind and click Add Rule to bound a field, fix a value, restrict to a set, match a regex, or relate two fields.</p>
-      </Show>
-
-      <div class="space-y-2" data-testid="rule-list">
+      <div class="space-y-2 ml-2" data-testid="rule-list">
         {/*
           Use <Index> instead of <For>: SolidJS <For> is reference-keyed, so updateRule's
           shallow array-with-spliced-element pattern disposes and recreates the row on every
           keystroke, unmounting the focused <input>. <Index> is index-keyed — it updates an
           internal signal at the same position without re-mounting DOM, preserving focus.
         */}
-        <Index each={props.recipeRules()}>
-          {(rule, i) => {
+        <Index each={props.rules()}>
+          {(entry) => {
+            const rule = () => entry().rule;
+            const globalIdx = () => entry().globalIndex;
             // Compare right-side helpers — closed over the reactive `rule` accessor.
             const cr = () => rule() as CompareRule;
             const knownPaths = () => new Set(scalarFields().map((f) => `${f.def}.${f.prop}`));
@@ -3115,7 +3161,7 @@ function ConstraintRulesEditor(props: {
                 <Show when={rule().kind === "range"}>
                   <FieldSelect
                     value={(rule() as RangeRule).field}
-                    onChange={(next) => updateRule(i, { field: next } as Partial<RangeRule>)}
+                    onChange={(next) => updateRule(globalIdx(), { field: next } as Partial<RangeRule>)}
                     groupedFields={groupedFields}
                   />
                   <span class="text-[10px] text-gray-500">min</span>
@@ -3123,14 +3169,14 @@ function ConstraintRulesEditor(props: {
                     type="number"
                     value={(rule() as RangeRule).min}
                     class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                    onInput={(e) => updateRule(i, { min: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                    onInput={(e) => updateRule(globalIdx(), { min: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
                   />
                   <span class="text-[10px] text-gray-500">max</span>
                   <input
                     type="number"
                     value={(rule() as RangeRule).max}
                     class="w-20 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                    onInput={(e) => updateRule(i, { max: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
+                    onInput={(e) => updateRule(globalIdx(), { max: parseFloat(e.currentTarget.value) || 0 } as Partial<RangeRule>)}
                   />
                 </Show>
 
@@ -3138,7 +3184,7 @@ function ConstraintRulesEditor(props: {
                 <Show when={rule().kind === "choice"}>
                   <FieldSelect
                     value={(rule() as ChoiceRule).field}
-                    onChange={(next) => updateRule(i, { field: next } as Partial<ChoiceRule>)}
+                    onChange={(next) => updateRule(globalIdx(), { field: next } as Partial<ChoiceRule>)}
                     groupedFields={groupedFields}
                   />
                   <input
@@ -3146,7 +3192,7 @@ function ConstraintRulesEditor(props: {
                     placeholder="value1, value2, value3"
                     value={stringifyChoiceOptions((rule() as ChoiceRule).options)}
                     class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                    onInput={(e) => updateRule(i, { options: parseChoiceOptions(e.currentTarget.value) } as Partial<ChoiceRule>)}
+                    onInput={(e) => updateRule(globalIdx(), { options: parseChoiceOptions(e.currentTarget.value) } as Partial<ChoiceRule>)}
                   />
                 </Show>
 
@@ -3154,7 +3200,7 @@ function ConstraintRulesEditor(props: {
                 <Show when={rule().kind === "const"}>
                   <FieldSelect
                     value={(rule() as ConstRule).field}
-                    onChange={(next) => updateRule(i, { field: next } as Partial<ConstRule>)}
+                    onChange={(next) => updateRule(globalIdx(), { field: next } as Partial<ConstRule>)}
                     groupedFields={groupedFields}
                   />
                   <input
@@ -3162,7 +3208,7 @@ function ConstraintRulesEditor(props: {
                     placeholder="value"
                     value={String((rule() as ConstRule).value ?? "")}
                     class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                    onInput={(e) => updateRule(i, { value: parseLiteral(e.currentTarget.value) } as Partial<ConstRule>)}
+                    onInput={(e) => updateRule(globalIdx(), { value: parseLiteral(e.currentTarget.value) } as Partial<ConstRule>)}
                   />
                 </Show>
 
@@ -3170,7 +3216,7 @@ function ConstraintRulesEditor(props: {
                 <Show when={rule().kind === "pattern"}>
                   <FieldSelect
                     value={(rule() as PatternRule).field}
-                    onChange={(next) => updateRule(i, { field: next } as Partial<PatternRule>)}
+                    onChange={(next) => updateRule(globalIdx(), { field: next } as Partial<PatternRule>)}
                     groupedFields={groupedFields}
                   />
                   <input
@@ -3178,7 +3224,7 @@ function ConstraintRulesEditor(props: {
                     placeholder="[A-Z]{3}-[0-9]{4}"
                     value={(rule() as PatternRule).regex}
                     class="flex-1 min-w-[160px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 font-mono focus:outline-none focus:border-gray-700"
-                    onInput={(e) => updateRule(i, { regex: e.currentTarget.value } as Partial<PatternRule>)}
+                    onInput={(e) => updateRule(globalIdx(), { regex: e.currentTarget.value } as Partial<PatternRule>)}
                   />
                 </Show>
 
@@ -3186,13 +3232,13 @@ function ConstraintRulesEditor(props: {
                 <Show when={rule().kind === "compare"}>
                   <FieldSelect
                     value={(rule() as CompareRule).left}
-                    onChange={(next) => updateRule(i, { left: next } as Partial<CompareRule>)}
+                    onChange={(next) => updateRule(globalIdx(), { left: next } as Partial<CompareRule>)}
                     groupedFields={groupedFields}
                   />
                   <select
                     value={(rule() as CompareRule).op}
                     class="bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                    onChange={(e) => updateRule(i, { op: e.target.value as CompareOp } as Partial<CompareRule>)}
+                    onChange={(e) => updateRule(globalIdx(), { op: e.target.value as CompareOp } as Partial<CompareRule>)}
                   >
                     <For each={COMPARE_OPS}>
                       {(o) => <option value={o}>{o}</option>}
@@ -3203,9 +3249,9 @@ function ConstraintRulesEditor(props: {
                     value={isFieldRef() ? "field" : "literal"}
                     onChange={(e) => {
                       if (e.target.value === "field") {
-                        updateRule(i, { right: firstFieldPath() } as Partial<CompareRule>);
+                        updateRule(globalIdx(), { right: firstFieldPath() } as Partial<CompareRule>);
                       } else {
-                        updateRule(i, { right: "" } as Partial<CompareRule>);
+                        updateRule(globalIdx(), { right: "" } as Partial<CompareRule>);
                       }
                     }}
                   >
@@ -3215,7 +3261,7 @@ function ConstraintRulesEditor(props: {
                   <Show when={isFieldRef()}>
                     <FieldSelect
                       value={typeof cr().right === "string" ? (cr().right as string) : ""}
-                      onChange={(next) => updateRule(i, { right: next } as Partial<CompareRule>)}
+                      onChange={(next) => updateRule(globalIdx(), { right: next } as Partial<CompareRule>)}
                       groupedFields={groupedFields}
                     />
                   </Show>
@@ -3225,14 +3271,14 @@ function ConstraintRulesEditor(props: {
                       placeholder="literal value"
                       value={String(cr().right ?? "")}
                       class="flex-1 min-w-[120px] bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                      onInput={(e) => updateRule(i, { right: parseLiteral(e.currentTarget.value) } as Partial<CompareRule>)}
+                      onInput={(e) => updateRule(globalIdx(), { right: parseLiteral(e.currentTarget.value) } as Partial<CompareRule>)}
                     />
                   </Show>
                 </Show>
 
                 <button
                   class="ml-auto text-gray-500 hover:text-red-400 text-sm w-6 h-6 flex items-center justify-center rounded hover:bg-red-500/10 transition-colors"
-                  onClick={() => removeRule(i)}
+                  onClick={() => removeRule(globalIdx())}
                   title="Remove rule"
                   data-testid="rule-remove-btn"
                 >
