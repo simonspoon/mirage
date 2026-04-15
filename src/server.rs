@@ -554,7 +554,7 @@ async fn catch_all_handler(
         ResponseShape::FreeformObject => {
             return Json(serde_json::Map::new()).into_response();
         }
-        ResponseShape::Empty if table.is_empty() => {
+        ResponseShape::Empty if m == "get" || m == "head" => {
             return StatusCode::NO_CONTENT.into_response();
         }
         ResponseShape::Empty => { /* fall through — DELETE/POST with a backing table */ }
@@ -4474,7 +4474,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_catch_all_empty() {
-        let router = setup_with_shape("get", "/health/ping", ResponseShape::Empty);
+        // Use a non-empty table name (realistic: table_name_from_path always produces one)
+        // to verify that Empty shape returns 204 regardless of table content.
+        let registry = Arc::new(RwLock::new(RouteRegistry::new()));
+        {
+            let mut reg = registry.write().unwrap();
+            reg.routes.push(RouteEntry {
+                method: "get".to_string(),
+                pattern: "/health/ping".to_string(),
+                table: "Health".to_string(),
+                has_path_param: false,
+                shape: ResponseShape::Empty,
+            });
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        let db: Db = Arc::new(Mutex::new(conn));
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recipe_conn = Connection::open_in_memory().unwrap();
+        crate::recipe::init_recipe_db(&recipe_conn).unwrap();
+        let recipe_db: Db = Arc::new(Mutex::new(recipe_conn));
+        let state = AppState {
+            db,
+            registry,
+            log,
+            recipe_db,
+            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+        let router = build_router(state);
         let req = Request::builder()
             .uri("/health/ping")
             .body(Body::empty())
