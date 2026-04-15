@@ -2973,6 +2973,26 @@ function SchemasPage(props: {
                     const svgWidth = () => dagLayout().width;
                     const svgHeight = () => dagLayout().height;
 
+                    // Box rects for edge routing obstruction checks
+                    const boxRects = createMemo(() => {
+                      const pos = entityPositions();
+                      const defs = props.definitions();
+                      const stubs = stubSet();
+                      const rects: Record<string, { x: number; y: number; w: number; h: number }> = {};
+                      for (const name of visibleList()) {
+                        const p = pos[name];
+                        if (!p) continue;
+                        const def = defs[name];
+                        let h = HEADER_HEIGHT;
+                        if (def && !stubs.has(name)) {
+                          const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
+                          h = HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+                        }
+                        rects[name] = { x: p.x, y: p.y, w: boxWidth, h };
+                      }
+                      return rects;
+                    });
+
                     // Click handlers
                     const handleStubClick = (entityName: string) => {
                       const next = new Set(props.graphExpanded());
@@ -3033,11 +3053,89 @@ function SchemasPage(props: {
                                   return pos ? pos.x : 0;
                                 };
 
-                                // Elbow connector: horizontal out, vertical bend, horizontal in
+                                // Elbow connector: orthogonal routing that avoids box obstructions
                                 const d = () => {
                                   const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
+                                  const rects = boxRects();
+                                  const margin = 10;
+
+                                  // Check if a vertical segment at x=vx from y1 to y2 intersects any box (excluding source & target)
+                                  const verticalHitsBox = (vx: number, y1: number, y2: number): { x: number; y: number; w: number; h: number }[] => {
+                                    const minY = Math.min(y1, y2);
+                                    const maxY = Math.max(y1, y2);
+                                    const hits: { x: number; y: number; w: number; h: number }[] = [];
+                                    for (const [name, r] of Object.entries(rects)) {
+                                      if (name === edge.source || name === edge.target) continue;
+                                      if (vx >= r.x && vx <= r.x + r.w && maxY >= r.y && minY <= r.y + r.h) {
+                                        hits.push(r);
+                                      }
+                                    }
+                                    return hits;
+                                  };
+
+                                  // Backward edge: source exits right and loops back left to target
+                                  if (_sx >= _tx) {
+                                    // Find the rightmost edge among source and target boxes plus any boxes in between
+                                    const srcRect = rects[edge.source];
+                                    const tgtRect = rects[edge.target];
+                                    let loopX = _sx + 20; // default: just past source right edge
+                                    if (srcRect) loopX = Math.max(loopX, srcRect.x + srcRect.w + 20);
+                                    if (tgtRect) loopX = Math.max(loopX, tgtRect.x + tgtRect.w + 20);
+
+                                    // Also avoid any box whose right edge is near our loop path
+                                    for (const [name, r] of Object.entries(rects)) {
+                                      if (name === edge.source || name === edge.target) continue;
+                                      const minY = Math.min(_sy, _ty);
+                                      const maxY = Math.max(_sy, _ty);
+                                      if (loopX >= r.x && loopX <= r.x + r.w + margin && maxY >= r.y && minY <= r.y + r.h) {
+                                        loopX = r.x + r.w + 20;
+                                      }
+                                    }
+
+                                    // Route: right from source, down/up to target Y, left to target
+                                    return `M ${_sx} ${_sy} H ${loopX} V ${_ty} H ${_tx}`;
+                                  }
+
+                                  // Forward edge: source is left of target
                                   const midX = (_sx + _tx) / 2;
-                                  return `M ${_sx} ${_sy} H ${midX} V ${_ty} H ${_tx}`;
+                                  const hits = verticalHitsBox(midX, _sy, _ty);
+
+                                  if (hits.length === 0) {
+                                    // No obstruction: simple H-V-H elbow
+                                    return `M ${_sx} ${_sy} H ${midX} V ${_ty} H ${_tx}`;
+                                  }
+
+                                  // Try routing the vertical segment to the right of all blocking boxes
+                                  const rightmostEdge = Math.max(...hits.map(h => h.x + h.w));
+                                  const shiftedRight = rightmostEdge + margin;
+                                  if (shiftedRight < _tx && verticalHitsBox(shiftedRight, _sy, _ty).length === 0) {
+                                    return `M ${_sx} ${_sy} H ${shiftedRight} V ${_ty} H ${_tx}`;
+                                  }
+
+                                  // Try routing to the left of all blocking boxes
+                                  const leftmostEdge = Math.min(...hits.map(h => h.x));
+                                  const shiftedLeft = leftmostEdge - margin;
+                                  if (shiftedLeft > _sx && verticalHitsBox(shiftedLeft, _sy, _ty).length === 0) {
+                                    return `M ${_sx} ${_sy} H ${shiftedLeft} V ${_ty} H ${_tx}`;
+                                  }
+
+                                  // Route around: go right past all obstructions, then vertical, then left to target
+                                  const minBlockY = Math.min(...hits.map(r => r.y));
+                                  const maxBlockY = Math.max(...hits.map(r => r.y + r.h));
+
+                                  // Decide whether to route above or below the obstruction
+                                  const routeAboveY = minBlockY - margin;
+                                  const routeBelowY = maxBlockY + margin;
+                                  const distAbove = Math.abs(_sy - routeAboveY) + Math.abs(routeAboveY - _ty);
+                                  const distBelow = Math.abs(_sy - routeBelowY) + Math.abs(routeBelowY - _ty);
+
+                                  // Use the shorter detour
+                                  const detourY = distAbove <= distBelow ? routeAboveY : routeBelowY;
+                                  const detourX = rightmostEdge + margin;
+
+                                  // H-V-H-V-H: exit source, jog vertically to clear the obstruction, then proceed to target
+                                  const clearMidX = (_sx + Math.min(_tx, detourX)) / 2;
+                                  return `M ${_sx} ${_sy} H ${clearMidX} V ${detourY} H ${detourX} V ${_ty} H ${_tx}`;
                                 };
 
                                 const isHovered = () => hoveredEdgeId() === edge.id;
