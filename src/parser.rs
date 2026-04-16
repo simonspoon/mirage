@@ -162,7 +162,14 @@ impl SwaggerSpec {
 
 /// Extract definition names referenced by a set of operations.
 /// Must be called BEFORE resolve_refs() since it reads $ref paths.
-pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> HashSet<String> {
+/// When `include_bodies` is true, body-parameter schemas are included;
+/// when false, only response schemas are collected. This lets callers
+/// distinguish "all referenced types" from "response-only types".
+pub fn definitions_for_paths(
+    spec: &SwaggerSpec,
+    paths: &[(String, String)],
+    include_bodies: bool,
+) -> HashSet<String> {
     let mut defs = HashSet::new();
     let spec_defs = spec.definitions.as_ref();
     for (path, method) in paths {
@@ -181,12 +188,14 @@ pub fn definitions_for_paths(spec: &SwaggerSpec, paths: &[(String, String)]) -> 
                         collect_schema_refs(schema, &mut defs, spec_defs);
                     }
                 }
-                if let Some(params) = &op.parameters {
-                    for param in params {
-                        if param.r#in == "body"
-                            && let Some(schema) = &param.schema
-                        {
-                            collect_schema_refs(schema, &mut defs, spec_defs);
+                if include_bodies {
+                    if let Some(params) = &op.parameters {
+                        for param in params {
+                            if param.r#in == "body"
+                                && let Some(schema) = &param.schema
+                            {
+                                collect_schema_refs(schema, &mut defs, spec_defs);
+                            }
                         }
                     }
                 }
@@ -822,5 +831,103 @@ mod tests {
         let path_item = spec.paths.get("/pet/{petId}").unwrap();
         let delete_op = path_item.delete.as_ref().unwrap();
         assert_eq!(primary_response_shape(delete_op), ResponseShape::Empty);
+    }
+
+    // --- Group 5: definitions_for_paths include_bodies flag ---
+
+    fn load_input_only() -> SwaggerSpec {
+        SwaggerSpec::from_file("tests/fixtures/input_only.yaml").unwrap()
+    }
+
+    #[test]
+    fn test_defs_for_paths_include_bodies_true() {
+        let spec = load_input_only();
+        let ops = vec![
+            ("/pets".to_string(), "get".to_string()),
+            ("/pets".to_string(), "post".to_string()),
+        ];
+        let defs = definitions_for_paths(&spec, &ops, true);
+        assert!(defs.contains("Pet"), "Pet should be in all_defs");
+        assert!(
+            defs.contains("CreatePetRequest"),
+            "CreatePetRequest should be in all_defs"
+        );
+    }
+
+    #[test]
+    fn test_defs_for_paths_include_bodies_false() {
+        let spec = load_input_only();
+        let ops = vec![
+            ("/pets".to_string(), "get".to_string()),
+            ("/pets".to_string(), "post".to_string()),
+        ];
+        let defs = definitions_for_paths(&spec, &ops, false);
+        assert!(defs.contains("Pet"), "Pet should be in response_defs");
+        assert!(
+            !defs.contains("CreatePetRequest"),
+            "CreatePetRequest should NOT be in response_defs"
+        );
+    }
+
+    #[test]
+    fn test_defs_for_paths_shared_type_in_both() {
+        // Pet is used in both response AND body (POST response returns Pet)
+        let spec = load_input_only();
+        let ops = vec![("/pets".to_string(), "post".to_string())];
+        let all = definitions_for_paths(&spec, &ops, true);
+        let resp = definitions_for_paths(&spec, &ops, false);
+        assert!(all.contains("Pet"));
+        assert!(resp.contains("Pet"), "Pet is in POST 201 response too");
+        assert!(all.contains("CreatePetRequest"));
+        assert!(!resp.contains("CreatePetRequest"));
+    }
+
+    #[test]
+    fn test_defs_for_paths_body_only_ref() {
+        // Only the POST endpoint, checking body-only type
+        let spec = load_input_only();
+        let ops = vec![("/pets".to_string(), "post".to_string())];
+        let resp = definitions_for_paths(&spec, &ops, false);
+        assert!(
+            !resp.contains("CreatePetRequest"),
+            "body-only type excluded from response_defs"
+        );
+    }
+
+    #[test]
+    fn test_input_only_table_exists_but_not_seeded() {
+        let mut spec = load_input_only();
+        let raw_spec = spec.clone();
+        let ops: Vec<(String, String)> = raw_spec
+            .path_operations()
+            .iter()
+            .map(|(p, m, _)| (p.to_string(), m.to_string()))
+            .collect();
+        let all_defs = definitions_for_paths(&raw_spec, &ops, true);
+        let response_defs = definitions_for_paths(&raw_spec, &ops, false);
+
+        spec.resolve_refs();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::create_tables_filtered(&conn, &spec, Some(&all_defs)).unwrap();
+        crate::seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
+            .unwrap();
+
+        // Pet table should exist and be seeded
+        let pet_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM \"Pet\"", [], |r| r.get(0))
+            .unwrap();
+        assert!(pet_count > 0, "Pet table should have seeded rows");
+
+        // CreatePetRequest table should exist but be empty
+        let req_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM \"CreatePetRequest\"", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            req_count, 0,
+            "CreatePetRequest table should exist but have 0 rows"
+        );
     }
 }

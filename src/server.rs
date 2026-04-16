@@ -1069,7 +1069,10 @@ async fn admin_configure(
         .collect();
 
     // Extract definition names from the unresolved spec's $ref paths
-    let needed_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops);
+    // all_defs includes body-parameter refs (for table creation + frozen_rows)
+    // response_defs excludes body-only types (for seeding — input-only tables stay empty)
+    let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
+    let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
     // Build raw op map for $ref-based table name lookups
     let raw_ops = raw_spec.path_operations();
@@ -1126,8 +1129,8 @@ async fn admin_configure(
     let mut all_routes = routes;
     all_routes.extend(collection_routes);
 
-    // Use definitions referenced by selected operations as the table filter
-    // Drop old tables, create only needed ones, seed
+    // Use all_defs for table creation (input-only types get empty tables),
+    // response_defs for seeding (only response types get fake rows)
     {
         let conn = state.db.lock().unwrap();
         let existing: Vec<String> = conn
@@ -1143,7 +1146,7 @@ async fn admin_configure(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&needed_defs)) {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs)) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1151,7 +1154,7 @@ async fn admin_configure(
                 .into_response();
         }
         if let Err(e) =
-            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&needed_defs), None, None)
+            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&response_defs), None, None)
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1798,7 +1801,10 @@ async fn admin_activate_recipe(
         .map(|e| (e.path.clone(), e.method.to_lowercase()))
         .collect();
 
-    let needed_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops);
+    // all_defs includes body-parameter refs (for table creation + frozen_rows)
+    // response_defs excludes body-only types (for seeding + quantity configs)
+    let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
+    let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
     let raw_ops = raw_spec.path_operations();
     let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
@@ -1854,6 +1860,9 @@ async fn admin_activate_recipe(
     all_routes.extend(collection_routes);
 
     // Drop old tables, create only needed ones, seed
+    // all_defs for table creation (input-only types get empty tables)
+    // all_defs for frozen_rows guard (input-only tables are writable)
+    // response_defs for seeding (only response types get fake rows)
     {
         let conn = state.db.lock().unwrap();
         let existing: Vec<String> = conn
@@ -1869,7 +1878,7 @@ async fn admin_activate_recipe(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&needed_defs)) {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs)) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1877,7 +1886,7 @@ async fn admin_activate_recipe(
                 .into_response();
         }
 
-        // Insert frozen rows before seeding
+        // Insert frozen rows before seeding (uses all_defs — input-only tables are writable)
         let frozen: crate::recipe::FrozenRows = match serde_json::from_str(&recipe.frozen_rows) {
             Ok(f) => f,
             Err(e) => {
@@ -1891,7 +1900,7 @@ async fn admin_activate_recipe(
         if !frozen.is_empty() {
             let spec_defs = spec.definitions.as_ref();
             for (table_name, rows) in &frozen {
-                if !needed_defs.contains(table_name) {
+                if !all_defs.contains(table_name) {
                     eprintln!(
                         "Warning: frozen_rows references unknown table \"{table_name}\", skipping"
                     );
@@ -1968,7 +1977,7 @@ async fn admin_activate_recipe(
             &conn,
             &spec,
             seed_count,
-            Some(&needed_defs),
+            Some(&response_defs),
             Some(&faker_rules),
             Some(&recipe_rules),
         ) {
@@ -1985,9 +1994,9 @@ async fn admin_activate_recipe(
     let pools = crate::composer::generate_pools(&spec, &pool_config, &faker_rules, &recipe_rules);
 
     // Build quantity configs: use recipe quantity_configs, with seed_count as default
+    // Only populate defaults for response_defs (no meaningless pools for input-only types)
     let mut effective_quantities = quantity_configs;
-    // For definitions that don't have explicit quantity configs, use seed_count
-    for def_name in &needed_defs {
+    for def_name in &response_defs {
         effective_quantities
             .entry(def_name.clone())
             .or_insert(crate::composer::QuantityConfig {

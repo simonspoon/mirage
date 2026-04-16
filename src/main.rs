@@ -271,24 +271,30 @@ async fn main() {
     if let Some(spec_path) = &cli.spec {
         let mut spec = parser::SwaggerSpec::from_file(spec_path.to_str().unwrap()).unwrap();
         let raw_spec = spec.clone();
+
+        // Build def sets from raw_spec BEFORE resolve_refs()
+        let all_ops: Vec<(String, String)> = raw_spec
+            .path_operations()
+            .iter()
+            .map(|(path, method, _)| (path.to_string(), method.to_string()))
+            .collect();
+        let all_defs = parser::definitions_for_paths(&raw_spec, &all_ops, true);
+        let response_defs = parser::definitions_for_paths(&raw_spec, &all_ops, false);
+
         spec.resolve_refs();
 
-        // Create tables and seed
+        // Create tables for all_defs, seed only response_defs
         {
             let conn = db.lock().unwrap();
-            schema::create_tables(&conn, &spec).unwrap();
-            seeder::seed_tables(&conn, &spec, 10).unwrap();
+            schema::create_tables_filtered(&conn, &spec, Some(&all_defs)).unwrap();
+            seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
+                .unwrap();
         }
 
         // Populate registry
         server::populate_registry(&mut registry.write().unwrap(), &spec, &raw_spec);
 
         // Populate document store using composer with default configs
-        let all_ops: Vec<(String, String)> = raw_spec
-            .path_operations()
-            .iter()
-            .map(|(path, method, _)| (path.to_string(), method.to_string()))
-            .collect();
         let entity_graph = entity_graph::build_entity_graph(&raw_spec, &all_ops);
         let pool_config = composer::SharedPoolConfig::new();
         let no_faker_rules = composer::FakerRules::new();
@@ -296,13 +302,11 @@ async fn main() {
         let pools =
             composer::generate_pools(&spec, &pool_config, &no_faker_rules, &no_recipe_rules);
         let mut quantities = composer::QuantityConfigs::new();
-        if let Some(defs) = &spec.definitions {
-            for def_name in defs.keys() {
-                quantities.insert(
-                    def_name.clone(),
-                    composer::QuantityConfig { min: 10, max: 10 },
-                );
-            }
+        for def_name in &response_defs {
+            quantities.insert(
+                def_name.clone(),
+                composer::QuantityConfig { min: 10, max: 10 },
+            );
         }
         let all_endpoints: Vec<server::EndpointInfo> = raw_spec
             .path_operations()
