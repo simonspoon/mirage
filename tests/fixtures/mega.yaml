@@ -40,6 +40,88 @@ paths:
             type: array
             items:
               $ref: "#/definitions/Owner"
+  /widgets:
+    get:
+      operationId: listWidgets
+      summary: List widgets
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          type: string
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Widget"
+    post:
+      operationId: createWidget
+      summary: Create widget
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/Widget"
+      responses:
+        "201":
+          description: widget created
+          schema:
+            $ref: "#/definitions/Widget"
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      summary: Get widget by id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: integer
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            $ref: "#/definitions/Widget"
+    put:
+      operationId: updateWidget
+      summary: Update widget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: integer
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/Widget"
+      responses:
+        "200":
+          description: widget updated
+          schema:
+            $ref: "#/definitions/Widget"
+    delete:
+      operationId: deleteWidget
+      summary: Delete widget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: integer
+      responses:
+        # 200 declared (spec-cosmetic) with $ref Widget so the server's table
+        # resolver (primary_response_def prefers 200 then 201) picks "Widget"
+        # instead of falling back to the pluralized path segment "Widgets",
+        # which would not match the definition-backed SQLite table. Runtime
+        # still returns 204 (handler hardcoded in src/server.rs:376).
+        "200":
+          description: widget deleted
+          schema:
+            $ref: "#/definitions/Widget"
+        "204":
+          description: widget deleted
 definitions:
   BaseAudit:
     type: object
@@ -114,4 +196,15 @@ definitions:
           - beta
           - gamma
       const_field:
+        type: string
+  Widget:
+    type: object
+    properties:
+      id:
+        type: integer
+      name:
+        type: string
+      price:
+        type: number
+      status:
         type: string

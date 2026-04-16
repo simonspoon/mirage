@@ -540,3 +540,126 @@ fn test_shared_type_pool() {
         );
     }
 }
+
+#[test]
+fn test_endpoint_method_coverage() {
+    // Exercises every supported HTTP method + parameter style on a flat-primitive
+    // Widget resource declared in mega.yaml. Single fn per acceptance criteria.
+    let server = MirageServer::start("tests/fixtures/mega.yaml", "/widgets");
+    let client = reqwest::blocking::Client::new();
+
+    // (a) GET collection — auto-seeded baseline.
+    let resp = client.get(server.url("/widgets")).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let arr = body
+        .as_array()
+        .expect("/widgets response should be a JSON array");
+    assert!(!arr.is_empty(), "/widgets array should have >=1 seeded row");
+    assert!(
+        arr[0]["name"].is_string(),
+        "widget[0].name must be string — row: {}",
+        arr[0]
+    );
+    assert!(
+        arr[0]["id"].is_i64(),
+        "widget[0].id must be integer — row: {}",
+        arr[0]
+    );
+    let baseline_len = arr.len();
+
+    // (b) POST create — id echoed from last_insert_rowid (src/server.rs:355).
+    let payload = serde_json::json!({
+        "name": "coverage-widget",
+        "price": 9.99,
+        "status": "active"
+    });
+    let resp = client
+        .post(server.url("/widgets"))
+        .json(&payload)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().unwrap();
+    let new_id = created["id"]
+        .as_i64()
+        .expect("POST response must include integer id");
+    assert_eq!(
+        created["name"].as_str(),
+        Some("coverage-widget"),
+        "POST response name mismatch — body: {created}"
+    );
+
+    // (c) GET single — lookup by rowid returned from POST. Note: stored `id`
+    //     column is NULL because POST payload omitted id (echoed id in POST
+    //     response is last_insert_rowid only, not persisted into the column).
+    //     Thus we assert name round-trip + reachability only, not id equality.
+    //     Deviation logged on task mlsz.
+    let resp = client
+        .get(server.url(&format!("/widgets/{new_id}")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let fetched: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        fetched["name"].as_str(),
+        Some("coverage-widget"),
+        "GET single name mismatch — body: {fetched}"
+    );
+
+    // (d) DELETE — 204 + empty body.
+    let resp = client
+        .delete(server.url(&format!("/widgets/{new_id}")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let body_text = resp.text().unwrap();
+    assert!(
+        body_text.is_empty(),
+        "DELETE body must be empty, got: {body_text}"
+    );
+
+    // (e) GET single non-existent — 404.
+    let resp = client.get(server.url("/widgets/999999")).send().unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // (f) PUT — pins current 405 fall-through at src/server.rs:505. Uses
+    //     auto-seeded rowid 1 (not new_id, which was deleted in step d).
+    //     Literal 405 assertion so any silent 200/500 future regression fails
+    //     this pin.
+    let update = serde_json::json!({
+        "name": "updated-widget",
+        "price": 19.99,
+        "status": "inactive"
+    });
+    let resp = client
+        .put(server.url("/widgets/1"))
+        .json(&update)
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        405,
+        "PUT pin: expect 405 from dispatch fall-through at src/server.rs:505"
+    );
+
+    // (g) Query-param — pins accept-but-ignore behavior. Filter must NOT reduce
+    //     result length vs. baseline_len (is_array alone would be redundant with
+    //     step a).
+    let resp = client
+        .get(server.url("/widgets?filter=anything"))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let filtered = body
+        .as_array()
+        .expect("/widgets?filter= response should be a JSON array");
+    assert_eq!(
+        filtered.len(),
+        baseline_len,
+        "query-param pin: filtered length ({}) must equal unfiltered baseline ({}) — filter currently accept-but-ignore",
+        filtered.len(),
+        baseline_len
+    );
+}
