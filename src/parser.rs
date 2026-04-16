@@ -188,14 +188,12 @@ pub fn definitions_for_paths(
                         collect_schema_refs(schema, &mut defs, spec_defs);
                     }
                 }
-                if include_bodies {
-                    if let Some(params) = &op.parameters {
-                        for param in params {
-                            if param.r#in == "body"
-                                && let Some(schema) = &param.schema
-                            {
-                                collect_schema_refs(schema, &mut defs, spec_defs);
-                            }
+                if include_bodies && let Some(params) = &op.parameters {
+                    for param in params {
+                        if param.r#in == "body"
+                            && let Some(schema) = &param.schema
+                        {
+                            collect_schema_refs(schema, &mut defs, spec_defs);
                         }
                     }
                 }
@@ -263,10 +261,10 @@ pub fn classify_response_schema(schema: &SchemaObject) -> ResponseShape {
 pub fn primary_response_shape(op: &Operation) -> ResponseShape {
     // Check 200 first, then 201
     for code in &["200", "201"] {
-        if let Some(resp) = op.responses.get(*code) {
-            if let Some(schema) = &resp.schema {
-                return classify_response_schema(schema);
-            }
+        if let Some(resp) = op.responses.get(*code)
+            && let Some(schema) = &resp.schema
+        {
+            return classify_response_schema(schema);
             // no schema on this response: continue to next priority code
         }
     }
@@ -274,10 +272,12 @@ pub fn primary_response_shape(op: &Operation) -> ResponseShape {
     let mut keys: Vec<&String> = op.responses.keys().collect();
     keys.sort();
     for key in keys {
-        if key.starts_with('2') && key != "200" && key != "201" {
-            if let Some(schema) = &op.responses[key].schema {
-                return classify_response_schema(schema);
-            }
+        if key.starts_with('2')
+            && key != "200"
+            && key != "201"
+            && let Some(schema) = &op.responses[key].schema
+        {
+            return classify_response_schema(schema);
         }
     }
     ResponseShape::Empty

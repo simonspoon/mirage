@@ -132,8 +132,34 @@ pub struct ConfigureRequest {
     pub seed_count: Option<usize>,
 }
 
+/// Query PRAGMA table_info for `table` and return the set of column names whose
+/// declared type is BOOLEAN (case-insensitive). Used by row_to_json to emit
+/// JSON true/false for boolean-typed columns instead of integer 0/1.
+fn bool_cols_for_table(conn: &rusqlite::Connection, table: &str) -> HashSet<String> {
+    let sql = format!("PRAGMA table_info(\"{table}\")");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    let rows = stmt.query_map([], |row| {
+        let col_name: String = row.get(1)?;
+        let col_type: String = row.get(2)?;
+        Ok((col_name, col_type))
+    });
+    let mut set = HashSet::new();
+    if let Ok(iter) = rows {
+        for entry in iter.flatten() {
+            if entry.1.eq_ignore_ascii_case("BOOLEAN") {
+                set.insert(entry.0);
+            }
+        }
+    }
+    set
+}
+
 fn row_to_json(
     col_names: &[String],
+    bool_cols: &HashSet<String>,
     row: &rusqlite::Row,
 ) -> Result<serde_json::Value, rusqlite::Error> {
     let mut map = serde_json::Map::new();
@@ -141,7 +167,13 @@ fn row_to_json(
         let val: SqlValue = row.get(idx)?;
         let json_val = match val {
             SqlValue::Null => serde_json::Value::Null,
-            SqlValue::Integer(n) => serde_json::Value::Number(serde_json::Number::from(n)),
+            SqlValue::Integer(n) => {
+                if bool_cols.contains(name) {
+                    serde_json::Value::Bool(n != 0)
+                } else {
+                    serde_json::Value::Number(serde_json::Number::from(n))
+                }
+            }
             SqlValue::Real(f) => serde_json::Number::from_f64(f)
                 .map_or(serde_json::Value::Null, serde_json::Value::Number),
             SqlValue::Text(s) => {
@@ -165,6 +197,7 @@ fn row_to_json(
 
 async fn get_collection(table: String, db: Db) -> Response {
     let conn = db.lock().unwrap();
+    let bool_cols = bool_cols_for_table(&conn, &table);
     let sql = format!("SELECT * FROM \"{table}\"");
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -178,7 +211,7 @@ async fn get_collection(table: String, db: Db) -> Response {
     };
     let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let rows: Vec<serde_json::Value> = stmt
-        .query_map([], |row| row_to_json(&col_names, row))
+        .query_map([], |row| row_to_json(&col_names, &bool_cols, row))
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
@@ -197,6 +230,7 @@ async fn get_single(table: String, db: Db, id: String) -> Response {
         }
     };
     let conn = db.lock().unwrap();
+    let bool_cols = bool_cols_for_table(&conn, &table);
     let sql = format!("SELECT * FROM \"{table}\" WHERE rowid = ?");
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -209,7 +243,7 @@ async fn get_single(table: String, db: Db, id: String) -> Response {
         }
     };
     let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
-    match stmt.query_row([id], |row| row_to_json(&col_names, row)) {
+    match stmt.query_row([id], |row| row_to_json(&col_names, &bool_cols, row)) {
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(rusqlite::Error::QueryReturnedNoRows) => (
             StatusCode::NOT_FOUND,
@@ -721,6 +755,7 @@ async fn admin_table_data(
     };
 
     // Get rows
+    let bool_cols = bool_cols_for_table(&conn, &name);
     let sql = format!("SELECT rowid, * FROM \"{}\"", name);
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -734,7 +769,7 @@ async fn admin_table_data(
     };
     let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let rows: Vec<serde_json::Value> = stmt
-        .query_map([], |row| row_to_json(&col_names, row))
+        .query_map([], |row| row_to_json(&col_names, &bool_cols, row))
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
@@ -865,11 +900,12 @@ async fn admin_update_table_row(
     }
 
     // Re-query the updated row
+    let bool_cols = bool_cols_for_table(&conn, &name);
     let select_sql = format!("SELECT rowid, * FROM \"{}\" WHERE rowid = ?", name);
     let mut stmt = conn.prepare(&select_sql).unwrap();
     let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let row = stmt
-        .query_row([rowid], |row| row_to_json(&col_names, row))
+        .query_row([rowid], |row| row_to_json(&col_names, &bool_cols, row))
         .unwrap();
 
     Json(row).into_response()
@@ -4809,5 +4845,90 @@ definitions:
         let names: Vec<&str> = arr.iter().map(|r| r["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"My Petstore"));
         assert!(names.contains(&"My Petstore (copy)"));
+    }
+
+    // -------------------------------------------------------------------
+    // row_to_json column-type-aware boolean emission
+    // -------------------------------------------------------------------
+
+    fn rows_as_json(conn: &Connection, table: &str) -> Vec<serde_json::Value> {
+        let bool_cols = bool_cols_for_table(conn, table);
+        let sql = format!("SELECT * FROM \"{table}\"");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        stmt.query_map([], |row| row_to_json(&col_names, &bool_cols, row))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_row_to_json_boolean_true_emits_json_true() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (flag BOOLEAN)", []).unwrap();
+        conn.execute("INSERT INTO t (flag) VALUES (1)", []).unwrap();
+        let rows = rows_as_json(&conn, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["flag"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn test_row_to_json_boolean_false_emits_json_false() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (flag BOOLEAN)", []).unwrap();
+        conn.execute("INSERT INTO t (flag) VALUES (0)", []).unwrap();
+        let rows = rows_as_json(&conn, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["flag"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn test_row_to_json_integer_column_unchanged() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (age INTEGER)", []).unwrap();
+        conn.execute("INSERT INTO t (age) VALUES (42)", []).unwrap();
+        let rows = rows_as_json(&conn, "t");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]["age"].is_i64(),
+            "age should be JSON integer, got {}",
+            rows[0]["age"]
+        );
+        assert_eq!(rows[0]["age"].as_i64().unwrap(), 42);
+        assert!(!rows[0]["age"].is_boolean(), "age must not be JSON boolean");
+    }
+
+    #[test]
+    fn test_row_to_json_boolean_null_emits_json_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (flag BOOLEAN)", []).unwrap();
+        conn.execute("INSERT INTO t (flag) VALUES (NULL)", [])
+            .unwrap();
+        let rows = rows_as_json(&conn, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["flag"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_row_to_json_mixed_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE t (flag BOOLEAN, count INTEGER, name TEXT, score REAL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO t (flag, count, name, score) VALUES (1, 42, 'x', 2.5)",
+            [],
+        )
+        .unwrap();
+        let rows = rows_as_json(&conn, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["flag"], serde_json::Value::Bool(true));
+        assert!(rows[0]["count"].is_i64());
+        assert_eq!(rows[0]["count"].as_i64().unwrap(), 42);
+        assert_eq!(rows[0]["name"], serde_json::Value::String("x".to_string()));
+        assert!(rows[0]["score"].is_f64());
+        assert!((rows[0]["score"].as_f64().unwrap() - 2.5).abs() < 1e-9);
     }
 }

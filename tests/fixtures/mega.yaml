@@ -1,0 +1,57 @@
+swagger: "2.0"
+info:
+  title: Mega
+  version: "1.0.0"
+basePath: /
+paths:
+  /primitives:
+    get:
+      operationId: listPrimitives
+      summary: List primitives
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Primitives"
+definitions:
+  Primitives:
+    type: object
+    properties:
+      str_plain:
+        type: string
+      int32_field:
+        type: integer
+        format: int32
+      int64_field:
+        type: integer
+        format: int64
+      float_field:
+        type: number
+        format: float
+      double_field:
+        type: number
+        format: double
+      bool_field:
+        type: boolean
+      date_field:
+        type: string
+        format: date
+      datetime_field:
+        type: string
+        format: date-time
+      uuid_field:
+        type: string
+        format: uuid
+      email_field:
+        type: string
+        format: email
+      enum_field:
+        type: string
+        enum:
+          - alpha
+          - beta
+          - gamma
+      const_field:
+        type: string

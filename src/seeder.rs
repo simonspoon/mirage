@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{NaiveDate, SecondsFormat};
 use fake::Fake;
 use fake::faker::address::en::*;
 use fake::faker::company::en::{Buzzword, CatchPhrase, CompanyName};
@@ -33,6 +34,7 @@ pub enum FakerStrategy {
     Paragraph,
     Uuid,
     Date,
+    DateTime,
     Integer,
     Float,
     Boolean,
@@ -135,6 +137,19 @@ fn generate_for_strategy(strategy: &FakerStrategy) -> serde_json::Value {
             let month = rng.random_range(1..=12u32);
             let day = rng.random_range(1..=28u32);
             serde_json::Value::String(format!("{year:04}-{month:02}-{day:02}"))
+        }
+        FakerStrategy::DateTime => {
+            let year = rng.random_range(2020..=2025);
+            let month = rng.random_range(1..=12u32);
+            let day = rng.random_range(1..=28u32);
+            let hour = rng.random_range(0..=23u32);
+            let min = rng.random_range(0..=59u32);
+            let sec = rng.random_range(0..=59u32);
+            let dt = NaiveDate::from_ymd_opt(year, month, day)
+                .and_then(|d| d.and_hms_opt(hour, min, sec))
+                .map(|ndt| ndt.and_utc())
+                .expect("valid datetime components");
+            serde_json::Value::String(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
         }
         FakerStrategy::Integer => {
             let n: i64 = rng.random_range(1..10000);
@@ -280,7 +295,7 @@ fn parse_strategy_string(s: &str) -> Option<FakerStrategy> {
 /// Resolve format string to a FakerStrategy.
 fn strategy_from_format(format: &str) -> Option<FakerStrategy> {
     match format {
-        "date-time" => Some(FakerStrategy::Date),
+        "date-time" => Some(FakerStrategy::DateTime),
         "date" => Some(FakerStrategy::Date),
         "email" => Some(FakerStrategy::Email),
         "uri" | "url" => Some(FakerStrategy::Url),
@@ -866,11 +881,9 @@ pub fn insert_composed_rows(
         // Get actual table columns via PRAGMA
         let table_columns: HashSet<String> = {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table_name))?;
-            let cols = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
+            stmt.query_map([], |row| row.get::<_, String>(1))?
                 .filter_map(|r| r.ok())
-                .collect();
-            cols
+                .collect()
         };
 
         for row in rows {
@@ -1231,5 +1244,62 @@ definitions:
         for id in &ids {
             assert_eq!(*id, 42);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // DateTime strategy + format mapping tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_strategy_from_format_date_time_maps_to_datetime() {
+        assert_eq!(
+            strategy_from_format("date-time"),
+            Some(FakerStrategy::DateTime)
+        );
+    }
+
+    #[test]
+    fn test_strategy_from_format_date_still_maps_to_date() {
+        assert_eq!(strategy_from_format("date"), Some(FakerStrategy::Date));
+    }
+
+    #[test]
+    fn test_generate_for_strategy_datetime_is_rfc3339() {
+        let tz_re = regex::Regex::new(r"[+-]\d{2}:\d{2}$").unwrap();
+        for _ in 0..100 {
+            let v = generate_for_strategy(&FakerStrategy::DateTime);
+            let s = v.as_str().expect("DateTime should emit a JSON string");
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(s).is_ok(),
+                "not RFC3339: {s}"
+            );
+            assert!(s.contains('T'), "missing T separator: {s}");
+            assert!(
+                s.ends_with('Z') || tz_re.is_match(s),
+                "missing Z or offset: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_for_strategy_datetime_distinct_from_date() {
+        let dt = generate_for_strategy(&FakerStrategy::DateTime);
+        let date = generate_for_strategy(&FakerStrategy::Date);
+        assert!(
+            dt.as_str().unwrap().contains('T'),
+            "DateTime should contain 'T'"
+        );
+        assert!(
+            !date.as_str().unwrap().contains('T'),
+            "Date should not contain 'T'"
+        );
+    }
+
+    #[test]
+    fn test_parse_strategy_string_datetime() {
+        assert_eq!(
+            parse_strategy_string("date_time"),
+            Some(FakerStrategy::DateTime)
+        );
     }
 }

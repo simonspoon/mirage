@@ -7,7 +7,7 @@ fn map_type(schema: &SchemaObject) -> &str {
     match schema.schema_type.as_deref() {
         Some("integer") => "INTEGER",
         Some("number") => "REAL",
-        Some("boolean") => "INTEGER",
+        Some("boolean") => "BOOLEAN",
         Some("string") => "TEXT",
         Some("object") => "TEXT",
         Some("array") => "TEXT",
@@ -168,6 +168,49 @@ mod tests {
                 "DDL for {name} should start with CREATE TABLE"
             );
         }
+    }
+
+    #[test]
+    fn test_schema_map_type_boolean_returns_boolean() {
+        use crate::parser::SchemaObject;
+        use std::collections::HashMap;
+
+        let bool_schema = SchemaObject {
+            schema_type: Some("boolean".to_string()),
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        assert_eq!(map_type(&bool_schema), "BOOLEAN");
+
+        // End-to-end: DDL for a definition with a boolean column must use BOOLEAN.
+        let mut props = HashMap::new();
+        props.insert("flag".to_string(), bool_schema);
+        let parent = SchemaObject {
+            schema_type: Some("object".to_string()),
+            format: None,
+            properties: Some(props),
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        let ddl = generate_table_sql("Thing", &parent);
+        assert!(
+            ddl.contains("\"flag\" BOOLEAN"),
+            "DDL should declare flag BOOLEAN, got: {ddl}"
+        );
     }
 
     #[test]
