@@ -1,6 +1,6 @@
 // Document-based seeder with shared entity pools
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::RngExt;
 
@@ -25,8 +25,12 @@ pub type DocumentStore = HashMap<String, Vec<serde_json::Value>>;
 
 /// Generate pools of shared entities according to pool_config.
 /// Each pool entry maps a definition name to N generated instances.
+/// `raw_spec` retains `$ref` paths (cleared by resolve_refs) and is used
+/// to discover inter-pool dependencies so pools are generated in
+/// topological order. `spec` (resolved) is used for actual generation.
 pub fn generate_pools(
     spec: &SwaggerSpec,
+    raw_spec: &SwaggerSpec,
     pool_config: &SharedPoolConfig,
     faker_rules: &FakerRules,
     recipe_rules: &[Rule],
@@ -36,23 +40,34 @@ pub fn generate_pools(
         None => return DocumentStore::new(),
     };
 
+    let raw_defs = raw_spec.definitions.as_ref();
+
     let field_rule_map = build_field_rule_map(recipe_rules);
     let compare_rules_by_def = build_compare_rules_by_def(recipe_rules);
 
+    // Topologically sort pool definitions so dependencies generate first.
+    let sorted_names = topo_sort_pool_defs(raw_spec, pool_config);
+
     let mut store = DocumentStore::new();
 
-    for (def_name, &pool_size) in pool_config {
+    for def_name in &sorted_names {
+        let pool_size = match pool_config.get(def_name) {
+            Some(&s) => s,
+            None => continue,
+        };
         let schema = match defs.get(def_name) {
             Some(s) => s,
             None => continue,
         };
+        let raw_schema = raw_defs.and_then(|d| d.get(def_name));
 
         let mut instances = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
             let mut doc = generate_document_from_schema(
                 def_name,
                 schema,
-                &DocumentStore::new(),
+                raw_schema,
+                &store,
                 faker_rules,
                 &field_rule_map,
                 compare_rules_by_def.get(def_name).map(Vec::as_slice),
@@ -70,6 +85,127 @@ pub fn generate_pools(
     }
 
     store
+}
+
+/// Build a dependency graph from the raw (unresolved) spec and topologically
+/// sort pool definition names using Kahn's algorithm.
+/// Nodes involved in cycles are appended after sorted nodes (graceful degradation).
+fn topo_sort_pool_defs(raw_spec: &SwaggerSpec, pool_config: &SharedPoolConfig) -> Vec<String> {
+    let raw_defs = match &raw_spec.definitions {
+        Some(d) => d,
+        None => {
+            let mut names: Vec<String> = pool_config.keys().cloned().collect();
+            names.sort();
+            return names;
+        }
+    };
+
+    let pool_names: HashSet<String> = pool_config.keys().cloned().collect();
+
+    // edges[A] = {B, ...} means "A depends on B" (B must generate before A).
+    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+    for name in &pool_names {
+        edges.entry(name.clone()).or_default();
+    }
+
+    for name in &pool_names {
+        if let Some(schema) = raw_defs.get(name) {
+            let deps = collect_ref_deps(schema);
+            for dep in deps {
+                if pool_names.contains(&dep) && dep != *name {
+                    edges.entry(name.clone()).or_default().insert(dep);
+                }
+            }
+        }
+    }
+
+    // in_degree[X] = number of dependencies X has (edges from X to others).
+    let mut in_deg: HashMap<String, usize> = HashMap::new();
+    for name in &pool_names {
+        in_deg.insert(name.clone(), 0);
+    }
+    for (name, deps) in &edges {
+        // name depends on each dep, so in topo order name comes after its deps.
+        // In Kahn's with "before" edges (dep -> name), in_degree of name = deps.len().
+        *in_deg.entry(name.clone()).or_insert(0) = deps.len();
+    }
+
+    // Reverse edges: rev[dep] = set of names that depend on dep
+    let mut rev_edges: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, deps) in &edges {
+        for dep in deps {
+            rev_edges
+                .entry(dep.clone())
+                .or_default()
+                .push(name.clone());
+        }
+    }
+
+    // Start with nodes that have no dependencies (in_degree == 0)
+    let mut initial: Vec<String> = in_deg
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(name, _)| name.clone())
+        .collect();
+    initial.sort();
+
+    let mut queue: VecDeque<String> = initial.into_iter().collect();
+    let mut sorted: Vec<String> = Vec::new();
+
+    while let Some(name) = queue.pop_front() {
+        sorted.push(name.clone());
+        if let Some(dependents) = rev_edges.get(&name) {
+            let mut next: Vec<String> = Vec::new();
+            for dependent in dependents {
+                let deg = in_deg.get_mut(dependent).unwrap();
+                *deg -= 1;
+                if *deg == 0 {
+                    next.push(dependent.clone());
+                }
+            }
+            next.sort();
+            for n in next {
+                queue.push_back(n);
+            }
+        }
+    }
+
+    // Append any nodes stuck in cycles (graceful degradation)
+    if sorted.len() < pool_names.len() {
+        let sorted_set: HashSet<&str> = sorted.iter().map(|s| s.as_str()).collect();
+        let mut remaining: Vec<String> = pool_names
+            .iter()
+            .filter(|n| !sorted_set.contains(n.as_str()))
+            .cloned()
+            .collect();
+        remaining.sort();
+        sorted.extend(remaining);
+    }
+
+    sorted
+}
+
+/// Collect definition names referenced via `$ref` in a schema's properties and
+/// array items. Scans only one level deep (direct properties).
+fn collect_ref_deps(schema: &SchemaObject) -> Vec<String> {
+    let mut deps = Vec::new();
+    if let Some(ref props) = schema.properties {
+        for prop_schema in props.values() {
+            if let Some(ref ref_path) = prop_schema.ref_path
+                && let Some(name) = ref_path.strip_prefix("#/definitions/")
+            {
+                deps.push(name.to_string());
+            }
+            // Check array items
+            if let Some(ref items) = prop_schema.items
+                && let Some(ref ref_path) = items.ref_path
+                && let Some(name) = ref_path.strip_prefix("#/definitions/")
+            {
+                deps.push(name.to_string());
+            }
+        }
+    }
+    deps
 }
 
 /// Compose documents for each selected endpoint's response definition.
@@ -142,6 +278,7 @@ pub fn compose_documents(
             let mut doc = generate_document_from_schema(
                 &def_name,
                 schema,
+                None,
                 pools,
                 faker_rules,
                 &field_rule_map,
@@ -163,9 +300,13 @@ pub fn compose_documents(
 }
 
 /// Generate a single document from a schema, sampling from pools for $ref properties.
+/// When `raw_schema` is provided, its property `ref_path` values are used for pool
+/// lookups (the resolved schema has `ref_path` cleared by `resolve_refs`).
+#[allow(clippy::too_many_arguments)]
 fn generate_document_from_schema(
     def_name: &str,
     schema: &SchemaObject,
+    raw_schema: Option<&SchemaObject>,
     pools: &DocumentStore,
     faker_rules: &FakerRules,
     field_rule_map: &FieldRuleMap,
@@ -176,13 +317,17 @@ fn generate_document_from_schema(
         None => return fake_value_for_field(def_name, schema),
     };
 
+    let raw_props = raw_schema.and_then(|s| s.properties.as_ref());
+
     let mut map = serde_json::Map::new();
     let mut rng = rand::rng();
 
     for (prop_name, prop_schema) in props {
+        let raw_prop = raw_props.and_then(|rp| rp.get(prop_name));
         let value = generate_property_value(
             prop_name,
             prop_schema,
+            raw_prop,
             pools,
             &mut rng,
             def_name,
@@ -200,10 +345,13 @@ fn generate_document_from_schema(
 }
 
 /// Generate a value for a single property, consulting pools for $ref targets.
+/// `raw_prop` (from the unresolved spec) is checked first for `ref_path` since
+/// the resolved schema has those cleared.
 #[allow(clippy::too_many_arguments)]
 fn generate_property_value(
     prop_name: &str,
     prop_schema: &SchemaObject,
+    raw_prop: Option<&SchemaObject>,
     pools: &DocumentStore,
     rng: &mut impl rand::Rng,
     def_name: &str,
@@ -212,10 +360,21 @@ fn generate_property_value(
 ) -> serde_json::Value {
     // Check if this is an array with $ref items pointing to a pool
     if prop_schema.schema_type.as_deref() == Some("array")
-        && let Some(ref items) = prop_schema.items
+        || raw_prop
+            .and_then(|r| r.schema_type.as_deref())
+            == Some("array")
     {
-        // If items reference a pooled definition, sample from pool
-        if let Some(target_def) = ref_target_name(items)
+        // Try raw_prop items ref first, then resolved items ref
+        let raw_items_ref = raw_prop
+            .and_then(|r| r.items.as_ref())
+            .and_then(|i| ref_target_name(i));
+        let resolved_items_ref = prop_schema
+            .items
+            .as_ref()
+            .and_then(|i| ref_target_name(i));
+        let target = raw_items_ref.or(resolved_items_ref);
+
+        if let Some(target_def) = target
             && let Some(pool) = pools.get(&target_def)
             && !pool.is_empty()
         {
@@ -233,7 +392,12 @@ fn generate_property_value(
     }
 
     // Check if this property references a pooled definition (object $ref)
-    if let Some(target_def) = ref_target_name(prop_schema)
+    // Try raw_prop ref first, then resolved schema ref
+    let raw_ref = raw_prop.and_then(ref_target_name);
+    let resolved_ref = ref_target_name(prop_schema);
+    let target = raw_ref.or(resolved_ref);
+
+    if let Some(target_def) = target
         && let Some(pool) = pools.get(&target_def)
         && !pool.is_empty()
     {
@@ -380,11 +544,12 @@ mod tests {
     #[test]
     fn test_generate_pools_exact_count() {
         let spec = load_petstore_resolved();
+        let raw_spec = load_petstore_raw();
         let mut pool_config = SharedPoolConfig::new();
         pool_config.insert("Category".to_string(), 5);
         pool_config.insert("Tag".to_string(), 3);
 
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
 
         assert_eq!(pools.get("Category").unwrap().len(), 5);
         assert_eq!(pools.get("Tag").unwrap().len(), 3);
@@ -400,9 +565,10 @@ mod tests {
     #[test]
     fn test_generate_pools_empty() {
         let spec = load_petstore_resolved();
+        let raw_spec = load_petstore_raw();
         let pool_config = SharedPoolConfig::new();
 
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
 
         assert!(pools.is_empty(), "empty config should produce empty pools");
     }
@@ -500,7 +666,7 @@ mod tests {
         // Create a Category pool
         let mut pool_config = SharedPoolConfig::new();
         pool_config.insert("Category".to_string(), 3);
-        let pools = generate_pools(&spec, &pool_config, &FakerRules::new(), &[]);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
 
         let mut quantities = QuantityConfigs::new();
         quantities.insert("Pet".to_string(), QuantityConfig { min: 5, max: 5 });
@@ -532,5 +698,297 @@ mod tests {
             assert!(pet.is_object());
             assert!(pet.get("category").is_some());
         }
+    }
+
+    /// Build a minimal SwaggerSpec with the given definitions.
+    fn build_spec(defs: HashMap<String, SchemaObject>) -> SwaggerSpec {
+        SwaggerSpec {
+            swagger: "2.0".to_string(),
+            info: crate::parser::Info {
+                title: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            paths: HashMap::new(),
+            definitions: Some(defs),
+        }
+    }
+
+    /// Helper: create a SchemaObject with string properties (no refs).
+    fn string_schema(fields: &[&str]) -> SchemaObject {
+        let mut props = HashMap::new();
+        for &f in fields {
+            props.insert(
+                f.to_string(),
+                SchemaObject {
+                    schema_type: Some("string".to_string()),
+                    format: None,
+                    properties: None,
+                    items: None,
+                    required: None,
+                    ref_path: None,
+                    enum_values: None,
+                    description: None,
+                    additional_properties: None,
+                    all_of: None,
+                    x_faker: None,
+                },
+            );
+        }
+        SchemaObject {
+            schema_type: Some("object".to_string()),
+            format: None,
+            properties: Some(props),
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        }
+    }
+
+    /// Helper: create a SchemaObject with string fields plus a $ref field.
+    fn schema_with_ref(fields: &[&str], ref_field: &str, ref_target: &str) -> SchemaObject {
+        let mut schema = string_schema(fields);
+        let props = schema.properties.as_mut().unwrap();
+        props.insert(
+            ref_field.to_string(),
+            SchemaObject {
+                schema_type: None,
+                format: None,
+                properties: None,
+                items: None,
+                required: None,
+                ref_path: Some(format!("#/definitions/{}", ref_target)),
+                enum_values: None,
+                description: None,
+                additional_properties: None,
+                all_of: None,
+                x_faker: None,
+            },
+        );
+        schema
+    }
+
+    /// Helper: create a SchemaObject with string fields plus an array-of-$ref field.
+    fn schema_with_array_ref(fields: &[&str], ref_field: &str, ref_target: &str) -> SchemaObject {
+        let mut schema = string_schema(fields);
+        let props = schema.properties.as_mut().unwrap();
+        props.insert(
+            ref_field.to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                format: None,
+                properties: None,
+                items: Some(Box::new(SchemaObject {
+                    schema_type: None,
+                    format: None,
+                    properties: None,
+                    items: None,
+                    required: None,
+                    ref_path: Some(format!("#/definitions/{}", ref_target)),
+                    enum_values: None,
+                    description: None,
+                    additional_properties: None,
+                    all_of: None,
+                    x_faker: None,
+                })),
+                required: None,
+                ref_path: None,
+                enum_values: None,
+                description: None,
+                additional_properties: None,
+                all_of: None,
+                x_faker: None,
+            },
+        );
+        schema
+    }
+
+    /// Helper: build a resolved version of a raw spec by inlining refs.
+    fn resolve(raw: &SwaggerSpec) -> SwaggerSpec {
+        let mut spec = raw.clone();
+        spec.resolve_refs();
+        spec
+    }
+
+    #[test]
+    fn generate_pools_ref_field_samples_from_accumulated_store() {
+        // PatientDto has {name: string}
+        // HospitalListDto has {patient: $ref PatientDto, address: string}
+        let mut defs = HashMap::new();
+        defs.insert("PatientDto".to_string(), string_schema(&["name"]));
+        defs.insert(
+            "HospitalListDto".to_string(),
+            schema_with_ref(&["address"], "patient", "PatientDto"),
+        );
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("PatientDto".to_string(), 3);
+        pool_config.insert("HospitalListDto".to_string(), 2);
+
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        assert_eq!(pools.get("PatientDto").unwrap().len(), 3);
+        assert_eq!(pools.get("HospitalListDto").unwrap().len(), 2);
+
+        // Each HospitalListDto.patient should be one of the PatientDto pool entries
+        let patient_pool = pools.get("PatientDto").unwrap();
+        for hospital in pools.get("HospitalListDto").unwrap() {
+            let patient = hospital.get("patient").expect("should have patient field");
+            assert!(
+                patient.is_object(),
+                "patient should be an object sampled from pool"
+            );
+            // The patient value should match one of the pool entries (by id)
+            let patient_id = patient.get("id");
+            assert!(
+                patient_id.is_some(),
+                "sampled patient should have id from pool"
+            );
+            let matches = patient_pool
+                .iter()
+                .any(|p| p.get("id") == patient_id);
+            assert!(matches, "patient should match a pool entry by id");
+        }
+    }
+
+    #[test]
+    fn generate_pools_dependency_order_is_deterministic() {
+        let mut defs = HashMap::new();
+        defs.insert("PatientDto".to_string(), string_schema(&["name"]));
+        defs.insert(
+            "HospitalListDto".to_string(),
+            schema_with_ref(&["address"], "patient", "PatientDto"),
+        );
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("PatientDto".to_string(), 3);
+        pool_config.insert("HospitalListDto".to_string(), 2);
+
+        // Run 20 times and verify structure is always correct
+        for _ in 0..20 {
+            let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+            assert_eq!(pools.get("PatientDto").unwrap().len(), 3);
+            assert_eq!(pools.get("HospitalListDto").unwrap().len(), 2);
+
+            let patient_pool = pools.get("PatientDto").unwrap();
+            for hospital in pools.get("HospitalListDto").unwrap() {
+                let patient = hospital.get("patient").unwrap();
+                let patient_id = patient.get("id");
+                assert!(patient_id.is_some());
+                assert!(patient_pool.iter().any(|p| p.get("id") == patient_id));
+            }
+        }
+    }
+
+    #[test]
+    fn generate_pools_three_level_chain() {
+        // C has {name: string}
+        // B has {label: string, c: $ref C}
+        // A has {title: string, b: $ref B}
+        let mut defs = HashMap::new();
+        defs.insert("C".to_string(), string_schema(&["name"]));
+        defs.insert("B".to_string(), schema_with_ref(&["label"], "c", "C"));
+        defs.insert("A".to_string(), schema_with_ref(&["title"], "b", "B"));
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("C".to_string(), 4);
+        pool_config.insert("B".to_string(), 3);
+        pool_config.insert("A".to_string(), 2);
+
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        assert_eq!(pools.get("C").unwrap().len(), 4);
+        assert_eq!(pools.get("B").unwrap().len(), 3);
+        assert_eq!(pools.get("A").unwrap().len(), 2);
+
+        let c_pool = pools.get("C").unwrap();
+        let b_pool = pools.get("B").unwrap();
+
+        // Each B.c should match a C pool entry
+        for b in b_pool {
+            let c_val = b.get("c").expect("B should have c field");
+            assert!(c_val.is_object());
+            assert!(c_pool.iter().any(|c| c.get("id") == c_val.get("id")));
+        }
+
+        // Each A.b should match a B pool entry
+        for a in pools.get("A").unwrap() {
+            let b_val = a.get("b").expect("A should have b field");
+            assert!(b_val.is_object());
+            assert!(b_pool.iter().any(|b| b.get("id") == b_val.get("id")));
+        }
+    }
+
+    #[test]
+    fn generate_pools_array_ref_samples_from_accumulated_store() {
+        // TagDto has {label: string}
+        // PostDto has {title: string, tags: array of $ref TagDto}
+        let mut defs = HashMap::new();
+        defs.insert("TagDto".to_string(), string_schema(&["label"]));
+        defs.insert(
+            "PostDto".to_string(),
+            schema_with_array_ref(&["title"], "tags", "TagDto"),
+        );
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("TagDto".to_string(), 5);
+        pool_config.insert("PostDto".to_string(), 3);
+
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        assert_eq!(pools.get("TagDto").unwrap().len(), 5);
+        assert_eq!(pools.get("PostDto").unwrap().len(), 3);
+
+        let tag_pool = pools.get("TagDto").unwrap();
+        for post in pools.get("PostDto").unwrap() {
+            let tags = post.get("tags").expect("PostDto should have tags field");
+            assert!(tags.is_array(), "tags should be an array");
+            let tags_arr = tags.as_array().unwrap();
+            assert!(!tags_arr.is_empty(), "tags array should not be empty");
+            for tag in tags_arr {
+                assert!(tag.is_object(), "each tag should be an object from pool");
+                let tag_id = tag.get("id");
+                assert!(tag_id.is_some());
+                assert!(tag_pool.iter().any(|t| t.get("id") == tag_id));
+            }
+        }
+    }
+
+    #[test]
+    fn generate_pools_cycle_does_not_panic() {
+        // X has {y: $ref Y}
+        // Y has {x: $ref X}
+        let mut defs = HashMap::new();
+        defs.insert("X".to_string(), schema_with_ref(&["name"], "y", "Y"));
+        defs.insert("Y".to_string(), schema_with_ref(&["label"], "x", "X"));
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("X".to_string(), 2);
+        pool_config.insert("Y".to_string(), 2);
+
+        // Should not panic -- cycles degrade gracefully
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        assert_eq!(pools.get("X").unwrap().len(), 2);
+        assert_eq!(pools.get("Y").unwrap().len(), 2);
     }
 }

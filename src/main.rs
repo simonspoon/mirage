@@ -308,7 +308,7 @@ async fn main() {
         let no_faker_rules = composer::FakerRules::new();
         let no_recipe_rules: Vec<rules::Rule> = Vec::new();
         let pools =
-            composer::generate_pools(&spec, &pool_config, &no_faker_rules, &no_recipe_rules);
+            composer::generate_pools(&spec, &raw_spec, &pool_config, &no_faker_rules, &no_recipe_rules);
         let mut quantities = composer::QuantityConfigs::new();
         for def_name in &response_defs {
             quantities.insert(
