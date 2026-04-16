@@ -156,12 +156,22 @@ function App() {
   const [tableData, setTableData] = createSignal<TableData | null>(null);
   const [tableLoading, setTableLoading] = createSignal(false);
   const [tableFilter, setTableFilter] = createSignal("");
+  const [showEmptyTables, setShowEmptyTables] = createSignal(false);
   const [selectedCellValue, setSelectedCellValue] = createSignal<any>(null);
   const [editingCell, setEditingCell] = createSignal<{rowid: string|number, col: string} | null>(null);
   const filteredTables = () => {
     const q = tableFilter().toLowerCase();
-    return q ? tables().filter((t) => t.name.toLowerCase().includes(q)) : tables();
+    const all = showEmptyTables() ? tables() : tables().filter((t) => t.row_count > 0);
+    return q ? all.filter((t) => t.name.toLowerCase().includes(q)) : all;
   };
+  const emptyTableNames = createMemo(() => {
+    const s = new Set<string>();
+    for (const t of tables()) {
+      if (t.row_count === 0) s.add(t.name);
+    }
+    return s;
+  });
+  const allTableNames = createMemo(() => new Set(tables().map(t => t.name)));
 
   // Log state
   const [logEntries, setLogEntries] = createSignal<LogEntry[]>([]);
@@ -241,7 +251,7 @@ function App() {
   };
 
   createEffect(() => {
-    if (page() === "tables" || page() === "dashboard") {
+    if (page() === "tables" || page() === "dashboard" || page() === "schemas") {
       refreshTables();
     }
   });
@@ -1516,7 +1526,7 @@ function App() {
                 <div class="flex gap-0">
                   {/* Table list */}
                   <div class="shrink-0 border-r border-[#141b28] pr-2 flex flex-col max-h-[calc(100vh-12rem)]">
-                    <div class="pb-2">
+                    <div class="pb-2 space-y-1.5">
                       <input
                         type="text"
                         placeholder="Filter tables..."
@@ -1524,6 +1534,26 @@ function App() {
                         onInput={(e) => setTableFilter(e.currentTarget.value)}
                         class="w-full px-3 py-1.5 text-sm bg-white/5 border border-[#141b28] rounded-md text-gray-300 placeholder-gray-600 focus:outline-none focus:border-blue-500/40"
                       />
+                      <Show when={emptyTableNames().size > 0}>
+                        <button
+                          class={`px-2.5 py-1 text-xs rounded-md transition-colors ${
+                            showEmptyTables()
+                              ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                              : "text-gray-500 hover:text-gray-300"
+                          }`}
+                          onClick={() => {
+                            const wasShowing = showEmptyTables();
+                            setShowEmptyTables(!wasShowing);
+                            if (wasShowing) {
+                              const sel = selectedTable();
+                              if (sel && emptyTableNames().has(sel)) {
+                                setSelectedTable(null);
+                                setTableData(null);
+                              }
+                            }
+                          }}
+                        >{showEmptyTables() ? "Hide empty" : "Show empty"}</button>
+                      </Show>
                     </div>
                     <div class="overflow-y-auto space-y-0.5">
                       <For each={filteredTables()}>
@@ -1699,6 +1729,40 @@ function App() {
               setGraphFocused={setGraphFocused}
               graphExpanded={graphExpanded}
               setGraphExpanded={setGraphExpanded}
+              emptyTableNames={emptyTableNames}
+              allTableNames={allTableNames}
+              showEmptyTables={showEmptyTables}
+              setShowEmptyTables={setShowEmptyTables}
+              clearEmptyEntities={() => {
+                const empty = emptyTableNames();
+                const allTables = allTableNames();
+                batch(() => {
+                  const sel = selectedEntities();
+                  const stale = [...sel].filter(n => allTables.has(n) && empty.has(n));
+                  if (stale.length > 0) {
+                    const next = new Set(sel);
+                    for (const n of stale) next.delete(n);
+                    setSelectedEntities(next);
+                    const last = lastSelectedEntity();
+                    if (last && allTables.has(last) && empty.has(last)) {
+                      const remaining = Array.from(next);
+                      setLastSelectedEntity(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+                    }
+                  }
+                  const exp = expandedDefs();
+                  const staleExp = [...exp].filter(n => allTables.has(n) && empty.has(n));
+                  if (staleExp.length > 0) {
+                    const nextExp = new Set(exp);
+                    for (const n of staleExp) nextExp.delete(n);
+                    setExpandedDefs(nextExp);
+                  }
+                  const focused = graphFocused();
+                  if (focused && allTables.has(focused) && empty.has(focused)) {
+                    setGraphFocused(null);
+                    setGraphExpanded(new Set<string>());
+                  }
+                });
+              }}
             />
           </Show>
 
@@ -2142,6 +2206,11 @@ function SchemasPage(props: {
   setGraphFocused: Setter<string | null>;
   graphExpanded: Accessor<Set<string>>;
   setGraphExpanded: Setter<Set<string>>;
+  emptyTableNames: Accessor<Set<string>>;
+  allTableNames: Accessor<Set<string>>;
+  showEmptyTables: Accessor<boolean>;
+  setShowEmptyTables: Setter<boolean>;
+  clearEmptyEntities: () => void;
 }) {
   const graph = () => props.schemaGraph();
   const nodes = () => (graph()?.nodes || []) as string[];
@@ -2154,10 +2223,16 @@ function SchemasPage(props: {
 
   const filteredNodes = () => {
     const q = props.schemaFilter().toLowerCase();
+    const empty = props.emptyTableNames();
+    const hideEmpty = !props.showEmptyTables() && empty.size > 0;
     const allNodes = nodes();
     const defKeys = Object.keys(props.definitions());
     const merged = [...new Set([...allNodes, ...defKeys])];
-    const filtered = q ? merged.filter((n: string) => n.toLowerCase().includes(q)) : merged;
+    let filtered = q ? merged.filter((n: string) => n.toLowerCase().includes(q)) : merged;
+    if (hideEmpty) {
+      const allTables = props.allTableNames();
+      filtered = filtered.filter((n: string) => !allTables.has(n) || !empty.has(n));
+    }
     if (props.schemaGraphGroupBy() === "alpha") return filtered.sort();
     return filtered;
   };
@@ -2294,7 +2369,7 @@ function SchemasPage(props: {
                   onInput={(e) => props.setSchemaFilter(e.currentTarget.value)}
                   class="w-full bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-1.5 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700"
                 />
-                <div class="flex gap-1">
+                <div class="flex gap-1 flex-wrap">
                   <button
                     class={`px-2.5 py-1 text-xs rounded-md transition-colors ${props.schemaGraphGroupBy() === "alpha" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
                     onClick={() => props.setSchemaGraphGroupBy("alpha")}
@@ -2303,6 +2378,22 @@ function SchemasPage(props: {
                     class={`px-2.5 py-1 text-xs rounded-md transition-colors ${props.schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
                     onClick={() => props.setSchemaGraphGroupBy("endpoint")}
                   >By endpoint</button>
+                  <Show when={props.emptyTableNames().size > 0}>
+                    <button
+                      class={`px-2.5 py-1 text-xs rounded-md transition-colors ml-auto ${
+                        props.showEmptyTables()
+                          ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30"
+                          : "text-gray-500 hover:text-gray-300"
+                      }`}
+                      onClick={() => {
+                        const wasShowing = props.showEmptyTables();
+                        props.setShowEmptyTables(!wasShowing);
+                        if (wasShowing) {
+                          props.clearEmptyEntities();
+                        }
+                      }}
+                    >{props.showEmptyTables() ? "Hide empty" : "Show empty"}</button>
+                  </Show>
                 </div>
               </div>
               <div class="flex-1 overflow-y-auto" style="scrollbar-width: thin;">
