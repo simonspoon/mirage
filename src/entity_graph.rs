@@ -290,6 +290,11 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         }
     }
 
+    // Filter out extension-only roots from nodes and roots map
+    let ext_only = parser::extension_only_roots(spec);
+    all_nodes.retain(|n| !ext_only.contains(n));
+    roots.retain(|k, _| !ext_only.contains(k));
+
     // Build edges for each node
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     if let Some(defs) = spec_defs {

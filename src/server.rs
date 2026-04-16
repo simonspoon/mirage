@@ -3109,6 +3109,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_graph_extension_only_root() {
+        let router = setup_empty();
+        // BaseProps is only used as an allOf extension base (never as a direct
+        // field, response, or parameter type). ConcreteType uses BaseProps via
+        // allOf and is the actual response body. BaseProps should be excluded
+        // from both nodes and roots.
+        let spec_yaml = r##"
+swagger: "2.0"
+info:
+  title: Extension Only Test
+  version: "1.0"
+paths:
+  /things:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/ConcreteType"
+definitions:
+  BaseProps:
+    type: object
+    properties:
+      id:
+        type: integer
+      name:
+        type: string
+  ConcreteType:
+    allOf:
+      - $ref: "#/definitions/BaseProps"
+      - type: object
+        properties:
+          extra:
+            type: string
+"##;
+        let body = serde_json::json!({
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/things"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/graph")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // BaseProps should NOT appear in nodes
+        let nodes = json["nodes"].as_array().unwrap();
+        let node_strs: Vec<&str> = nodes.iter().map(|n| n.as_str().unwrap()).collect();
+        assert!(
+            !node_strs.contains(&"BaseProps"),
+            "BaseProps (extension-only root) should be excluded from nodes, got: {:?}",
+            node_strs
+        );
+        assert!(
+            node_strs.contains(&"ConcreteType"),
+            "ConcreteType should be present in nodes, got: {:?}",
+            node_strs
+        );
+
+        // BaseProps should NOT appear in roots keys
+        let roots = json["roots"].as_object().unwrap();
+        assert!(
+            !roots.contains_key("BaseProps"),
+            "BaseProps should be excluded from roots keys, got: {:?}",
+            roots.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            roots.contains_key("ConcreteType"),
+            "ConcreteType should be present in roots keys, got: {:?}",
+            roots.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn test_admin_graph_empty_endpoints() {
         let router = setup_empty();
         let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
