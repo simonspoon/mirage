@@ -326,6 +326,96 @@ pub(crate) fn collect_schema_refs(
     }
 }
 
+/// Identify definition names that are ONLY used as allOf extension bases
+/// (i.e., they appear in allOf `$ref`s but are never referenced directly
+/// by properties, response schemas, or body-parameter schemas).
+pub fn extension_only_roots(spec: &SwaggerSpec) -> HashSet<String> {
+    let definitions = match &spec.definitions {
+        Some(defs) => defs,
+        None => return HashSet::new(),
+    };
+
+    // 1. Collect all types referenced via allOf $ref in definitions
+    let mut allof_refs: HashSet<String> = HashSet::new();
+    for def_schema in definitions.values() {
+        if let Some(all_of) = &def_schema.all_of {
+            for member in all_of {
+                if let Some(ref_path) = &member.ref_path
+                    && let Some(name) = ref_path.strip_prefix("#/definitions/")
+                {
+                    allof_refs.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Collect all directly-used types (properties, responses, body params)
+    let mut direct_usage: HashSet<String> = HashSet::new();
+
+    // 2a. Definition properties (including allOf-wrapped property refs)
+    for def_schema in definitions.values() {
+        collect_non_allof_refs(def_schema, &mut direct_usage);
+    }
+
+    // 2b. Response schemas and 2c. Body-parameter schemas in paths
+    for path_item in spec.paths.values() {
+        let operations = [
+            path_item.get.as_ref(),
+            path_item.post.as_ref(),
+            path_item.put.as_ref(),
+            path_item.delete.as_ref(),
+            path_item.patch.as_ref(),
+        ];
+        for op in operations.into_iter().flatten() {
+            for response in op.responses.values() {
+                if let Some(schema) = &response.schema {
+                    collect_schema_refs(schema, &mut direct_usage, None);
+                }
+            }
+            if let Some(params) = &op.parameters {
+                for param in params {
+                    if param.r#in == "body"
+                        && let Some(schema) = &param.schema
+                    {
+                        collect_schema_refs(schema, &mut direct_usage, None);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Return allof_refs minus direct_usage
+    allof_refs
+        .into_iter()
+        .filter(|name| !direct_usage.contains(name))
+        .collect()
+}
+
+/// Collect refs from a definition's sub-schemas (properties, items,
+/// additional_properties) and from allOf members' sub-schemas, but skip
+/// the allOf members' own `$ref` (those are extension-base refs, not
+/// direct usage).
+fn collect_non_allof_refs(schema: &SchemaObject, refs: &mut HashSet<String>) {
+    if let Some(props) = &schema.properties {
+        for prop in props.values() {
+            collect_schema_refs(prop, refs, None);
+        }
+    }
+    if let Some(items) = &schema.items {
+        collect_schema_refs(items, refs, None);
+    }
+    if let Some(ap) = &schema.additional_properties {
+        collect_schema_refs(ap, refs, None);
+    }
+    // For allOf members: recurse into their sub-schemas but skip the member's
+    // own ref_path (which is the extension-base ref we're tracking separately)
+    if let Some(all_of) = &schema.all_of {
+        for member in all_of {
+            collect_non_allof_refs(member, refs);
+        }
+    }
+}
+
 fn resolve_schema(
     schema: &mut SchemaObject,
     definitions: &HashMap<String, SchemaObject>,
@@ -929,5 +1019,195 @@ mod tests {
             req_count, 0,
             "CreatePetRequest table should exist but have 0 rows"
         );
+    }
+
+    // --- Group 6: extension_only_roots ---
+
+    fn make_spec_with_defs(
+        definitions: HashMap<String, SchemaObject>,
+        paths: HashMap<String, PathItem>,
+    ) -> SwaggerSpec {
+        SwaggerSpec {
+            swagger: "2.0".to_string(),
+            info: Info {
+                title: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            paths,
+            definitions: Some(definitions),
+        }
+    }
+
+    fn empty_path_item() -> PathItem {
+        PathItem {
+            get: None,
+            post: None,
+            put: None,
+            delete: None,
+            patch: None,
+        }
+    }
+
+    #[test]
+    fn test_extension_only_roots_basic() {
+        // ChildA and ChildB extend BaseType via allOf.
+        // BaseType is not used in any property, response, or parameter.
+        // => BaseType should be in the result.
+        let mut definitions = HashMap::new();
+        definitions.insert("BaseType".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("id".to_string(), schema_typed("integer")),
+            ])),
+            ..schema_default()
+        });
+        definitions.insert("ChildA".to_string(), SchemaObject {
+            all_of: Some(vec![
+                schema_ref("BaseType"),
+                SchemaObject {
+                    schema_type: Some("object".to_string()),
+                    properties: Some(HashMap::from([
+                        ("name".to_string(), schema_typed("string")),
+                    ])),
+                    ..schema_default()
+                },
+            ]),
+            ..schema_default()
+        });
+        definitions.insert("ChildB".to_string(), SchemaObject {
+            all_of: Some(vec![
+                schema_ref("BaseType"),
+                SchemaObject {
+                    schema_type: Some("object".to_string()),
+                    properties: Some(HashMap::from([
+                        ("age".to_string(), schema_typed("integer")),
+                    ])),
+                    ..schema_default()
+                },
+            ]),
+            ..schema_default()
+        });
+
+        let spec = make_spec_with_defs(definitions, HashMap::new());
+        let roots = extension_only_roots(&spec);
+        assert!(
+            roots.contains("BaseType"),
+            "BaseType should be an extension-only root, got: {:?}",
+            roots
+        );
+        assert_eq!(roots.len(), 1, "Only BaseType should be in the set");
+    }
+
+    #[test]
+    fn test_extension_only_roots_excluded_by_response_ref() {
+        // BaseType in allOf, but also referenced by a response schema.
+        // => BaseType should NOT be in the result.
+        let mut definitions = HashMap::new();
+        definitions.insert("BaseType".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("id".to_string(), schema_typed("integer")),
+            ])),
+            ..schema_default()
+        });
+        definitions.insert("Child".to_string(), SchemaObject {
+            all_of: Some(vec![schema_ref("BaseType")]),
+            ..schema_default()
+        });
+
+        let mut paths = HashMap::new();
+        let mut path_item = empty_path_item();
+        path_item.get = Some(op_with_response("200", Some(schema_ref("BaseType"))));
+        paths.insert("/things".to_string(), path_item);
+
+        let spec = make_spec_with_defs(definitions, paths);
+        let roots = extension_only_roots(&spec);
+        assert!(
+            !roots.contains("BaseType"),
+            "BaseType used in response should not be an extension-only root"
+        );
+    }
+
+    #[test]
+    fn test_extension_only_roots_excluded_by_property_ref() {
+        // BaseType in allOf, but also referenced by a property in another definition.
+        // => BaseType should NOT be in the result.
+        let mut definitions = HashMap::new();
+        definitions.insert("BaseType".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("id".to_string(), schema_typed("integer")),
+            ])),
+            ..schema_default()
+        });
+        definitions.insert("Child".to_string(), SchemaObject {
+            all_of: Some(vec![schema_ref("BaseType")]),
+            ..schema_default()
+        });
+        definitions.insert("Container".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("base".to_string(), schema_ref("BaseType")),
+            ])),
+            ..schema_default()
+        });
+
+        let spec = make_spec_with_defs(definitions, HashMap::new());
+        let roots = extension_only_roots(&spec);
+        assert!(
+            !roots.contains("BaseType"),
+            "BaseType used as property ref should not be an extension-only root"
+        );
+    }
+
+    #[test]
+    fn test_extension_only_roots_excluded_by_allof_wrapped_property() {
+        // BaseType in allOf at definition level, but also referenced
+        // via allOf-wrapped property ref (property: {allOf: [{$ref: BaseType}]})
+        // => BaseType should NOT be in the result.
+        let mut definitions = HashMap::new();
+        definitions.insert("BaseType".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("id".to_string(), schema_typed("integer")),
+            ])),
+            ..schema_default()
+        });
+        definitions.insert("Child".to_string(), SchemaObject {
+            all_of: Some(vec![schema_ref("BaseType")]),
+            ..schema_default()
+        });
+        definitions.insert("Wrapper".to_string(), SchemaObject {
+            schema_type: Some("object".to_string()),
+            properties: Some(HashMap::from([
+                ("embedded".to_string(), SchemaObject {
+                    all_of: Some(vec![schema_ref("BaseType")]),
+                    ..schema_default()
+                }),
+            ])),
+            ..schema_default()
+        });
+
+        let spec = make_spec_with_defs(definitions, HashMap::new());
+        let roots = extension_only_roots(&spec);
+        assert!(
+            !roots.contains("BaseType"),
+            "BaseType used via allOf-wrapped property should not be an extension-only root"
+        );
+    }
+
+    #[test]
+    fn test_extension_only_roots_none_definitions() {
+        let spec = SwaggerSpec {
+            swagger: "2.0".to_string(),
+            info: Info {
+                title: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            paths: HashMap::new(),
+            definitions: None,
+        };
+        let roots = extension_only_roots(&spec);
+        assert!(roots.is_empty(), "Should return empty set when definitions is None");
     }
 }
