@@ -134,10 +134,7 @@ fn topo_sort_pool_defs(raw_spec: &SwaggerSpec, pool_config: &SharedPoolConfig) -
     let mut rev_edges: HashMap<String, Vec<String>> = HashMap::new();
     for (name, deps) in &edges {
         for dep in deps {
-            rev_edges
-                .entry(dep.clone())
-                .or_default()
-                .push(name.clone());
+            rev_edges.entry(dep.clone()).or_default().push(name.clone());
         }
     }
 
@@ -360,18 +357,13 @@ fn generate_property_value(
 ) -> serde_json::Value {
     // Check if this is an array with $ref items pointing to a pool
     if prop_schema.schema_type.as_deref() == Some("array")
-        || raw_prop
-            .and_then(|r| r.schema_type.as_deref())
-            == Some("array")
+        || raw_prop.and_then(|r| r.schema_type.as_deref()) == Some("array")
     {
         // Try raw_prop items ref first, then resolved items ref
         let raw_items_ref = raw_prop
             .and_then(|r| r.items.as_ref())
             .and_then(|i| ref_target_name(i));
-        let resolved_items_ref = prop_schema
-            .items
-            .as_ref()
-            .and_then(|i| ref_target_name(i));
+        let resolved_items_ref = prop_schema.items.as_ref().and_then(|i| ref_target_name(i));
         let target = raw_items_ref.or(resolved_items_ref);
 
         if let Some(target_def) = target
@@ -851,9 +843,7 @@ mod tests {
                 patient_id.is_some(),
                 "sampled patient should have id from pool"
             );
-            let matches = patient_pool
-                .iter()
-                .any(|p| p.get("id") == patient_id);
+            let matches = patient_pool.iter().any(|p| p.get("id") == patient_id);
             assert!(matches, "patient should match a pool entry by id");
         }
     }

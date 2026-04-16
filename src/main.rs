@@ -8,6 +8,7 @@ mod seeder;
 mod server;
 
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -289,6 +290,11 @@ async fn main() {
             .collect();
         let response_defs = parser::definitions_for_paths(&raw_spec, &all_ops, false);
 
+        // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
+        let ext_only_roots = parser::extension_only_roots(&raw_spec);
+        let response_defs: HashSet<String> =
+            response_defs.difference(&ext_only_roots).cloned().collect();
+
         spec.resolve_refs();
 
         // Create tables only for response_defs, seed only response_defs
@@ -307,8 +313,13 @@ async fn main() {
         let pool_config = composer::SharedPoolConfig::new();
         let no_faker_rules = composer::FakerRules::new();
         let no_recipe_rules: Vec<rules::Rule> = Vec::new();
-        let pools =
-            composer::generate_pools(&spec, &raw_spec, &pool_config, &no_faker_rules, &no_recipe_rules);
+        let pools = composer::generate_pools(
+            &spec,
+            &raw_spec,
+            &pool_config,
+            &no_faker_rules,
+            &no_recipe_rules,
+        );
         let mut quantities = composer::QuantityConfigs::new();
         for def_name in &response_defs {
             quantities.insert(

@@ -1880,7 +1880,13 @@ async fn admin_activate_recipe(
 
     // Generate document store using composer
     let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
-    let pools = crate::composer::generate_pools(&spec, &raw_spec, &pool_config, &faker_rules, &recipe_rules);
+    let pools = crate::composer::generate_pools(
+        &spec,
+        &raw_spec,
+        &pool_config,
+        &faker_rules,
+        &recipe_rules,
+    );
 
     // Build quantity configs: use recipe quantity_configs, with seed_count as default
     // Only populate defaults for response_defs (no meaningless pools for input-only types)
