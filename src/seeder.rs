@@ -1,7 +1,7 @@
 // Mock data seeder
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fake::Fake;
 use fake::faker::address::en::*;
@@ -835,6 +835,106 @@ pub fn seed_tables_filtered(
                 faker_rules,
                 recipe_rules,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// Insert pre-composed document rows into SQLite tables.
+///
+/// For each `(table_name, rows)` in `docs`:
+/// - Checks the table exists in sqlite_master — skips if not found
+/// - Clears existing rows with DELETE
+/// - For each row, reads PRAGMA table_info to determine valid columns, then
+///   INSERTs only columns present in both the JSON doc and the table schema
+pub fn insert_composed_rows(
+    conn: &Connection,
+    docs: &HashMap<String, Vec<serde_json::Value>>,
+) -> Result<(), rusqlite::Error> {
+    for (table_name, rows) in docs {
+        // Check table exists
+        let exists: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?
+            .exists(rusqlite::params![table_name])?;
+        if !exists {
+            continue;
+        }
+
+        // Clear existing rows
+        conn.execute(&format!("DELETE FROM \"{}\"", table_name), [])?;
+
+        // Get actual table columns via PRAGMA
+        let table_columns: HashSet<String> = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table_name))?;
+            let cols = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols
+        };
+
+        for row in rows {
+            let obj = match row.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+
+            // Only INSERT columns that exist in BOTH the JSON doc AND the table schema
+            let mut col_names: Vec<&String> = obj
+                .keys()
+                .filter(|k| table_columns.contains(k.as_str()))
+                .collect();
+            col_names.sort();
+
+            if col_names.is_empty() {
+                continue;
+            }
+
+            let columns_str = col_names
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders: Vec<String> =
+                (1..=col_names.len()).map(|i| format!("?{i}")).collect();
+            let placeholders_str = placeholders.join(", ");
+            let sql = format!(
+                "INSERT INTO \"{}\" ({}) VALUES ({})",
+                table_name, columns_str, placeholders_str
+            );
+
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            for col_name in &col_names {
+                let value = &obj[col_name.as_str()];
+                match value {
+                    serde_json::Value::Null => {
+                        params.push(Box::new(rusqlite::types::Null));
+                    }
+                    serde_json::Value::Bool(b) => {
+                        params.push(Box::new(if *b { 1i64 } else { 0i64 }));
+                    }
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            params.push(Box::new(i));
+                        } else if let Some(f) = n.as_f64() {
+                            params.push(Box::new(f));
+                        } else {
+                            params.push(Box::new(n.to_string()));
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        params.push(Box::new(s.clone()));
+                    }
+                    other => {
+                        // Object/Array → serialize to JSON string
+                        params.push(Box::new(serde_json::to_string(other).unwrap_or_default()));
+                    }
+                }
+            }
+
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
         }
     }
     Ok(())

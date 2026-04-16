@@ -15,7 +15,6 @@ use rusqlite::types::Value as SqlValue;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
-use crate::composer::DocumentStore;
 use crate::parser::{ResponseShape, SwaggerSpec};
 use crate::schema;
 use crate::seeder;
@@ -113,7 +112,6 @@ pub struct AppState {
     pub registry: Registry,
     pub log: RequestLog,
     pub recipe_db: Db,
-    pub documents: Arc<RwLock<DocumentStore>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -398,102 +396,6 @@ fn match_route(pattern: &str, path: &str) -> Option<Option<String>> {
     Some(captured)
 }
 
-fn doc_get_collection(table: String, documents: Arc<RwLock<DocumentStore>>) -> Response {
-    let docs = documents.read().unwrap();
-    match docs.get(&table) {
-        Some(items) => (
-            StatusCode::OK,
-            Json(serde_json::Value::Array(items.clone())),
-        )
-            .into_response(),
-        None => (StatusCode::OK, Json(serde_json::Value::Array(vec![]))).into_response(),
-    }
-}
-
-fn doc_get_single(table: String, documents: Arc<RwLock<DocumentStore>>, id: String) -> Response {
-    let id_num: i64 = match id.parse() {
-        Ok(n) => n,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid id"})),
-            )
-                .into_response();
-        }
-    };
-    let docs = documents.read().unwrap();
-    if let Some(items) = docs.get(&table) {
-        for item in items {
-            if let Some(doc_id) = item.get("id").and_then(|v| v.as_i64())
-                && doc_id == id_num
-            {
-                return (StatusCode::OK, Json(item.clone())).into_response();
-            }
-        }
-    }
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "not found"})),
-    )
-        .into_response()
-}
-
-fn doc_post_create(
-    table: String,
-    documents: Arc<RwLock<DocumentStore>>,
-    body: Option<Json<serde_json::Value>>,
-) -> Response {
-    let body = match body {
-        Some(Json(v)) => v,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "expected JSON body"})),
-            )
-                .into_response();
-        }
-    };
-    let mut docs = documents.write().unwrap();
-    let items = docs.entry(table).or_default();
-    let new_id = items.len() + 1;
-    let mut doc = body;
-    if let serde_json::Value::Object(ref mut map) = doc {
-        map.insert(
-            "id".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(new_id)),
-        );
-    }
-    items.push(doc.clone());
-    (StatusCode::CREATED, Json(doc)).into_response()
-}
-
-fn doc_delete_single(table: String, documents: Arc<RwLock<DocumentStore>>, id: String) -> Response {
-    let id_num: i64 = match id.parse() {
-        Ok(n) => n,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid id"})),
-            )
-                .into_response();
-        }
-    };
-    let mut docs = documents.write().unwrap();
-    if let Some(items) = docs.get_mut(&table)
-        && let Some(pos) = items
-            .iter()
-            .position(|item| item.get("id").and_then(|v| v.as_i64()) == Some(id_num))
-    {
-        items.remove(pos);
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "not found"})),
-    )
-        .into_response()
-}
-
 const PRIMITIVE_ARRAY_LEN: usize = 3;
 
 fn generate_primitive_value(t: &str) -> serde_json::Value {
@@ -560,31 +462,13 @@ async fn catch_all_handler(
         ResponseShape::Empty => { /* fall through — DELETE/POST with a backing table */ }
     }
 
-    // Check if document store has data for this definition
-    let has_documents = {
-        let docs = state.documents.read().unwrap();
-        docs.contains_key(&table)
-    };
-
-    if has_documents {
-        match (m, has_path_param) {
-            ("get", true) => doc_get_single(table, state.documents.clone(), param_value.unwrap()),
-            ("get", false) => doc_get_collection(table, state.documents.clone()),
-            ("post", _) => doc_post_create(table, state.documents.clone(), body),
-            ("delete", true) => {
-                doc_delete_single(table, state.documents.clone(), param_value.unwrap())
-            }
-            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        }
-    } else {
-        let db = state.db.clone();
-        match (m, has_path_param) {
-            ("get", true) => get_single(table, db, param_value.unwrap()).await,
-            ("get", false) => get_collection(table, db).await,
-            ("post", _) => post_create(table, db, body).await,
-            ("delete", true) => delete_single(table, db, param_value.unwrap()).await,
-            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        }
+    let db = state.db.clone();
+    match (m, has_path_param) {
+        ("get", true) => get_single(table, db, param_value.unwrap()).await,
+        ("get", false) => get_collection(table, db).await,
+        ("post", _) => post_create(table, db, body).await,
+        ("delete", true) => delete_single(table, db, param_value.unwrap()).await,
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
 
@@ -1864,6 +1748,18 @@ async fn admin_activate_recipe(
     let mut all_routes = routes;
     all_routes.extend(collection_routes);
 
+    // Parse frozen rows (needed for initial insert and re-apply after composer)
+    let frozen: crate::recipe::FrozenRows = match serde_json::from_str(&recipe.frozen_rows) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to parse frozen_rows for recipe {}: {e}",
+                recipe.id
+            );
+            std::collections::HashMap::new()
+        }
+    };
+
     // Drop old tables, create only needed ones, seed
     // response_defs for table creation + frozen_rows guard + seeding
     {
@@ -1890,16 +1786,6 @@ async fn admin_activate_recipe(
         }
 
         // Insert frozen rows before seeding (uses response_defs — only response tables exist)
-        let frozen: crate::recipe::FrozenRows = match serde_json::from_str(&recipe.frozen_rows) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to parse frozen_rows for recipe {}: {e}",
-                    recipe.id
-                );
-                std::collections::HashMap::new()
-            }
-        };
         if !frozen.is_empty() {
             let spec_defs = spec.definitions.as_ref();
             for (table_name, rows) in &frozen {
@@ -2019,10 +1905,77 @@ async fn admin_activate_recipe(
         &recipe_rules,
     );
 
-    // Store composed documents
+    // Write composed documents to SQLite, then re-apply frozen rows
     {
-        let mut docs = state.documents.write().unwrap();
-        *docs = composed;
+        let conn = state.db.lock().unwrap();
+        if let Err(e) = seeder::insert_composed_rows(&conn, &composed) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to insert composed rows: {e}")})),
+            )
+                .into_response();
+        }
+
+        // Re-apply frozen rows (insert_composed_rows truncated the tables)
+        if !frozen.is_empty() {
+            let spec_defs = spec.definitions.as_ref();
+            for (table_name, rows) in &frozen {
+                if !response_defs.contains(table_name) {
+                    continue;
+                }
+                let valid_columns: HashSet<String> = spec_defs
+                    .and_then(|defs| defs.get(table_name))
+                    .and_then(|schema| schema.properties.as_ref())
+                    .map(|props| props.keys().cloned().collect())
+                    .unwrap_or_default();
+                let safe_table = table_name.replace('"', "\"\"");
+                for row in rows {
+                    let obj = match row.as_object() {
+                        Some(o) => o,
+                        None => continue,
+                    };
+                    let mut col_names: Vec<String> = Vec::new();
+                    let mut col_values: Vec<String> = Vec::new();
+                    for (col, val) in obj {
+                        if !valid_columns.contains(col) {
+                            continue;
+                        }
+                        let safe_col = col.replace('"', "\"\"");
+                        col_names.push(format!("\"{}\"", safe_col));
+                        let sql_val = match val {
+                            serde_json::Value::Null => "NULL".to_string(),
+                            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::String(s) => {
+                                format!("'{}'", s.replace('\'', "''"))
+                            }
+                            other => {
+                                format!(
+                                    "'{}'",
+                                    serde_json::to_string(other)
+                                        .unwrap_or_default()
+                                        .replace('\'', "''")
+                                )
+                            }
+                        };
+                        col_values.push(sql_val);
+                    }
+                    if !col_names.is_empty() {
+                        let sql = format!(
+                            "INSERT INTO \"{}\" ({}) VALUES ({})",
+                            safe_table,
+                            col_names.join(", "),
+                            col_values.join(", ")
+                        );
+                        if let Err(e) = conn.execute(&sql, []) {
+                            eprintln!(
+                                "Warning: failed to re-insert frozen row into \"{table_name}\": {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let activated_endpoints: Vec<EndpointInfo> = all_routes
@@ -2565,7 +2518,6 @@ mod tests {
             registry,
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         build_router(state)
     }
@@ -2583,7 +2535,6 @@ mod tests {
             registry,
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         build_router(state)
     }
@@ -2761,7 +2712,6 @@ mod tests {
             registry: registry.clone(),
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
 
@@ -3031,7 +2981,6 @@ mod tests {
             registry,
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
 
@@ -4288,7 +4237,6 @@ definitions:
             registry,
             log,
             recipe_db: recipe_db.clone(),
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
 
@@ -4541,7 +4489,6 @@ definitions:
             registry,
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         build_router(state)
     }
@@ -4647,7 +4594,6 @@ definitions:
             registry,
             log,
             recipe_db,
-            documents: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let router = build_router(state);
         let req = Request::builder()

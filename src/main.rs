@@ -8,7 +8,6 @@ mod seeder;
 mod server;
 
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -277,8 +276,6 @@ async fn main() {
 
     let registry = Arc::new(RwLock::new(server::RouteRegistry::new()));
 
-    let documents: Arc<RwLock<composer::DocumentStore>> = Arc::new(RwLock::new(HashMap::new()));
-
     // If spec provided, auto-import and configure
     if let Some(spec_path) = &cli.spec {
         let mut spec = parser::SwaggerSpec::from_file(spec_path.to_str().unwrap()).unwrap();
@@ -337,7 +334,7 @@ async fn main() {
             &no_faker_rules,
             &no_recipe_rules,
         );
-        *documents.write().unwrap() = composed;
+        seeder::insert_composed_rows(&db.lock().unwrap(), &composed).unwrap();
     }
 
     let log: server::RequestLog = Arc::new(Mutex::new(Vec::new()));
@@ -346,7 +343,6 @@ async fn main() {
         registry,
         log,
         recipe_db,
-        documents,
     };
     let router = server::build_router(state);
 
