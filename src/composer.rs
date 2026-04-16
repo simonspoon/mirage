@@ -225,6 +225,8 @@ pub fn compose_documents(
         None => return DocumentStore::new(),
     };
 
+    let raw_defs = raw_spec.definitions.as_ref();
+
     // Build a lookup of (path, method) -> definition name from the raw spec
     let raw_ops = raw_spec.path_operations();
     let raw_op_map: HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
@@ -269,13 +271,14 @@ pub fn compose_documents(
         };
 
         let def_compare_rules = compare_rules_by_def.get(&def_name).map(Vec::as_slice);
+        let raw_schema = raw_defs.and_then(|d| d.get(&def_name));
 
         let mut docs = Vec::with_capacity(count);
         for i in 0..count {
             let mut doc = generate_document_from_schema(
                 &def_name,
                 schema,
-                None,
+                raw_schema,
                 pools,
                 faker_rules,
                 &field_rule_map,
@@ -660,6 +663,22 @@ mod tests {
         pool_config.insert("Category".to_string(), 3);
         let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
 
+        // Capture the Category pool's (id, name) tuples for subset assertion below.
+        let category_pool_tuples: HashSet<(i64, String)> = pools
+            .get("Category")
+            .expect("Category pool generated")
+            .iter()
+            .map(|c| {
+                (
+                    c["id"].as_i64().expect("pool Category.id must be integer"),
+                    c["name"]
+                        .as_str()
+                        .expect("pool Category.name must be string")
+                        .to_string(),
+                )
+            })
+            .collect();
+
         let mut quantities = QuantityConfigs::new();
         quantities.insert("Pet".to_string(), QuantityConfig { min: 5, max: 5 });
 
@@ -682,13 +701,25 @@ mod tests {
         let pets = docs.get("Pet").unwrap();
         assert_eq!(pets.len(), 5);
 
-        // Each pet's category should come from the pool (since it's resolved,
-        // category is inlined as an object -- pool sampling only works on
-        // unresolved $ref schemas, so for resolved specs we get fresh fakes).
-        // Verify the documents are valid objects regardless.
         for pet in pets {
             assert!(pet.is_object());
-            assert!(pet.get("category").is_some());
+            let category = pet.get("category").expect("pet.category present");
+            assert!(category.is_object(), "pet.category must be object");
+            let cat_id = category["id"]
+                .as_i64()
+                .expect("pet.category.id must be integer from pool");
+            let cat_name = category["name"]
+                .as_str()
+                .expect("pet.category.name must be string from pool")
+                .to_string();
+            assert!(
+                (1..=3).contains(&cat_id),
+                "pet.category.id must be in 1..=3, got {cat_id}"
+            );
+            assert!(
+                category_pool_tuples.contains(&(cat_id, cat_name.clone())),
+                "pet.category (id={cat_id}, name={cat_name}) must match a pool entry"
+            );
         }
     }
 
