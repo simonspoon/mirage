@@ -296,24 +296,23 @@ fn test_primitives_fixture_all_types() {
     }
 }
 
+/// Unwrap possibly TEXT-backed JSON: row_to_json only reparses top-level
+/// TEXT, so nested JSON objects remain as strings inside the outer object.
+fn unwrap_json(v: &serde_json::Value) -> serde_json::Value {
+    if let Some(s) = v.as_str() {
+        serde_json::from_str(s)
+            .unwrap_or_else(|e| panic!("expected nested JSON string, parse failed: {e} — raw={s}"))
+    } else if v.is_object() {
+        v.clone()
+    } else {
+        panic!("expected string or object, got: {v}");
+    }
+}
+
 #[test]
 fn test_composition_merged_fields() {
     let server = MirageServer::start("tests/fixtures/mega.yaml", "/composed");
     let client = reqwest::blocking::Client::new();
-
-    // Unwrap possibly TEXT-backed JSON: row_to_json only reparses top-level
-    // TEXT, so nested JSON objects remain as strings inside the outer object.
-    fn unwrap_json(v: &serde_json::Value) -> serde_json::Value {
-        if let Some(s) = v.as_str() {
-            serde_json::from_str(s).unwrap_or_else(|e| {
-                panic!("expected nested JSON string, parse failed: {e} — raw={s}")
-            })
-        } else if v.is_object() {
-            v.clone()
-        } else {
-            panic!("expected string or object, got: {v}");
-        }
-    }
 
     let resp = client.get(server.url("/composed")).send().unwrap();
     assert_eq!(resp.status(), 200);
@@ -406,6 +405,137 @@ fn test_composition_merged_fields() {
         assert!(
             address_val["country"].is_string(),
             "address.country must be string — {}",
+            ctx()
+        );
+    }
+}
+
+#[test]
+fn test_shared_type_pool() {
+    // Owner appears via two paths — directly at /owners (array) and indirectly
+    // as ComposedEntity.owner (embedded $ref) on /composed. After recipe
+    // activation, the composed collection URL is /{table.to_lowercase()}, i.e.
+    // /composedentity per src/server.rs:1768.
+    //
+    // This test guards endpoint reachability + Owner shape round-trip through
+    // DB for both paths. Cross-endpoint pool-consumption identity is NOT
+    // asserted — compose_documents doesn't consume the pool today (tracked
+    // separately as task ldum).
+    let server = MirageServer::start("tests/fixtures/mega.yaml", "/owners");
+    let client = reqwest::blocking::Client::new();
+
+    let spec_source = std::fs::read_to_string("tests/fixtures/mega.yaml").unwrap();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let recipe_name = format!("mega-shared-owner-{nanos}");
+    let body = serde_json::json!({
+        "name": recipe_name,
+        "spec_source": spec_source,
+        "endpoints": [
+            {"method": "get", "path": "/owners"},
+            {"method": "get", "path": "/composed/{id}"}
+        ],
+        "seed_count": 5,
+        "shared_pools": {
+            "Owner": {"is_shared": true, "pool_size": 3}
+        }
+    });
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create recipe should return 201");
+    let created: serde_json::Value = resp.json().unwrap();
+    let id = created["id"]
+        .as_i64()
+        .expect("recipe response should contain numeric id");
+
+    let resp = client
+        .post(server.url(&format!("/_api/admin/recipes/{id}/activate")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "activate recipe should return 200");
+
+    // /owners — direct Owner array endpoint.
+    let resp = client.get(server.url("/owners")).send().unwrap();
+    assert_eq!(resp.status(), 200, "/owners should return 200");
+    let body: serde_json::Value = resp.json().unwrap();
+    let owners = body
+        .as_array()
+        .expect("/owners response should be a JSON array");
+    assert!(!owners.is_empty(), "/owners array should be non-empty");
+
+    for (idx, row) in owners.iter().enumerate() {
+        let ctx = || format!("/owners row {idx}: {row}");
+        assert!(
+            row["name"].is_string(),
+            "owner.name must be string — {}",
+            ctx()
+        );
+        let address_raw = &row["address"];
+        assert!(
+            address_raw.is_string() || address_raw.is_object(),
+            "owner.address must be string or object — {}",
+            ctx()
+        );
+        let address = unwrap_json(address_raw);
+        assert!(
+            address["city"].is_string(),
+            "owner.address.city must be string — {}",
+            ctx()
+        );
+        assert!(
+            address["country"].is_string(),
+            "owner.address.country must be string — {}",
+            ctx()
+        );
+    }
+
+    // /composedentity — ComposedEntity collection URL post-activation is
+    // /{table.to_lowercase()} (src/server.rs:1768), NOT /composed.
+    let resp = client.get(server.url("/composedentity")).send().unwrap();
+    assert_eq!(resp.status(), 200, "/composedentity should return 200");
+    let body: serde_json::Value = resp.json().unwrap();
+    let composed = body
+        .as_array()
+        .expect("/composedentity response should be a JSON array");
+    assert!(
+        !composed.is_empty(),
+        "/composedentity array should be non-empty"
+    );
+
+    for (idx, row) in composed.iter().enumerate() {
+        let ctx = || format!("/composedentity row {idx}: {row}");
+        let owner_raw = &row["owner"];
+        assert!(
+            owner_raw.is_string() || owner_raw.is_object(),
+            "composed.owner must be string or object — {}",
+            ctx()
+        );
+        let owner = unwrap_json(owner_raw);
+        assert!(
+            owner["name"].is_string(),
+            "composed.owner.name must be string — {}",
+            ctx()
+        );
+        let address_raw = &owner["address"];
+        assert!(
+            address_raw.is_string() || address_raw.is_object(),
+            "composed.owner.address must be string or object — {}",
+            ctx()
+        );
+        let address = unwrap_json(address_raw);
+        assert!(
+            address["city"].is_string(),
+            "composed.owner.address.city must be string — {}",
+            ctx()
+        );
+        assert!(
+            address["country"].is_string(),
+            "composed.owner.address.country must be string — {}",
             ctx()
         );
     }

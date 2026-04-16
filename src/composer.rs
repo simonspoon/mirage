@@ -961,6 +961,61 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_pools_mega_owner_shape() {
+        // Parse the mega fixture both raw and resolved, then generate a shared
+        // pool of 3 Owners. Verify ids == {1,2,3} and every entry has the
+        // expected cross-definition $ref shape (name + address.city/country).
+        let raw_spec = SwaggerSpec::from_file("tests/fixtures/mega.yaml").unwrap();
+        let mut spec = SwaggerSpec::from_file("tests/fixtures/mega.yaml").unwrap();
+        spec.resolve_refs();
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("Owner".to_string(), 3);
+
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        let owner_pool = pools.get("Owner").expect("Owner pool generated");
+        assert_eq!(owner_pool.len(), 3, "Owner pool should have 3 entries");
+
+        let ids: HashSet<i64> = owner_pool
+            .iter()
+            .map(|e| {
+                e["id"]
+                    .as_i64()
+                    .expect("Owner entry should have integer id")
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([1, 2, 3]),
+            "Owner pool ids should be exactly {{1,2,3}}"
+        );
+
+        for entry in owner_pool {
+            assert!(entry.is_object(), "Owner entry should be an object");
+            assert!(
+                entry["name"].is_string(),
+                "Owner.name must be string — entry: {entry}"
+            );
+            let address = entry
+                .get("address")
+                .expect("Owner should have address field");
+            assert!(
+                address.is_object(),
+                "Owner.address must be an object (cross-def $ref resolved) — entry: {entry}"
+            );
+            assert!(
+                address["city"].is_string(),
+                "Owner.address.city must be string — entry: {entry}"
+            );
+            assert!(
+                address["country"].is_string(),
+                "Owner.address.country must be string — entry: {entry}"
+            );
+        }
+    }
+
+    #[test]
     fn generate_pools_cycle_does_not_panic() {
         // X has {y: $ref Y}
         // Y has {x: $ref X}
