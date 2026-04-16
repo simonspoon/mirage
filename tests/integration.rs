@@ -295,3 +295,118 @@ fn test_primitives_fixture_all_types() {
         );
     }
 }
+
+#[test]
+fn test_composition_merged_fields() {
+    let server = MirageServer::start("tests/fixtures/mega.yaml", "/composed");
+    let client = reqwest::blocking::Client::new();
+
+    // Unwrap possibly TEXT-backed JSON: row_to_json only reparses top-level
+    // TEXT, so nested JSON objects remain as strings inside the outer object.
+    fn unwrap_json(v: &serde_json::Value) -> serde_json::Value {
+        if let Some(s) = v.as_str() {
+            serde_json::from_str(s).unwrap_or_else(|e| {
+                panic!("expected nested JSON string, parse failed: {e} — raw={s}")
+            })
+        } else if v.is_object() {
+            v.clone()
+        } else {
+            panic!("expected string or object, got: {v}");
+        }
+    }
+
+    let resp = client.get(server.url("/composed")).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    let arr = body
+        .as_array()
+        .expect("/composed response should be a JSON array");
+    assert!(!arr.is_empty(), "array should have at least one row");
+    let first = &arr[0];
+
+    let resp = client.get(server.url("/composed/1")).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let single: serde_json::Value = resp.json().unwrap();
+
+    for (label, row) in [("collection[0]", first), ("single", &single)] {
+        let ctx = || format!("{label}: {row}");
+
+        // Set A — base+extension merge proof
+        assert!(
+            row.as_object()
+                .map(|o| o.contains_key("created_at"))
+                .unwrap_or(false),
+            "row must contain created_at — {}",
+            ctx()
+        );
+        let created_at = &row["created_at"];
+        assert!(
+            created_at.is_string(),
+            "created_at must be string — {}",
+            ctx()
+        );
+        assert!(
+            !created_at.as_str().unwrap().is_empty(),
+            "created_at must be non-empty — {}",
+            ctx()
+        );
+        assert!(
+            row["updated_by"].is_string(),
+            "updated_by must be string — {}",
+            ctx()
+        );
+        assert!(row["id"].is_i64(), "id must be integer — {}", ctx());
+        assert!(row["title"].is_string(), "title must be string — {}", ctx());
+        assert!(
+            row["priority"].is_i64(),
+            "priority must be integer — {}",
+            ctx()
+        );
+        assert!(
+            row.as_object()
+                .map(|o| o.contains_key("owner"))
+                .unwrap_or(false),
+            "row must contain owner — {}",
+            ctx()
+        );
+
+        // Set B — ≥2-hop $ref chain resolved
+        let owner_raw = &row["owner"];
+        assert!(
+            owner_raw.is_string() || owner_raw.is_object(),
+            "owner must be string or object — {}",
+            ctx()
+        );
+        let owner_val = unwrap_json(owner_raw);
+        assert!(
+            owner_val["name"].is_string(),
+            "owner.name must be string — {}",
+            ctx()
+        );
+        assert!(
+            owner_val
+                .as_object()
+                .map(|o| o.contains_key("address"))
+                .unwrap_or(false),
+            "owner must contain address — {}",
+            ctx()
+        );
+        let address_raw = &owner_val["address"];
+        assert!(
+            address_raw.is_string() || address_raw.is_object(),
+            "address must be string or object — {}",
+            ctx()
+        );
+        let address_val = unwrap_json(address_raw);
+        assert!(
+            address_val["city"].is_string(),
+            "address.city must be string — {}",
+            ctx()
+        );
+        assert!(
+            address_val["country"].is_string(),
+            "address.country must be string — {}",
+            ctx()
+        );
+    }
+}
