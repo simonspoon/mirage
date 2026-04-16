@@ -122,6 +122,92 @@ paths:
             $ref: "#/definitions/Widget"
         "204":
           description: widget deleted
+  # Response-shape coverage (task izkr) — five disjoint paths, one per shape:
+  # (a) /gadgets — plain 200 single-object $ref to flat Gadget.
+  # (b) /labels  — plain 200 array-of-primitive (no $ref).
+  # (c) /ping    — 204 empty on GET (no schema).
+  # (d) /catalog — Shape B wrapped-array: $ref CatalogPage whose type:array
+  #               items:$ref CatalogItem. Exercises primary_response_def
+  #               wrapper-vs-element regression.
+  # (e) /things + /things/{id} — flat $ref Thing; collection rules out
+  #               route-missing false-positive on the 404 probe.
+  /gadgets:
+    get:
+      operationId: listGadgets
+      summary: List gadgets (collection — auto-seeded Gadget rows)
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Gadget"
+  /gadgets/{id}:
+    get:
+      operationId: getGadget
+      summary: Get gadget by id (plain single-object $ref — Shape A probe)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: integer
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            $ref: "#/definitions/Gadget"
+  /labels:
+    get:
+      operationId: listLabels
+      summary: List labels (primitive-array virtual root)
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            type: array
+            items:
+              type: string
+  /ping:
+    get:
+      operationId: ping
+      summary: Liveness probe (empty 204 response)
+      responses:
+        "204":
+          description: no content
+  /catalog:
+    get:
+      operationId: listCatalog
+      summary: List catalog (Shape B wrapped-array regression surface)
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            $ref: "#/definitions/CatalogPage"
+  /things:
+    get:
+      operationId: listThings
+      summary: List things (collection — rules out 404 false-positive)
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Thing"
+  /things/{id}:
+    get:
+      operationId: getThing
+      summary: Get thing by id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: integer
+      responses:
+        "200":
+          description: successful operation
+          schema:
+            $ref: "#/definitions/Thing"
 definitions:
   BaseAudit:
     type: object
@@ -207,4 +293,35 @@ definitions:
       price:
         type: number
       status:
+        type: string
+  # Response-shape coverage defs (task izkr)
+  Gadget:
+    type: object
+    properties:
+      id:
+        type: integer
+      name:
+        type: string
+      price:
+        type: number
+  CatalogPage:
+    # Shape B wrapper: type:array whose items are a $ref to the element def.
+    # Today mirage treats CatalogPage as the table name (wrapper, not element)
+    # which is the regression surface under test.
+    type: array
+    items:
+      $ref: "#/definitions/CatalogItem"
+  CatalogItem:
+    type: object
+    properties:
+      sku:
+        type: string
+      title:
+        type: string
+  Thing:
+    type: object
+    properties:
+      id:
+        type: integer
+      label:
         type: string
