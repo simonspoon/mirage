@@ -1074,6 +1074,11 @@ async fn admin_configure(
     let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
     let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
+    // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
+    let ext_only_roots = crate::parser::extension_only_roots(&raw_spec);
+    let response_defs: HashSet<String> =
+        response_defs.difference(&ext_only_roots).cloned().collect();
+
     // Build raw op map for $ref-based table name lookups
     let raw_ops = raw_spec.path_operations();
     let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
@@ -1146,7 +1151,9 @@ async fn admin_configure(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None) {
+        if let Err(e) =
+            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), Some(&ext_only_roots))
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1806,6 +1813,11 @@ async fn admin_activate_recipe(
     let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
     let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
+    // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
+    let ext_only_roots = crate::parser::extension_only_roots(&raw_spec);
+    let response_defs: HashSet<String> =
+        response_defs.difference(&ext_only_roots).cloned().collect();
+
     let raw_ops = raw_spec.path_operations();
     let raw_op_map: std::collections::HashMap<(&str, &str), &crate::parser::Operation> = raw_ops
         .iter()
@@ -1878,7 +1890,9 @@ async fn admin_activate_recipe(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None) {
+        if let Err(e) =
+            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), Some(&ext_only_roots))
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
