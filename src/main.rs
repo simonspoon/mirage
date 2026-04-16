@@ -195,6 +195,10 @@ fn run_inspect(spec_path: &str) {
             std::process::exit(1);
         }
     };
+
+    // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
+    let ext_only_roots = parser::extension_only_roots(&spec);
+
     spec.resolve_refs();
 
     let definitions = spec.definitions.as_ref();
@@ -206,6 +210,7 @@ fn run_inspect(spec_path: &str) {
     println!("  Paths: {path_count}");
 
     let mut stub_count = 0usize;
+    let mut skipped_count = 0usize;
 
     if let Some(defs) = definitions {
         let mut names: Vec<&String> = defs.keys().collect();
@@ -213,6 +218,12 @@ fn run_inspect(spec_path: &str) {
 
         println!();
         for name in &names {
+            if ext_only_roots.contains(name.as_str()) {
+                skipped_count += 1;
+                println!("  [SKIPPED — extension-only root] \"{name}\"");
+                continue;
+            }
+
             let schema = &defs[*name];
             let props = schema.properties.as_ref();
             let col_count = props.map(|p| p.len()).unwrap_or(0);
@@ -242,6 +253,7 @@ fn run_inspect(spec_path: &str) {
 
     println!();
     println!("  Stubs (allOf/empty): {stub_count}");
+    println!("  Skipped (extension-only roots): {skipped_count}");
 }
 
 #[tokio::main]
@@ -286,7 +298,7 @@ async fn main() {
         // Create tables for all_defs, seed only response_defs
         {
             let conn = db.lock().unwrap();
-            schema::create_tables_filtered(&conn, &spec, Some(&all_defs)).unwrap();
+            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None).unwrap();
             seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
                 .unwrap();
         }

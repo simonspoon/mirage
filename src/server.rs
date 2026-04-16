@@ -1146,7 +1146,7 @@ async fn admin_configure(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs)) {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1878,7 +1878,7 @@ async fn admin_activate_recipe(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs)) {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),

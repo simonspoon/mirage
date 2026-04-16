@@ -70,18 +70,24 @@ pub fn create_tables(
     conn: &rusqlite::Connection,
     spec: &SwaggerSpec,
 ) -> Result<(), rusqlite::Error> {
-    create_tables_filtered(conn, spec, None)
+    create_tables_filtered(conn, spec, None, None)
 }
 
 pub fn create_tables_filtered(
     conn: &rusqlite::Connection,
     spec: &SwaggerSpec,
     only: Option<&std::collections::HashSet<String>>,
+    skip: Option<&std::collections::HashSet<String>>,
 ) -> Result<(), rusqlite::Error> {
     if let Some(ref definitions) = spec.definitions {
         for (name, schema) in definitions {
             if let Some(filter) = only
                 && !filter.contains(name)
+            {
+                continue;
+            }
+            if let Some(skip_set) = skip
+                && skip_set.contains(name)
             {
                 continue;
             }
@@ -162,5 +168,131 @@ mod tests {
                 "DDL for {name} should start with CREATE TABLE"
             );
         }
+    }
+
+    #[test]
+    fn test_skip_extension_only_roots() {
+        use crate::parser::{self, Info, SchemaObject};
+        use std::collections::HashMap;
+
+        fn so() -> SchemaObject {
+            SchemaObject {
+                schema_type: None,
+                format: None,
+                properties: None,
+                items: None,
+                required: None,
+                ref_path: None,
+                enum_values: None,
+                description: None,
+                additional_properties: None,
+                all_of: None,
+                x_faker: None,
+            }
+        }
+
+        // BaseType: extension-only root (no own properties beyond id, only used via allOf)
+        let mut definitions = HashMap::new();
+        definitions.insert(
+            "BaseType".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([(
+                    "id".to_string(),
+                    SchemaObject {
+                        schema_type: Some("string".to_string()),
+                        ..so()
+                    },
+                )])),
+                ..so()
+            },
+        );
+        // ChildType: extends BaseType via allOf, adds own properties
+        definitions.insert(
+            "ChildType".to_string(),
+            SchemaObject {
+                all_of: Some(vec![
+                    SchemaObject {
+                        ref_path: Some("#/definitions/BaseType".to_string()),
+                        ..so()
+                    },
+                    SchemaObject {
+                        schema_type: Some("object".to_string()),
+                        properties: Some(HashMap::from([(
+                            "child_field".to_string(),
+                            SchemaObject {
+                                schema_type: Some("string".to_string()),
+                                ..so()
+                            },
+                        )])),
+                        ..so()
+                    },
+                ]),
+                ..so()
+            },
+        );
+
+        let mut spec = SwaggerSpec {
+            swagger: "2.0".to_string(),
+            info: Info {
+                title: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            paths: HashMap::new(),
+            definitions: Some(definitions),
+        };
+
+        // Compute skip set from raw spec BEFORE resolve_refs
+        let skip_set = parser::extension_only_roots(&spec);
+        assert!(
+            skip_set.contains("BaseType"),
+            "BaseType should be extension-only root, got: {:?}",
+            skip_set
+        );
+
+        // Resolve refs (merges allOf)
+        spec.resolve_refs();
+
+        // Create tables, skipping extension-only roots
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables_filtered(&conn, &spec, None, Some(&skip_set)).unwrap();
+
+        // BaseType table should NOT exist
+        let base_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='BaseType'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!base_exists, "BaseType table should not be created");
+
+        // ChildType table should exist
+        let child_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='ChildType'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(child_exists, "ChildType table should exist");
+
+        // ChildType should have both inherited (id) and own (child_field) columns
+        let mut stmt = conn.prepare("PRAGMA table_info('ChildType')").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.contains(&"id".to_string()),
+            "ChildType should have inherited 'id' column, got: {:?}",
+            columns
+        );
+        assert!(
+            columns.contains(&"child_field".to_string()),
+            "ChildType should have own 'child_field' column, got: {:?}",
+            columns
+        );
     }
 }

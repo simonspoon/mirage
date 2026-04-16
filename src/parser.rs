@@ -999,7 +999,7 @@ mod tests {
         spec.resolve_refs();
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::schema::create_tables_filtered(&conn, &spec, Some(&all_defs)).unwrap();
+        crate::schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None).unwrap();
         crate::seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
             .unwrap();
 
@@ -1054,39 +1054,48 @@ mod tests {
         // BaseType is not used in any property, response, or parameter.
         // => BaseType should be in the result.
         let mut definitions = HashMap::new();
-        definitions.insert("BaseType".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("id".to_string(), schema_typed("integer")),
-            ])),
-            ..schema_default()
-        });
-        definitions.insert("ChildA".to_string(), SchemaObject {
-            all_of: Some(vec![
-                schema_ref("BaseType"),
-                SchemaObject {
-                    schema_type: Some("object".to_string()),
-                    properties: Some(HashMap::from([
-                        ("name".to_string(), schema_typed("string")),
-                    ])),
-                    ..schema_default()
-                },
-            ]),
-            ..schema_default()
-        });
-        definitions.insert("ChildB".to_string(), SchemaObject {
-            all_of: Some(vec![
-                schema_ref("BaseType"),
-                SchemaObject {
-                    schema_type: Some("object".to_string()),
-                    properties: Some(HashMap::from([
-                        ("age".to_string(), schema_typed("integer")),
-                    ])),
-                    ..schema_default()
-                },
-            ]),
-            ..schema_default()
-        });
+        definitions.insert(
+            "BaseType".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([("id".to_string(), schema_typed("integer"))])),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "ChildA".to_string(),
+            SchemaObject {
+                all_of: Some(vec![
+                    schema_ref("BaseType"),
+                    SchemaObject {
+                        schema_type: Some("object".to_string()),
+                        properties: Some(HashMap::from([(
+                            "name".to_string(),
+                            schema_typed("string"),
+                        )])),
+                        ..schema_default()
+                    },
+                ]),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "ChildB".to_string(),
+            SchemaObject {
+                all_of: Some(vec![
+                    schema_ref("BaseType"),
+                    SchemaObject {
+                        schema_type: Some("object".to_string()),
+                        properties: Some(HashMap::from([(
+                            "age".to_string(),
+                            schema_typed("integer"),
+                        )])),
+                        ..schema_default()
+                    },
+                ]),
+                ..schema_default()
+            },
+        );
 
         let spec = make_spec_with_defs(definitions, HashMap::new());
         let roots = extension_only_roots(&spec);
@@ -1103,17 +1112,21 @@ mod tests {
         // BaseType in allOf, but also referenced by a response schema.
         // => BaseType should NOT be in the result.
         let mut definitions = HashMap::new();
-        definitions.insert("BaseType".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("id".to_string(), schema_typed("integer")),
-            ])),
-            ..schema_default()
-        });
-        definitions.insert("Child".to_string(), SchemaObject {
-            all_of: Some(vec![schema_ref("BaseType")]),
-            ..schema_default()
-        });
+        definitions.insert(
+            "BaseType".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([("id".to_string(), schema_typed("integer"))])),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "Child".to_string(),
+            SchemaObject {
+                all_of: Some(vec![schema_ref("BaseType")]),
+                ..schema_default()
+            },
+        );
 
         let mut paths = HashMap::new();
         let mut path_item = empty_path_item();
@@ -1133,24 +1146,32 @@ mod tests {
         // BaseType in allOf, but also referenced by a property in another definition.
         // => BaseType should NOT be in the result.
         let mut definitions = HashMap::new();
-        definitions.insert("BaseType".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("id".to_string(), schema_typed("integer")),
-            ])),
-            ..schema_default()
-        });
-        definitions.insert("Child".to_string(), SchemaObject {
-            all_of: Some(vec![schema_ref("BaseType")]),
-            ..schema_default()
-        });
-        definitions.insert("Container".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("base".to_string(), schema_ref("BaseType")),
-            ])),
-            ..schema_default()
-        });
+        definitions.insert(
+            "BaseType".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([("id".to_string(), schema_typed("integer"))])),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "Child".to_string(),
+            SchemaObject {
+                all_of: Some(vec![schema_ref("BaseType")]),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "Container".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([(
+                    "base".to_string(),
+                    schema_ref("BaseType"),
+                )])),
+                ..schema_default()
+            },
+        );
 
         let spec = make_spec_with_defs(definitions, HashMap::new());
         let roots = extension_only_roots(&spec);
@@ -1166,27 +1187,35 @@ mod tests {
         // via allOf-wrapped property ref (property: {allOf: [{$ref: BaseType}]})
         // => BaseType should NOT be in the result.
         let mut definitions = HashMap::new();
-        definitions.insert("BaseType".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("id".to_string(), schema_typed("integer")),
-            ])),
-            ..schema_default()
-        });
-        definitions.insert("Child".to_string(), SchemaObject {
-            all_of: Some(vec![schema_ref("BaseType")]),
-            ..schema_default()
-        });
-        definitions.insert("Wrapper".to_string(), SchemaObject {
-            schema_type: Some("object".to_string()),
-            properties: Some(HashMap::from([
-                ("embedded".to_string(), SchemaObject {
-                    all_of: Some(vec![schema_ref("BaseType")]),
-                    ..schema_default()
-                }),
-            ])),
-            ..schema_default()
-        });
+        definitions.insert(
+            "BaseType".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([("id".to_string(), schema_typed("integer"))])),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "Child".to_string(),
+            SchemaObject {
+                all_of: Some(vec![schema_ref("BaseType")]),
+                ..schema_default()
+            },
+        );
+        definitions.insert(
+            "Wrapper".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([(
+                    "embedded".to_string(),
+                    SchemaObject {
+                        all_of: Some(vec![schema_ref("BaseType")]),
+                        ..schema_default()
+                    },
+                )])),
+                ..schema_default()
+            },
+        );
 
         let spec = make_spec_with_defs(definitions, HashMap::new());
         let roots = extension_only_roots(&spec);
@@ -1208,6 +1237,9 @@ mod tests {
             definitions: None,
         };
         let roots = extension_only_roots(&spec);
-        assert!(roots.is_empty(), "Should return empty set when definitions is None");
+        assert!(
+            roots.is_empty(),
+            "Should return empty set when definitions is None"
+        );
     }
 }
