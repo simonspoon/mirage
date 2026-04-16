@@ -290,15 +290,14 @@ async fn main() {
             .iter()
             .map(|(path, method, _)| (path.to_string(), method.to_string()))
             .collect();
-        let all_defs = parser::definitions_for_paths(&raw_spec, &all_ops, true);
         let response_defs = parser::definitions_for_paths(&raw_spec, &all_ops, false);
 
         spec.resolve_refs();
 
-        // Create tables for all_defs, seed only response_defs
+        // Create tables only for response_defs, seed only response_defs
         {
             let conn = db.lock().unwrap();
-            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None).unwrap();
+            schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None).unwrap();
             seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
                 .unwrap();
         }

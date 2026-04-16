@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_input_only_table_exists_but_not_seeded() {
+    fn test_input_only_table_not_created() {
         let mut spec = load_input_only();
         let raw_spec = spec.clone();
         let ops: Vec<(String, String)> = raw_spec
@@ -993,13 +993,12 @@ mod tests {
             .iter()
             .map(|(p, m, _)| (p.to_string(), m.to_string()))
             .collect();
-        let all_defs = definitions_for_paths(&raw_spec, &ops, true);
         let response_defs = definitions_for_paths(&raw_spec, &ops, false);
 
         spec.resolve_refs();
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::schema::create_tables_filtered(&conn, &spec, Some(&all_defs), None).unwrap();
+        crate::schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None).unwrap();
         crate::seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
             .unwrap();
 
@@ -1009,16 +1008,11 @@ mod tests {
             .unwrap();
         assert!(pet_count > 0, "Pet table should have seeded rows");
 
-        // CreatePetRequest table should exist but be empty
-        let req_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM \"CreatePetRequest\"", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            req_count, 0,
-            "CreatePetRequest table should exist but have 0 rows"
-        );
+        // CreatePetRequest table should NOT exist (input-only schemas are excluded)
+        let result = conn.query_row("SELECT COUNT(*) FROM \"CreatePetRequest\"", [], |r| {
+            r.get::<_, i64>(0)
+        });
+        assert!(result.is_err(), "CreatePetRequest table should not exist");
     }
 
     // --- Group 6: extension_only_roots ---

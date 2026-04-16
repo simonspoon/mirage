@@ -1069,9 +1069,7 @@ async fn admin_configure(
         .collect();
 
     // Extract definition names from the unresolved spec's $ref paths
-    // all_defs includes body-parameter refs (for table creation + frozen_rows)
-    // response_defs excludes body-only types (for seeding — input-only tables stay empty)
-    let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
+    // response_defs excludes body-only types (used for table creation + seeding)
     let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
     // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
@@ -1134,8 +1132,7 @@ async fn admin_configure(
     let mut all_routes = routes;
     all_routes.extend(collection_routes);
 
-    // Use all_defs for table creation (input-only types get empty tables),
-    // response_defs for seeding (only response types get fake rows)
+    // Create tables only for response_defs, seed only response_defs
     {
         let conn = state.db.lock().unwrap();
         let existing: Vec<String> = conn
@@ -1151,9 +1148,7 @@ async fn admin_configure(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) =
-            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), Some(&ext_only_roots))
-        {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1808,9 +1803,7 @@ async fn admin_activate_recipe(
         .map(|e| (e.path.clone(), e.method.to_lowercase()))
         .collect();
 
-    // all_defs includes body-parameter refs (for table creation + frozen_rows)
-    // response_defs excludes body-only types (for seeding + quantity configs)
-    let all_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, true);
+    // response_defs excludes body-only types (used for table creation + seeding + quantity configs)
     let response_defs = crate::parser::definitions_for_paths(&raw_spec, &selected_ops, false);
 
     // Classify extension-only roots BEFORE resolve_refs (allOf structure is lost after resolution)
@@ -1872,9 +1865,7 @@ async fn admin_activate_recipe(
     all_routes.extend(collection_routes);
 
     // Drop old tables, create only needed ones, seed
-    // all_defs for table creation (input-only types get empty tables)
-    // all_defs for frozen_rows guard (input-only tables are writable)
-    // response_defs for seeding (only response types get fake rows)
+    // response_defs for table creation + frozen_rows guard + seeding
     {
         let conn = state.db.lock().unwrap();
         let existing: Vec<String> = conn
@@ -1890,9 +1881,7 @@ async fn admin_activate_recipe(
             conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])
                 .unwrap();
         }
-        if let Err(e) =
-            schema::create_tables_filtered(&conn, &spec, Some(&all_defs), Some(&ext_only_roots))
-        {
+        if let Err(e) = schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to create tables: {e}")})),
@@ -1900,7 +1889,7 @@ async fn admin_activate_recipe(
                 .into_response();
         }
 
-        // Insert frozen rows before seeding (uses all_defs — input-only tables are writable)
+        // Insert frozen rows before seeding (uses response_defs — only response tables exist)
         let frozen: crate::recipe::FrozenRows = match serde_json::from_str(&recipe.frozen_rows) {
             Ok(f) => f,
             Err(e) => {
@@ -1914,7 +1903,7 @@ async fn admin_activate_recipe(
         if !frozen.is_empty() {
             let spec_defs = spec.definitions.as_ref();
             for (table_name, rows) in &frozen {
-                if !all_defs.contains(table_name) {
+                if !response_defs.contains(table_name) {
                     eprintln!(
                         "Warning: frozen_rows references unknown table \"{table_name}\", skipping"
                     );
