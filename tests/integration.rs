@@ -418,9 +418,9 @@ fn test_shared_type_pool() {
     // /composedentity per src/server.rs:1768.
     //
     // This test guards endpoint reachability + Owner shape round-trip through
-    // DB for both paths. Cross-endpoint pool-consumption identity is NOT
-    // asserted — compose_documents doesn't consume the pool today (tracked
-    // separately as task ldum).
+    // DB for both paths AND cross-endpoint pool-consumption identity:
+    // every composed.owner (name, city) tuple must be a member of the
+    // /owners pool's (name, city) tuple set.
     let server = MirageServer::start("tests/fixtures/mega.yaml", "/owners");
     let client = reqwest::blocking::Client::new();
 
@@ -468,6 +468,8 @@ fn test_shared_type_pool() {
         .expect("/owners response should be a JSON array");
     assert!(!owners.is_empty(), "/owners array should be non-empty");
 
+    let mut pool_tuples: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for (idx, row) in owners.iter().enumerate() {
         let ctx = || format!("/owners row {idx}: {row}");
         assert!(
@@ -492,7 +494,28 @@ fn test_shared_type_pool() {
             "owner.address.country must be string — {}",
             ctx()
         );
+        let name = row["name"].as_str().unwrap().to_string();
+        let city = address["city"].as_str().unwrap().to_string();
+        pool_tuples.insert((name, city));
     }
+
+    // Guard against tautological pass if pool short-circuit regresses: we
+    // requested pool_size=3, so /owners must surface exactly 3 rows and
+    // the (name, city) tuples must all be distinct.
+    assert_eq!(
+        owners.len(),
+        3,
+        "/owners should surface exactly pool_size=3 rows, got {}",
+        owners.len()
+    );
+    assert_eq!(
+        pool_tuples.len(),
+        3,
+        "/owners (name, city) tuples should all be distinct, got {} unique of {} rows: {:?}",
+        pool_tuples.len(),
+        owners.len(),
+        pool_tuples
+    );
 
     // /composedentity — ComposedEntity collection URL post-activation is
     // /{table.to_lowercase()} (src/server.rs:1768), NOT /composed.
@@ -536,6 +559,18 @@ fn test_shared_type_pool() {
         assert!(
             address["country"].is_string(),
             "composed.owner.address.country must be string — {}",
+            ctx()
+        );
+
+        let tup = (
+            owner["name"].as_str().unwrap().to_string(),
+            address["city"].as_str().unwrap().to_string(),
+        );
+        assert!(
+            pool_tuples.contains(&tup),
+            "composed.owner (name, city) {:?} must be drawn from /owners pool {:?} — {}",
+            tup,
+            pool_tuples,
             ctx()
         );
     }
