@@ -2,7 +2,6 @@ import { render } from "solid-js/web";
 import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
 import "./index.css";
-import ForceGraph from "./ForceGraph";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
 
 interface Endpoint {
