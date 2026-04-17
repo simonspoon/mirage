@@ -862,7 +862,6 @@ fn test_response_shape_coverage() {
 /// fixed (see follow-up limbo task). Fixture entries for /catalog live
 /// in tests/fixtures/mega.yaml.
 #[test]
-#[ignore]
 fn test_response_shape_b_wrapped_array_regression() {
     let server = MirageServer::start("tests/fixtures/mega.yaml", "/gadgets");
     let client = reqwest::blocking::Client::new();

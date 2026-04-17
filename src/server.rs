@@ -1004,6 +1004,7 @@ async fn admin_configure(
         .map(|(path, method, op)| ((*path, *method), *op))
         .collect();
 
+    let raw_defs = raw_spec.definitions.as_ref();
     let routes: Vec<RouteEntry> = spec
         .path_operations()
         .iter()
@@ -1011,10 +1012,10 @@ async fn admin_configure(
         .map(|(path, method, _)| {
             let raw_op = raw_op_map.get(&(*path, *method));
             let shape = raw_op
-                .map(|op| crate::parser::primary_response_shape(op))
+                .map(|op| crate::parser::primary_response_shape(op, raw_defs))
                 .unwrap_or(ResponseShape::Empty);
             let table = raw_op
-                .and_then(|op| crate::parser::primary_response_def(op))
+                .and_then(|op| crate::parser::primary_response_def(op, raw_defs))
                 .unwrap_or_else(|| table_name_from_path(path));
             RouteEntry {
                 method: method.to_string(),
@@ -1736,6 +1737,7 @@ async fn admin_activate_recipe(
         .iter()
         .map(|(path, method, op)| ((*path, *method), *op))
         .collect();
+    let raw_defs = raw_spec.definitions.as_ref();
 
     let routes: Vec<RouteEntry> = spec
         .path_operations()
@@ -1744,10 +1746,10 @@ async fn admin_activate_recipe(
         .map(|(path, method, _)| {
             let raw_op = raw_op_map.get(&(*path, *method));
             let shape = raw_op
-                .map(|op| crate::parser::primary_response_shape(op))
+                .map(|op| crate::parser::primary_response_shape(op, raw_defs))
                 .unwrap_or(ResponseShape::Empty);
             let table = raw_op
-                .and_then(|op| crate::parser::primary_response_def(op))
+                .and_then(|op| crate::parser::primary_response_def(op, raw_defs))
                 .unwrap_or_else(|| table_name_from_path(path));
             RouteEntry {
                 method: method.to_string(),
@@ -2279,14 +2281,15 @@ pub fn populate_registry(reg: &mut RouteRegistry, spec: &SwaggerSpec, raw_spec: 
         .iter()
         .map(|(path, method, op)| ((*path, *method), *op))
         .collect();
+    let raw_defs = raw_spec.definitions.as_ref();
 
     for (path, method, _op) in spec.path_operations() {
         let raw_op = raw_op_map.get(&(path, method));
         let shape = raw_op
-            .map(|op| crate::parser::primary_response_shape(op))
+            .map(|op| crate::parser::primary_response_shape(op, raw_defs))
             .unwrap_or(ResponseShape::Empty);
         let table = raw_op
-            .and_then(|op| crate::parser::primary_response_def(op))
+            .and_then(|op| crate::parser::primary_response_def(op, raw_defs))
             .unwrap_or_else(|| table_name_from_path(path));
         let has_path_param = path.contains('{');
 

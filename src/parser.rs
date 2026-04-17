@@ -213,10 +213,30 @@ pub enum ResponseShape {
 }
 
 /// Classify the shape of a response schema (works on raw, pre-resolve_refs schemas).
-pub fn classify_response_schema(schema: &SchemaObject) -> ResponseShape {
-    // 1. Direct $ref → Definition
+///
+/// When `spec_defs` is `Some`, performs a strict one-hop unwrap for Shape B
+/// (`$ref → named def of type:array + items:$ref`) so the element def name is
+/// returned instead of the wrapper. When `spec_defs` is `None`, preserves the
+/// pre-fix behavior of returning the wrapper name (back-compat for unit tests
+/// that don't thread a spec).
+pub fn classify_response_schema(
+    schema: &SchemaObject,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> ResponseShape {
+    // 1. Direct $ref → Definition (with optional Shape B one-hop unwrap)
     if let Some(ref ref_path) = schema.ref_path {
         let name = ref_path.rsplit('/').next().unwrap_or(ref_path);
+        // Shape B: if the named def is a type:array with items.$ref, unwrap
+        // one hop to the element def name. Strict one-hop only — no recursion.
+        if let Some(defs) = spec_defs
+            && let Some(target) = defs.get(name)
+            && target.schema_type.as_deref() == Some("array")
+            && let Some(ref items) = target.items
+            && let Some(ref items_ref) = items.ref_path
+        {
+            let element = items_ref.rsplit('/').next().unwrap_or(items_ref);
+            return ResponseShape::Definition(element.to_string());
+        }
         return ResponseShape::Definition(name.to_string());
     }
 
@@ -258,13 +278,18 @@ pub fn classify_response_schema(schema: &SchemaObject) -> ResponseShape {
 
 /// Get the primary response shape for a given operation.
 /// Prefers 200, then 201, then any other 2xx response.
-pub fn primary_response_shape(op: &Operation) -> ResponseShape {
+///
+/// See `classify_response_schema` for `spec_defs` semantics (Shape B unwrap).
+pub fn primary_response_shape(
+    op: &Operation,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> ResponseShape {
     // Check 200 first, then 201
     for code in &["200", "201"] {
         if let Some(resp) = op.responses.get(*code)
             && let Some(schema) = &resp.schema
         {
-            return classify_response_schema(schema);
+            return classify_response_schema(schema, spec_defs);
             // no schema on this response: continue to next priority code
         }
     }
@@ -277,7 +302,7 @@ pub fn primary_response_shape(op: &Operation) -> ResponseShape {
             && key != "201"
             && let Some(schema) = &op.responses[key].schema
         {
-            return classify_response_schema(schema);
+            return classify_response_schema(schema, spec_defs);
         }
     }
     ResponseShape::Empty
@@ -285,8 +310,11 @@ pub fn primary_response_shape(op: &Operation) -> ResponseShape {
 
 /// Get the primary response definition name for a given operation.
 /// Prefers 200, then 201, then any other 2xx response.
-pub fn primary_response_def(op: &Operation) -> Option<String> {
-    match primary_response_shape(op) {
+pub fn primary_response_def(
+    op: &Operation,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Option<String> {
+    match primary_response_shape(op, spec_defs) {
         ResponseShape::Definition(name) => Some(name),
         _ => None,
     }
@@ -717,7 +745,7 @@ mod tests {
     fn test_classify_definition_direct_ref() {
         let s = schema_ref("Pet");
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::Definition("Pet".to_string())
         );
     }
@@ -726,7 +754,7 @@ mod tests {
     fn test_classify_definition_array_of_refs() {
         let s = schema_array(schema_ref("Pet"));
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::Definition("Pet".to_string())
         );
     }
@@ -735,7 +763,7 @@ mod tests {
     fn test_classify_primitive_string() {
         let s = schema_typed("string");
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::Primitive("string".to_string())
         );
     }
@@ -744,7 +772,7 @@ mod tests {
     fn test_classify_primitive_integer() {
         let s = schema_typed("integer");
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::Primitive("integer".to_string())
         );
     }
@@ -753,7 +781,7 @@ mod tests {
     fn test_classify_primitive_boolean() {
         let s = schema_typed("boolean");
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::Primitive("boolean".to_string())
         );
     }
@@ -762,7 +790,7 @@ mod tests {
     fn test_classify_primitive_array() {
         let s = schema_array(schema_typed("string"));
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::PrimitiveArray("string".to_string())
         );
     }
@@ -771,7 +799,7 @@ mod tests {
     fn test_classify_primitive_array_integer_items() {
         let s = schema_array(schema_typed("integer"));
         assert_eq!(
-            classify_response_schema(&s),
+            classify_response_schema(&s, None),
             ResponseShape::PrimitiveArray("integer".to_string())
         );
     }
@@ -783,19 +811,25 @@ mod tests {
             additional_properties: Some(Box::new(schema_typed("string"))),
             ..schema_default()
         };
-        assert_eq!(classify_response_schema(&s), ResponseShape::FreeformObject);
+        assert_eq!(
+            classify_response_schema(&s, None),
+            ResponseShape::FreeformObject
+        );
     }
 
     #[test]
     fn test_classify_freeform_object_bare_object() {
         let s = schema_typed("object");
-        assert_eq!(classify_response_schema(&s), ResponseShape::FreeformObject);
+        assert_eq!(
+            classify_response_schema(&s, None),
+            ResponseShape::FreeformObject
+        );
     }
 
     #[test]
     fn test_classify_empty_schema() {
         let s = schema_default();
-        assert_eq!(classify_response_schema(&s), ResponseShape::Empty);
+        assert_eq!(classify_response_schema(&s, None), ResponseShape::Empty);
     }
 
     // --- Group 2: primary_response_shape ---
@@ -804,7 +838,7 @@ mod tests {
     fn test_primary_shape_200_definition() {
         let op = op_with_response("200", Some(schema_ref("Pet")));
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::Definition("Pet".to_string())
         );
     }
@@ -813,7 +847,7 @@ mod tests {
     fn test_primary_shape_200_primitive() {
         let op = op_with_response("200", Some(schema_typed("string")));
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::Primitive("string".to_string())
         );
     }
@@ -822,7 +856,7 @@ mod tests {
     fn test_primary_shape_200_primitive_array() {
         let op = op_with_response("200", Some(schema_array(schema_typed("integer"))));
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::PrimitiveArray("integer".to_string())
         );
     }
@@ -830,13 +864,16 @@ mod tests {
     #[test]
     fn test_primary_shape_200_freeform() {
         let op = op_with_response("200", Some(schema_typed("object")));
-        assert_eq!(primary_response_shape(&op), ResponseShape::FreeformObject);
+        assert_eq!(
+            primary_response_shape(&op, None),
+            ResponseShape::FreeformObject
+        );
     }
 
     #[test]
     fn test_primary_shape_no_success_response() {
         let op = op_with_response("404", None);
-        assert_eq!(primary_response_shape(&op), ResponseShape::Empty);
+        assert_eq!(primary_response_shape(&op, None), ResponseShape::Empty);
     }
 
     #[test]
@@ -846,7 +883,7 @@ mod tests {
             ("201", Some(schema_ref("Dog"))),
         ]);
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::Definition("Cat".to_string())
         );
     }
@@ -855,7 +892,7 @@ mod tests {
     fn test_primary_shape_201_fallback() {
         let op = op_with_responses(vec![("404", None), ("201", Some(schema_ref("Dog")))]);
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::Definition("Dog".to_string())
         );
     }
@@ -863,17 +900,17 @@ mod tests {
     #[test]
     fn test_primary_shape_no_schema_on_200() {
         let op = op_with_response("200", None);
-        assert_eq!(primary_response_shape(&op), ResponseShape::Empty);
+        assert_eq!(primary_response_shape(&op, None), ResponseShape::Empty);
     }
 
     #[test]
     fn test_primary_shape_200_no_schema_falls_through_to_201() {
         let op = op_with_responses(vec![("200", None), ("201", Some(schema_ref("Dog")))]);
         assert_eq!(
-            primary_response_shape(&op),
+            primary_response_shape(&op, None),
             ResponseShape::Definition("Dog".to_string())
         );
-        assert_eq!(primary_response_def(&op), Some("Dog".to_string()));
+        assert_eq!(primary_response_def(&op, None), Some("Dog".to_string()));
     }
 
     // --- Group 3: primary_response_def regression ---
@@ -881,25 +918,25 @@ mod tests {
     #[test]
     fn test_primary_response_def_returns_some_for_ref() {
         let op = op_with_response("200", Some(schema_ref("Pet")));
-        assert_eq!(primary_response_def(&op), Some("Pet".to_string()));
+        assert_eq!(primary_response_def(&op, None), Some("Pet".to_string()));
     }
 
     #[test]
     fn test_primary_response_def_returns_some_for_array_ref() {
         let op = op_with_response("200", Some(schema_array(schema_ref("Pet"))));
-        assert_eq!(primary_response_def(&op), Some("Pet".to_string()));
+        assert_eq!(primary_response_def(&op, None), Some("Pet".to_string()));
     }
 
     #[test]
     fn test_primary_response_def_returns_none_for_primitive() {
         let op = op_with_response("200", Some(schema_typed("string")));
-        assert_eq!(primary_response_def(&op), None);
+        assert_eq!(primary_response_def(&op, None), None);
     }
 
     #[test]
     fn test_primary_response_def_returns_none_when_no_schema() {
         let op = op_with_response("200", None);
-        assert_eq!(primary_response_def(&op), None);
+        assert_eq!(primary_response_def(&op, None), None);
     }
 
     // --- Group 4: petstore fixture ---
@@ -910,7 +947,7 @@ mod tests {
         let path_item = spec.paths.get("/pet/{petId}").unwrap();
         let get_op = path_item.get.as_ref().unwrap();
         assert_eq!(
-            primary_response_shape(get_op),
+            primary_response_shape(get_op, None),
             ResponseShape::Definition("Pet".to_string())
         );
     }
@@ -920,7 +957,10 @@ mod tests {
         let spec = load_petstore();
         let path_item = spec.paths.get("/pet/{petId}").unwrap();
         let delete_op = path_item.delete.as_ref().unwrap();
-        assert_eq!(primary_response_shape(delete_op), ResponseShape::Empty);
+        assert_eq!(
+            primary_response_shape(delete_op, None),
+            ResponseShape::Empty
+        );
     }
 
     // --- Group 5: definitions_for_paths include_bodies flag ---
@@ -1234,6 +1274,160 @@ mod tests {
         assert!(
             roots.is_empty(),
             "Should return empty set when definitions is None"
+        );
+    }
+
+    // --- Group 7: Shape B wrapped-array unwrap ---
+
+    fn shape_b_defs() -> HashMap<String, SchemaObject> {
+        let mut defs = HashMap::new();
+        // CatalogPage: type:array wrapper with items.$ref → CatalogItem
+        defs.insert(
+            "CatalogPage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                items: Some(Box::new(schema_ref("CatalogItem"))),
+                ..schema_default()
+            },
+        );
+        defs.insert(
+            "CatalogItem".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                properties: Some(HashMap::from([("sku".to_string(), schema_typed("string"))])),
+                ..schema_default()
+            },
+        );
+        defs
+    }
+
+    #[test]
+    fn test_classify_shape_b_wrapper_unwraps_to_element() {
+        let defs = shape_b_defs();
+        let s = schema_ref("CatalogPage");
+        assert_eq!(
+            classify_response_schema(&s, Some(&defs)),
+            ResponseShape::Definition("CatalogItem".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_shape_b_without_spec_defs_falls_back() {
+        // When spec_defs is None, preserve pre-fix behavior (wrapper name).
+        let s = schema_ref("CatalogPage");
+        assert_eq!(
+            classify_response_schema(&s, None),
+            ResponseShape::Definition("CatalogPage".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_shape_b_unknown_items_ref() {
+        // Wrapper present, but items.$ref points to a def absent from defs.
+        // Must return Definition(element_name) unresolved — no panic, no
+        // drop-to-FreeformObject.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "CatalogPage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                items: Some(Box::new(schema_ref("Ghost"))),
+                ..schema_default()
+            },
+        );
+        let s = schema_ref("CatalogPage");
+        assert_eq!(
+            classify_response_schema(&s, Some(&defs)),
+            ResponseShape::Definition("Ghost".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_shape_b_wrapper_items_without_ref() {
+        // Wrapper def is type:array but items have no $ref (inline primitive).
+        // Must NOT misclassify — keep the Definition(wrapper) fallthrough.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "StringPage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                items: Some(Box::new(schema_typed("string"))),
+                ..schema_default()
+            },
+        );
+        let s = schema_ref("StringPage");
+        assert_eq!(
+            classify_response_schema(&s, Some(&defs)),
+            ResponseShape::Definition("StringPage".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_shape_b_wrapper_no_items() {
+        // Wrapper def is type:array with NO items at all. Preserve current
+        // behavior (Definition(wrapper)) — do NOT drop to PrimitiveArray.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "BarePage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                ..schema_default()
+            },
+        );
+        let s = schema_ref("BarePage");
+        assert_eq!(
+            classify_response_schema(&s, Some(&defs)),
+            ResponseShape::Definition("BarePage".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_shape_b_no_double_unwrap() {
+        // Chained wrappers: OuterPage → InnerPage → Leaf. Strict one-hop only;
+        // after unwrapping OuterPage once we land on InnerPage (the element
+        // name), NOT Leaf. Do not recurse.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "OuterPage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                items: Some(Box::new(schema_ref("InnerPage"))),
+                ..schema_default()
+            },
+        );
+        defs.insert(
+            "InnerPage".to_string(),
+            SchemaObject {
+                schema_type: Some("array".to_string()),
+                items: Some(Box::new(schema_ref("Leaf"))),
+                ..schema_default()
+            },
+        );
+        defs.insert(
+            "Leaf".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                ..schema_default()
+            },
+        );
+        let s = schema_ref("OuterPage");
+        assert_eq!(
+            classify_response_schema(&s, Some(&defs)),
+            ResponseShape::Definition("InnerPage".to_string())
+        );
+    }
+
+    #[test]
+    fn test_primary_shape_shape_b_unwraps() {
+        let defs = shape_b_defs();
+        let op = op_with_response("200", Some(schema_ref("CatalogPage")));
+        assert_eq!(
+            primary_response_shape(&op, Some(&defs)),
+            ResponseShape::Definition("CatalogItem".to_string())
+        );
+        assert_eq!(
+            primary_response_def(&op, Some(&defs)),
+            Some("CatalogItem".to_string())
         );
     }
 }

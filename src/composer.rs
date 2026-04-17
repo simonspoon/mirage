@@ -242,7 +242,7 @@ pub fn compose_documents(
     for endpoint in selected_endpoints {
         let def_name = raw_op_map
             .get(&(endpoint.path.as_str(), endpoint.method.as_str()))
-            .and_then(|raw_op| crate::parser::primary_response_def(raw_op));
+            .and_then(|raw_op| crate::parser::primary_response_def(raw_op, raw_defs));
         let def_name = match def_name {
             Some(n) => n,
             None => continue,

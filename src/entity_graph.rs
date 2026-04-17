@@ -38,11 +38,28 @@ pub struct EntityGraph {
 }
 
 /// Extract the root definition name from a schema's $ref (or items.$ref for arrays).
-fn root_def_name(schema: &SchemaObject) -> Option<String> {
+///
+/// When `spec_defs` is `Some`, performs a strict one-hop unwrap for Shape B
+/// (`$ref → named def of type:array + items:$ref`) so the element def name
+/// is returned instead of the wrapper. Mirrors
+/// `parser::classify_response_schema` Shape B semantics.
+fn root_def_name(
+    schema: &SchemaObject,
+    spec_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Option<String> {
     if let Some(ref ref_path) = schema.ref_path {
-        return ref_path
-            .strip_prefix("#/definitions/")
-            .map(|s| s.to_string());
+        let name = ref_path.strip_prefix("#/definitions/")?.to_string();
+        // Shape B one-hop unwrap when spec_defs is available.
+        if let Some(defs) = spec_defs
+            && let Some(target) = defs.get(&name)
+            && target.schema_type.as_deref() == Some("array")
+            && let Some(ref items) = target.items
+            && let Some(ref items_ref) = items.ref_path
+            && let Some(element) = items_ref.strip_prefix("#/definitions/")
+        {
+            return Some(element.to_string());
+        }
+        return Some(name);
     }
     if schema.schema_type.as_deref() == Some("array")
         && let Some(ref items) = schema.items
@@ -210,7 +227,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         for code in &["200", "201"] {
             if let Some(resp) = op.responses.get(*code)
                 && let Some(schema) = &resp.schema
-                && let Some(name) = root_def_name(schema)
+                && let Some(name) = root_def_name(schema, spec_defs)
             {
                 response_root = Some(name);
                 break;
@@ -224,7 +241,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
                     && key != "200"
                     && key != "201"
                     && let Some(schema) = &op.responses[key].schema
-                    && let Some(name) = root_def_name(schema)
+                    && let Some(name) = root_def_name(schema, spec_defs)
                 {
                     response_root = Some(name);
                     break;
@@ -235,12 +252,13 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
             endpoint_roots.push(name);
         }
 
-        // Check body parameters for $ref
+        // Check body parameters for $ref (body params are request-side; no
+        // Shape B unwrap — pass None to preserve wrapper-as-root semantics).
         if let Some(params) = &op.parameters {
             for param in params {
                 if param.r#in == "body"
                     && let Some(schema) = &param.schema
-                    && let Some(name) = root_def_name(schema)
+                    && let Some(name) = root_def_name(schema, None)
                     && !endpoint_roots.contains(&name)
                 {
                     endpoint_roots.push(name);
@@ -250,7 +268,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
 
         // If no definition-based roots found, check for virtual root
         if endpoint_roots.is_empty() {
-            let shape = parser::primary_response_shape(op);
+            let shape = parser::primary_response_shape(op, spec_defs);
             match shape {
                 ResponseShape::Definition(_) | ResponseShape::Empty => {}
                 _ => {
@@ -609,5 +627,131 @@ paths:
         let selected = vec![("/ping".to_string(), "get".to_string())];
         let graph = build_entity_graph(&spec, &selected);
         assert!(graph.virtual_roots.is_empty());
+    }
+
+    // --- root_def_name: Shape B one-hop unwrap ---
+
+    fn ref_schema(def: &str) -> SchemaObject {
+        SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: Some(format!("#/definitions/{def}")),
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        }
+    }
+
+    fn array_ref_def_schema(element: &str) -> SchemaObject {
+        SchemaObject {
+            schema_type: Some("array".to_string()),
+            format: None,
+            properties: None,
+            items: Some(Box::new(ref_schema(element))),
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        }
+    }
+
+    #[test]
+    fn test_root_def_name_shape_b_unwraps() {
+        // Shape B: $ref → CatalogPage (type:array + items.$ref CatalogItem).
+        // With spec_defs provided, must return CatalogItem (element), not
+        // CatalogPage (wrapper).
+        let mut defs = HashMap::new();
+        defs.insert(
+            "CatalogPage".to_string(),
+            array_ref_def_schema("CatalogItem"),
+        );
+        defs.insert(
+            "CatalogItem".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                format: None,
+                properties: None,
+                items: None,
+                required: None,
+                ref_path: None,
+                enum_values: None,
+                description: None,
+                additional_properties: None,
+                all_of: None,
+                x_faker: None,
+            },
+        );
+        let schema = ref_schema("CatalogPage");
+        assert_eq!(
+            root_def_name(&schema, Some(&defs)),
+            Some("CatalogItem".to_string())
+        );
+    }
+
+    #[test]
+    fn test_root_def_name_direct_ref_unchanged() {
+        // Direct $ref to a non-array def. Unwrap must be a no-op.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "Pet".to_string(),
+            SchemaObject {
+                schema_type: Some("object".to_string()),
+                format: None,
+                properties: None,
+                items: None,
+                required: None,
+                ref_path: None,
+                enum_values: None,
+                description: None,
+                additional_properties: None,
+                all_of: None,
+                x_faker: None,
+            },
+        );
+        let schema = ref_schema("Pet");
+        assert_eq!(root_def_name(&schema, Some(&defs)), Some("Pet".to_string()));
+    }
+
+    #[test]
+    fn test_root_def_name_array_of_ref_unchanged() {
+        // Inline array with items.$ref — not Shape B. Must return element
+        // name directly (existing behavior).
+        let schema = SchemaObject {
+            schema_type: Some("array".to_string()),
+            format: None,
+            properties: None,
+            items: Some(Box::new(ref_schema("Pet"))),
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        assert_eq!(root_def_name(&schema, None), Some("Pet".to_string()));
+        // Same result with spec_defs provided.
+        let defs = HashMap::new();
+        assert_eq!(root_def_name(&schema, Some(&defs)), Some("Pet".to_string()));
+    }
+
+    #[test]
+    fn test_root_def_name_shape_b_missing_def() {
+        // Wrapper def absent from spec_defs → falls back to Some(wrapper).
+        // No panic, no drop to None.
+        let defs: HashMap<String, SchemaObject> = HashMap::new();
+        let schema = ref_schema("CatalogPage");
+        assert_eq!(
+            root_def_name(&schema, Some(&defs)),
+            Some("CatalogPage".to_string())
+        );
     }
 }
