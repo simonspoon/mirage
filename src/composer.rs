@@ -273,6 +273,20 @@ pub fn compose_documents(
             continue;
         }
 
+        // Pool short-circuit: when this endpoint's def has a non-empty pool,
+        // clone pool entries directly into the store. Preserves cross-endpoint
+        // identity (same Owner queried via /owners and referenced via nested
+        // $ref returns the same instances). quantity_configs for pooled defs
+        // are ignored by design — pool_size is authoritative. Empty pools
+        // (pool_size=0 or generation produced zero entries) fall through to
+        // the fresh-generation path below.
+        if let Some(pool) = pools.get(&def_name)
+            && !pool.is_empty()
+        {
+            store.insert(def_name.clone(), pool.clone());
+            continue;
+        }
+
         let schema = match defs.get(&def_name) {
             Some(s) => s,
             None => continue,
@@ -1369,5 +1383,256 @@ mod tests {
 
         assert_eq!(pools.get("X").unwrap().len(), 2);
         assert_eq!(pools.get("Y").unwrap().len(), 2);
+    }
+
+    fn load_mega_raw() -> SwaggerSpec {
+        SwaggerSpec::from_file("tests/fixtures/mega.yaml").unwrap()
+    }
+
+    fn load_mega_resolved() -> SwaggerSpec {
+        let mut spec = SwaggerSpec::from_file("tests/fixtures/mega.yaml").unwrap();
+        spec.resolve_refs();
+        spec
+    }
+
+    #[test]
+    fn test_compose_endpoint_def_uses_pool() {
+        // T1: /owners endpoint returns Owner. Owner has a pool of 3 generated
+        // via real generate_pools (so nested $ref Address is fully resolved).
+        // quantity_configs deliberately requests 10 — pool short-circuit must
+        // ignore it and return the 3 pool entries verbatim (by (id, name)).
+        let raw_spec = load_mega_raw();
+        let spec = load_mega_resolved();
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("Owner".to_string(), 3);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        // Snapshot pool (id, name) tuples BEFORE compose to prove clone-not-regen.
+        let pool_tuples: HashSet<(i64, String)> = pools
+            .get("Owner")
+            .expect("Owner pool generated")
+            .iter()
+            .map(|o| {
+                (
+                    o["id"].as_i64().expect("Owner.id must be integer"),
+                    o["name"]
+                        .as_str()
+                        .expect("Owner.name must be string")
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        let selected_ops = vec![("/owners".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&raw_spec, &selected_ops);
+
+        let mut quantities = QuantityConfigs::new();
+        quantities.insert("Owner".to_string(), QuantityConfig { min: 10, max: 10 });
+
+        let endpoints = vec![EndpointInfo {
+            method: "get".to_string(),
+            path: "/owners".to_string(),
+        }];
+
+        let docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+            &[],
+        );
+
+        let owners = docs.get("Owner").expect("Owner docs present");
+        assert_eq!(
+            owners.len(),
+            3,
+            "pool short-circuit must override quantity_configs (pool_size=3, requested=10)"
+        );
+
+        let ids: HashSet<i64> = owners
+            .iter()
+            .map(|o| o["id"].as_i64().expect("composed Owner.id must be integer"))
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([1, 2, 3]),
+            "pool ids preserved (not regenerated 1..=N from count loop)"
+        );
+
+        // Load-bearing: every composed (id, name) must be a pool tuple — proves
+        // clone from pool, not fresh generation.
+        for owner in owners {
+            let oid = owner["id"].as_i64().unwrap();
+            let oname = owner["name"].as_str().unwrap().to_string();
+            assert!(
+                pool_tuples.contains(&(oid, oname.clone())),
+                "composed Owner (id={oid}, name={oname}) must be a pool entry"
+            );
+            let address = owner.get("address").expect("nested address preserved");
+            assert!(
+                address.is_object(),
+                "nested Owner.address must remain an object from pool clone"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compose_endpoint_def_not_in_pool_uses_quantity() {
+        // T2: pool_config has Owner but selected endpoint is /widgets. Widget
+        // has no pool — the short-circuit branch must be bypassed and the
+        // quantity path must run. Regression fence: proves the branch is
+        // conditional on pool membership, not global.
+        let raw_spec = load_mega_raw();
+        let spec = load_mega_resolved();
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("Owner".to_string(), 3);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        let selected_ops = vec![("/widgets".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&raw_spec, &selected_ops);
+
+        let mut quantities = QuantityConfigs::new();
+        quantities.insert("Widget".to_string(), QuantityConfig { min: 7, max: 7 });
+
+        let endpoints = vec![EndpointInfo {
+            method: "get".to_string(),
+            path: "/widgets".to_string(),
+        }];
+
+        let docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+            &[],
+        );
+
+        let widgets = docs.get("Widget").expect("Widget docs present");
+        assert_eq!(widgets.len(), 7, "Widget follows quantity_configs");
+
+        let ids: HashSet<i64> = widgets
+            .iter()
+            .map(|w| w["id"].as_i64().expect("Widget.id must be integer"))
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([1, 2, 3, 4, 5, 6, 7]),
+            "Widget ids are 1..=7 from the count loop"
+        );
+
+        assert!(
+            !docs.contains_key("Owner"),
+            "Owner not selected — must not appear in composed docs"
+        );
+    }
+
+    #[test]
+    fn test_compose_pool_empty_falls_through_to_fresh() {
+        // T3: pools has an empty vec for Owner. The short-circuit predicate
+        // uses !is_empty(), so the branch must NOT fire. Quantity path runs.
+        let raw_spec = load_mega_raw();
+        let spec = load_mega_resolved();
+
+        let mut pools = DocumentStore::new();
+        pools.insert("Owner".to_string(), Vec::new());
+
+        let selected_ops = vec![("/owners".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&raw_spec, &selected_ops);
+
+        let mut quantities = QuantityConfigs::new();
+        quantities.insert("Owner".to_string(), QuantityConfig { min: 5, max: 5 });
+
+        let endpoints = vec![EndpointInfo {
+            method: "get".to_string(),
+            path: "/owners".to_string(),
+        }];
+
+        let docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+            &[],
+        );
+
+        let owners = docs.get("Owner").expect("Owner docs present");
+        assert_eq!(
+            owners.len(),
+            5,
+            "empty pool falls through to quantity path (5 fresh docs)"
+        );
+
+        let ids: HashSet<i64> = owners
+            .iter()
+            .map(|o| o["id"].as_i64().expect("Owner.id must be integer"))
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([1, 2, 3, 4, 5]),
+            "fresh-gen ids are 1..=5 from the count loop"
+        );
+    }
+
+    #[test]
+    fn test_compose_pool_entries_deep_cloned_not_aliased() {
+        // T7: mutate a composed doc, verify the pool entry is unchanged. Proves
+        // the pool.clone() at the short-circuit produces an independent Vec of
+        // independent serde_json::Value trees (serde_json::Value::clone is deep).
+        let raw_spec = load_mega_raw();
+        let spec = load_mega_resolved();
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("Owner".to_string(), 2);
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        let original_name = pools.get("Owner").unwrap()[0]["name"]
+            .as_str()
+            .expect("Owner.name must be string")
+            .to_string();
+
+        let selected_ops = vec![("/owners".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&raw_spec, &selected_ops);
+        let quantities = QuantityConfigs::new();
+        let endpoints = vec![EndpointInfo {
+            method: "get".to_string(),
+            path: "/owners".to_string(),
+        }];
+
+        let mut docs = compose_documents(
+            &spec,
+            &raw_spec,
+            &graph,
+            &pools,
+            &quantities,
+            &endpoints,
+            &FakerRules::new(),
+            &[],
+        );
+
+        // Mutate the composed Owner[0].name.
+        if let serde_json::Value::Object(ref mut map) = docs.get_mut("Owner").unwrap()[0] {
+            map.insert(
+                "name".to_string(),
+                serde_json::Value::String("MUTATED".to_string()),
+            );
+        }
+
+        // Pool entry must be untouched (deep clone, not aliased).
+        assert_eq!(
+            pools.get("Owner").unwrap()[0]["name"].as_str().unwrap(),
+            original_name,
+            "pool entry must not be aliased to the composed doc"
+        );
     }
 }
