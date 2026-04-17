@@ -67,6 +67,7 @@ pub fn generate_pools(
                 def_name,
                 schema,
                 raw_schema,
+                raw_defs,
                 &store,
                 faker_rules,
                 &field_rule_map,
@@ -183,10 +184,30 @@ fn topo_sort_pool_defs(raw_spec: &SwaggerSpec, pool_config: &SharedPoolConfig) -
 }
 
 /// Collect definition names referenced via `$ref` in a schema's properties and
-/// array items. Scans only one level deep (direct properties).
+/// array items. Scans one level deep (direct properties). For allOf-rooted
+/// schemas, also scans each allOf member's properties and the member's own
+/// `$ref` (so topo sort picks up pool deps that live inside allOf members).
 fn collect_ref_deps(schema: &SchemaObject) -> Vec<String> {
     let mut deps = Vec::new();
-    if let Some(ref props) = schema.properties {
+    collect_ref_deps_from_props(&schema.properties, &mut deps);
+    if let Some(ref all_of) = schema.all_of {
+        for member in all_of {
+            if let Some(ref ref_path) = member.ref_path
+                && let Some(name) = ref_path.strip_prefix("#/definitions/")
+            {
+                deps.push(name.to_string());
+            }
+            collect_ref_deps_from_props(&member.properties, &mut deps);
+        }
+    }
+    deps
+}
+
+fn collect_ref_deps_from_props(
+    props: &Option<HashMap<String, SchemaObject>>,
+    deps: &mut Vec<String>,
+) {
+    if let Some(props) = props {
         for prop_schema in props.values() {
             if let Some(ref ref_path) = prop_schema.ref_path
                 && let Some(name) = ref_path.strip_prefix("#/definitions/")
@@ -202,7 +223,6 @@ fn collect_ref_deps(schema: &SchemaObject) -> Vec<String> {
             }
         }
     }
-    deps
 }
 
 /// Compose documents for each selected endpoint's response definition.
@@ -279,6 +299,7 @@ pub fn compose_documents(
                 &def_name,
                 schema,
                 raw_schema,
+                raw_defs,
                 pools,
                 faker_rules,
                 &field_rule_map,
@@ -307,6 +328,7 @@ fn generate_document_from_schema(
     def_name: &str,
     schema: &SchemaObject,
     raw_schema: Option<&SchemaObject>,
+    raw_defs: Option<&HashMap<String, SchemaObject>>,
     pools: &DocumentStore,
     faker_rules: &FakerRules,
     field_rule_map: &FieldRuleMap,
@@ -317,7 +339,16 @@ fn generate_document_from_schema(
         None => return fake_value_for_field(def_name, schema),
     };
 
-    let raw_props = raw_schema.and_then(|s| s.properties.as_ref());
+    // When raw_schema has no direct properties but uses allOf at the definition
+    // root, flatten its allOf members (following $ref chains via raw_defs) so
+    // property-level $ref lookups for pool sampling still work. Binding this
+    // owner before `raw_props` keeps the borrow alive across the loop below.
+    let flattened_raw_props =
+        raw_schema.and_then(|rs| flatten_allof_raw_props(rs, raw_defs, &mut HashSet::new()));
+
+    let raw_props = raw_schema
+        .and_then(|s| s.properties.as_ref())
+        .or(flattened_raw_props.as_ref());
 
     let mut map = serde_json::Map::new();
     let mut rng = rand::rng();
@@ -416,6 +447,56 @@ fn ref_target_name(schema: &SchemaObject) -> Option<String> {
             .map(|s| s.to_string());
     }
     None
+}
+
+/// Flatten a raw schema's allOf members into a single property map, preserving
+/// `ref_path` values on property schemas so pool lookups in
+/// `generate_property_value` still fire. Mirrors the allOf merge in
+/// `parser::resolve_schema` (vec-order `.extend`, later wins).
+///
+/// Returns `Some(map)` when `schema.all_of` is set (map may merge in existing
+/// `schema.properties` clones first), `None` otherwise. `$ref`-only members
+/// are resolved via `raw_defs` (the same raw definitions map `schema` came
+/// from). The `visited` set guards against cyclic `allOf` chains
+/// (mirrors `parser::resolve_schema`'s cycle guard).
+fn flatten_allof_raw_props(
+    schema: &SchemaObject,
+    raw_defs: Option<&HashMap<String, SchemaObject>>,
+    visited: &mut HashSet<String>,
+) -> Option<HashMap<String, SchemaObject>> {
+    let all_of = schema.all_of.as_ref()?;
+
+    let mut merged: HashMap<String, SchemaObject> = schema.properties.clone().unwrap_or_default();
+
+    for member in all_of {
+        if let Some(ref ref_path) = member.ref_path {
+            let def_name = ref_path.strip_prefix("#/definitions/").unwrap_or(ref_path);
+            if visited.contains(def_name) {
+                continue;
+            }
+            let resolved = match raw_defs.and_then(|d| d.get(def_name)) {
+                Some(r) => r,
+                None => continue,
+            };
+            visited.insert(def_name.to_string());
+            if let Some(props) = resolved.properties.as_ref() {
+                merged.extend(props.clone());
+            }
+            if let Some(nested) = flatten_allof_raw_props(resolved, raw_defs, visited) {
+                merged.extend(nested);
+            }
+            visited.remove(def_name);
+        } else {
+            if let Some(props) = member.properties.as_ref() {
+                merged.extend(props.clone());
+            }
+            if let Some(nested) = flatten_allof_raw_props(member, raw_defs, visited) {
+                merged.extend(nested);
+            }
+        }
+    }
+
+    Some(merged)
 }
 
 /// Parse a SharedPoolConfig from a JSON string. Returns empty map on parse failure.
@@ -837,6 +918,40 @@ mod tests {
         spec
     }
 
+    /// Helper: create a SchemaObject whose root is allOf of the given members.
+    fn schema_allof(members: Vec<SchemaObject>) -> SchemaObject {
+        SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: Some(members),
+            x_faker: None,
+        }
+    }
+
+    /// Helper: create a SchemaObject that is a pure $ref.
+    fn schema_ref_only(target: &str) -> SchemaObject {
+        SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: Some(format!("#/definitions/{}", target)),
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        }
+    }
+
     #[test]
     fn generate_pools_ref_field_samples_from_accumulated_store() {
         // PatientDto has {name: string}
@@ -1042,6 +1157,194 @@ mod tests {
             assert!(
                 address["country"].is_string(),
                 "Owner.address.country must be string — entry: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_inline_only() {
+        // allOf of two inline members; no raw_defs needed.
+        let member_a = string_schema(&["a1", "a2"]);
+        let member_b = string_schema(&["b1"]);
+        let schema = schema_allof(vec![member_a, member_b]);
+
+        let merged = flatten_allof_raw_props(&schema, None, &mut HashSet::new())
+            .expect("allOf present -> Some");
+        let keys: HashSet<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(keys, HashSet::from(["a1", "a2", "b1"]));
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_ref_resolves_via_raw_defs() {
+        // Base has {x,y}. Composed is allOf [$ref Base, inline {z}].
+        let mut raw_defs: HashMap<String, SchemaObject> = HashMap::new();
+        raw_defs.insert("Base".to_string(), string_schema(&["x", "y"]));
+
+        let composed = schema_allof(vec![schema_ref_only("Base"), string_schema(&["z"])]);
+
+        let merged = flatten_allof_raw_props(&composed, Some(&raw_defs), &mut HashSet::new())
+            .expect("allOf present -> Some");
+        let keys: HashSet<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(keys, HashSet::from(["x", "y", "z"]));
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_mixed_members_preserve_ref_path() {
+        // An inline member contains a property that is a $ref. Its ref_path
+        // must survive the merge so pool lookup can still fire downstream.
+        let inline = schema_with_ref(&["title"], "owner", "Owner");
+        let schema = schema_allof(vec![inline]);
+
+        let merged = flatten_allof_raw_props(&schema, None, &mut HashSet::new())
+            .expect("allOf present -> Some");
+        let owner_prop = merged.get("owner").expect("owner prop present");
+        assert_eq!(
+            owner_prop.ref_path.as_deref(),
+            Some("#/definitions/Owner"),
+            "ref_path on property must be preserved for pool lookup"
+        );
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_nested_allof_recurses() {
+        // Outer allOf -> $ref Middle; Middle itself is allOf-rooted with
+        // $ref Leaf + inline props.
+        let leaf = string_schema(&["leaf_prop"]);
+        let middle = schema_allof(vec![schema_ref_only("Leaf"), string_schema(&["mid_prop"])]);
+        let outer = schema_allof(vec![
+            schema_ref_only("Middle"),
+            string_schema(&["outer_prop"]),
+        ]);
+
+        let mut raw_defs: HashMap<String, SchemaObject> = HashMap::new();
+        raw_defs.insert("Leaf".to_string(), leaf);
+        raw_defs.insert("Middle".to_string(), middle);
+
+        let merged = flatten_allof_raw_props(&outer, Some(&raw_defs), &mut HashSet::new())
+            .expect("allOf present -> Some");
+        let keys: HashSet<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            HashSet::from(["leaf_prop", "mid_prop", "outer_prop"]),
+            "all levels of allOf chain should contribute properties"
+        );
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_missing_ref_skipped() {
+        // allOf references a def that doesn't exist in raw_defs -> skip
+        // silently, return remaining keys.
+        let schema = schema_allof(vec![
+            schema_ref_only("DoesNotExist"),
+            string_schema(&["present"]),
+        ]);
+        let raw_defs: HashMap<String, SchemaObject> = HashMap::new();
+
+        let merged = flatten_allof_raw_props(&schema, Some(&raw_defs), &mut HashSet::new())
+            .expect("allOf present -> Some (even with only resolvable keys)");
+        let keys: HashSet<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(keys, HashSet::from(["present"]));
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_cycle_safe() {
+        // A allOf [$ref B]; B allOf [$ref A]. Must not stack-overflow.
+        let a = schema_allof(vec![schema_ref_only("B")]);
+        let b = schema_allof(vec![schema_ref_only("A")]);
+        let mut raw_defs: HashMap<String, SchemaObject> = HashMap::new();
+        raw_defs.insert("A".to_string(), a.clone());
+        raw_defs.insert("B".to_string(), b);
+
+        // Walk starting from A -- cycle guard prevents infinite recursion.
+        let merged = flatten_allof_raw_props(&a, Some(&raw_defs), &mut HashSet::new());
+        assert!(
+            merged.is_some(),
+            "cyclic allOf should return Some (possibly empty), not panic"
+        );
+    }
+
+    #[test]
+    fn test_flatten_allof_raw_props_properties_plus_allof_merges() {
+        // Schema has BOTH properties=Some and all_of=Some. Merge must include
+        // both (R2 gate widening: gate on all_of.is_some(), not
+        // properties.is_none()).
+        let mut schema = string_schema(&["own_prop"]);
+        schema.all_of = Some(vec![string_schema(&["allof_prop"])]);
+
+        let merged = flatten_allof_raw_props(&schema, None, &mut HashSet::new())
+            .expect("allOf present -> Some");
+        let keys: HashSet<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(keys, HashSet::from(["own_prop", "allof_prop"]));
+    }
+
+    #[test]
+    fn test_compose_with_pools_allof_root() {
+        // Mirrors mega.yaml ComposedEntity shape:
+        //   Address { city, country }
+        //   Owner   { name, address: $ref Address }
+        //   BaseAudit { created_at, updated_at }
+        //   ComposedEntity allOf [$ref BaseAudit, inline { title, priority, owner: $ref Owner }]
+        //
+        // Pool config: Owner=3, ComposedEntity=4. Assertions:
+        //   * owner_ids observed on ComposedEntity.owner all drawn from {1,2,3}
+        //   * owner.address present as object (proves real pool object, not faked)
+        let mut defs: HashMap<String, SchemaObject> = HashMap::new();
+        defs.insert("Address".to_string(), string_schema(&["city", "country"]));
+        defs.insert(
+            "Owner".to_string(),
+            schema_with_ref(&["name"], "address", "Address"),
+        );
+        defs.insert(
+            "BaseAudit".to_string(),
+            string_schema(&["created_at", "updated_at"]),
+        );
+
+        // Inline member: { title, priority, owner: $ref Owner }
+        let inline_member = schema_with_ref(&["title", "priority"], "owner", "Owner");
+        defs.insert(
+            "ComposedEntity".to_string(),
+            schema_allof(vec![schema_ref_only("BaseAudit"), inline_member]),
+        );
+
+        let raw_spec = build_spec(defs);
+        let spec = resolve(&raw_spec);
+
+        let mut pool_config = SharedPoolConfig::new();
+        pool_config.insert("Owner".to_string(), 3);
+        pool_config.insert("ComposedEntity".to_string(), 4);
+
+        let pools = generate_pools(&spec, &raw_spec, &pool_config, &FakerRules::new(), &[]);
+
+        let owner_pool = pools.get("Owner").expect("Owner pool generated");
+        assert_eq!(owner_pool.len(), 3);
+        let owner_id_set: HashSet<i64> = owner_pool
+            .iter()
+            .map(|o| o["id"].as_i64().expect("Owner.id must be integer"))
+            .collect();
+        assert_eq!(owner_id_set, HashSet::from([1, 2, 3]));
+
+        let composed = pools
+            .get("ComposedEntity")
+            .expect("ComposedEntity pool generated");
+        assert_eq!(composed.len(), 4);
+
+        for entry in composed {
+            let owner = entry
+                .get("owner")
+                .expect("ComposedEntity.owner present (allOf-rooted)");
+            assert!(owner.is_object(), "owner must be sampled pool object");
+            let oid = owner["id"]
+                .as_i64()
+                .expect("sampled owner.id must be integer");
+            assert!(
+                owner_id_set.contains(&oid),
+                "owner.id {oid} must be drawn from Owner pool ids {owner_id_set:?}"
+            );
+            // Proves the owner came from the real pool (which itself had its
+            // $ref address resolved) and not from synthetic fake generation.
+            assert!(
+                owner.get("address").map(|a| a.is_object()).unwrap_or(false),
+                "owner.address must be an object (real pool entry) -- entry: {entry}"
             );
         }
     }
