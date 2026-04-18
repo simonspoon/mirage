@@ -3709,6 +3709,14 @@ function SchemasPage(props: {
                                 const labelText = () =>
                                   edge.refKind === "extends" ? "extends" : edge.sourceField;
 
+                                // Hover two-line content. line1 = 'extends' for extends edges (def.properties['extends']
+                                // does not exist, so use pseudo-key), else 'source.field'. line2 = '-> target'.
+                                const hoverLine1 = () =>
+                                  edge.refKind === "extends"
+                                    ? "extends"
+                                    : `${edge.source}.${edge.sourceField}`;
+                                const hoverLine2 = () => `-> ${edge.target}`;
+
                                 // Native SVG <title> content: "source.field -> target\ntype\nrequired: yes|no"
                                 const tooltipText = () => {
                                   const head = edge.refKind === "extends"
@@ -3719,8 +3727,19 @@ function SchemasPage(props: {
                                   return `${head}\n${typeLine}\n${reqLine}`;
                                 };
 
-                                // Approximate label rect: 6px per char + 12px padding, 14px tall.
-                                const labelWidth = () => labelText().length * 6 + 12;
+                                // Approximate label rect: 6px per char + 12px padding. Width hover-aware:
+                                // single line uses labelText(); hover uses max of two lines.
+                                const labelWidth = () => {
+                                  if (isHovered()) {
+                                    const w = Math.max(hoverLine1().length, hoverLine2().length);
+                                    return w * 6 + 12;
+                                  }
+                                  return labelText().length * 6 + 12;
+                                };
+                                // Rect height: 14px single-line, 28px two-line on hover (2px pad above/below).
+                                const labelHeight = () => (isHovered() ? 28 : 14);
+                                // Rect top-y: non-hover preserves original y=labelY-8; hover centers 28px rect.
+                                const labelRectY = () => isHovered() ? labelY() - 14 : labelY() - 8;
 
                                 const style = EDGE_STYLE[edge.refKind] ?? EDGE_STYLE.ref;
 
@@ -3776,14 +3795,15 @@ function SchemasPage(props: {
                                         points={`${tx()},${ty()} ${tx() - 6},${ty() - 3} ${tx() - 6},${ty() + 3}`}
                                         fill={isHovered() ? "#60a5fa" : style.stroke}
                                       />
-                                      {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover) */}
+                                      {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover).
+                                          Hover expands to two lines: source.field (or 'extends') + '-> target'. */}
                                       <Show when={showLabel()}>
                                         <g pointer-events="none" data-edge-label-for={edge.id}>
                                           <rect
                                             x={labelX() - labelWidth() / 2}
-                                            y={labelY() - 8}
+                                            y={labelRectY()}
                                             width={labelWidth()}
-                                            height={14}
+                                            height={labelHeight()}
                                             rx={3}
                                             ry={3}
                                             fill="#070c17"
@@ -3791,14 +3811,36 @@ function SchemasPage(props: {
                                             stroke={isHovered() ? "#60a5fa" : "#374151"}
                                             stroke-width={0.5}
                                           />
-                                          <text
-                                            x={labelX()}
-                                            y={labelY() + 3}
-                                            fill={isHovered() ? "#93c5fd" : "#9ca3af"}
-                                            font-size="10"
-                                            font-family="ui-monospace, monospace"
-                                            text-anchor="middle"
-                                          >{labelText()}</text>
+                                          <Show
+                                            when={isHovered()}
+                                            fallback={
+                                              <text
+                                                x={labelX()}
+                                                y={labelY() + 3}
+                                                fill="#9ca3af"
+                                                font-size="10"
+                                                font-family="ui-monospace, monospace"
+                                                text-anchor="middle"
+                                              >{labelText()}</text>
+                                            }
+                                          >
+                                            <text
+                                              x={labelX()}
+                                              y={labelY() - 2}
+                                              fill="#93c5fd"
+                                              font-size="10"
+                                              font-family="ui-monospace, monospace"
+                                              text-anchor="middle"
+                                            >{hoverLine1()}</text>
+                                            <text
+                                              x={labelX()}
+                                              y={labelY() + 10}
+                                              fill="#93c5fd"
+                                              font-size="10"
+                                              font-family="ui-monospace, monospace"
+                                              text-anchor="middle"
+                                            >{hoverLine2()}</text>
+                                          </Show>
                                         </g>
                                       </Show>
                                     </g>
