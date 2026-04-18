@@ -1,6 +1,6 @@
 import { render } from "solid-js/web";
 import type { Accessor, Setter } from "solid-js";
-import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
+import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch, untrack } from "solid-js";
 import "./index.css";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
 import {
@@ -18,6 +18,43 @@ export const EDGE_STYLE = {
   ref:     { stroke: "#4b5563", dasharray: undefined },
   items:   { stroke: "#4b5563", dasharray: undefined },
 } satisfies Record<"ref" | "items" | "extends", EdgeStyle>;
+
+// Pure fit-to-viewport transform. Takes plain snapshot positions +
+// per-node width/height function refs + scalar viewport. No reactive
+// reads inside the body — caller threads any reactive data through
+// the function refs so untrack discipline stays at the call site.
+// Returns null on empty positions, zero viewport, or degenerate bbox.
+export function computeFitTransform(
+  positions: Record<string, { x: number; y: number }>,
+  widthOf: (name: string) => number,
+  heightOf: (name: string) => number,
+  viewport: { width: number; height: number },
+): { zoom: number; panX: number; panY: number } | null {
+  const keys = Object.keys(positions);
+  if (keys.length === 0) return null;
+  if (viewport.width === 0 || viewport.height === 0) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const name of keys) {
+    const p = positions[name];
+    if (!p) continue;
+    const w = widthOf(name);
+    const h = heightOf(name);
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x + w > maxX) maxX = p.x + w;
+    if (p.y + h > maxY) maxY = p.y + h;
+  }
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+  if (!isFinite(bboxW) || !isFinite(bboxH) || bboxW <= 0 || bboxH <= 0) return null;
+  const zoom = Math.min(
+    4,
+    Math.max(0.1, Math.min(viewport.width / bboxW, viewport.height / bboxH) * 0.95),
+  );
+  const panX = (viewport.width - bboxW * zoom) / 2 - minX * zoom;
+  const panY = (viewport.height - bboxH * zoom) / 2 - minY * zoom;
+  return { zoom, panX, panY };
+}
 
 interface Endpoint {
   method: string;
@@ -1013,25 +1050,25 @@ function App() {
   };
 
   const selectEntity = (name: string) => {
-    const prev = selectedEntities();
-    const next = new Set(prev);
-    const wasSelected = next.has(name);
-    if (wasSelected) {
-      next.delete(name);
-    } else {
-      next.add(name);
-    }
-    setSelectedEntities(next);
-    if (wasSelected) {
-      const remaining = Array.from(next);
-      setLastSelectedEntity(remaining.length > 0 ? remaining[remaining.length - 1] : null);
-    } else {
-      setLastSelectedEntity(name);
-      if (!expandedDefs().has(name)) toggleDef(name);
-    }
-    // Progressive exploration: focus the clicked entity in the graph (only on select, not deselect)
-    if (!wasSelected && graphFocused() !== name) {
-      batch(() => {
+    batch(() => {
+      const prev = selectedEntities();
+      const next = new Set(prev);
+      const wasSelected = next.has(name);
+      if (wasSelected) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      setSelectedEntities(next);
+      if (wasSelected) {
+        const remaining = Array.from(next);
+        setLastSelectedEntity(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+      } else {
+        setLastSelectedEntity(name);
+        if (!expandedDefs().has(name)) toggleDef(name);
+      }
+      // Progressive exploration: focus the clicked entity in the graph (only on select, not deselect)
+      if (!wasSelected && graphFocused() !== name) {
         setGraphFocused(name);
         // Pre-populate expanded set with all immediate neighbors so they render with fields visible
         const defs = definitions();
@@ -1055,8 +1092,8 @@ function App() {
           }
         }
         setGraphExpanded(neighbors);
-      });
-    }
+      }
+    });
   };
 
   const collapseGraph = () => {
@@ -3015,17 +3052,23 @@ function SchemasPage(props: {
                 </Show>
                 <Show when={props.graphFocused() !== null}>
                   {(() => {
-                    // focusSet: selectedEntities filtered to known defs; fallback to graphFocused
-                    const focusSet = createMemo<string[]>(() => {
-                      const defs = props.definitions();
-                      const sel = props.selectedEntities();
-                      if (sel.size >= 1) {
-                        const filtered = [...sel].filter(e => defs[e]);
-                        if (filtered.length > 0) return filtered;
-                      }
-                      const gf = props.graphFocused();
-                      return gf ? [gf] : [];
-                    });
+                    // focusSet: selectedEntities filtered to known defs; fallback to graphFocused.
+                    // Custom equals prevents spurious re-fires when definitions() reloads
+                    // but the visible focus set (entity names) hasn't changed.
+                    const focusSet = createMemo<string[]>(
+                      () => {
+                        const defs = props.definitions();
+                        const sel = props.selectedEntities();
+                        if (sel.size >= 1) {
+                          const filtered = [...sel].filter(e => defs[e]);
+                          if (filtered.length > 0) return filtered;
+                        }
+                        const gf = props.graphFocused();
+                        return gf ? [gf] : [];
+                      },
+                      undefined,
+                      { equals: (a, b) => a.length === b.length && a.every((x, i) => x === b[i]) },
+                    );
                     const focusMembership = createMemo(() => new Set(focusSet()));
                     const expandedSet = createMemo(() => props.graphExpanded());
 
@@ -3439,42 +3482,111 @@ function SchemasPage(props: {
                       }
                     };
 
+                    // Per-node rendered height (matches boxRects logic).
+                    // Passed as function ref into computeFitTransform so the
+                    // pure helper stays free of reactive reads.
+                    const heightOf = (name: string): number => {
+                      const def = props.definitions()[name];
+                      if (!def || stubSet().has(name)) return HEADER_HEIGHT;
+                      const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
+                      return HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+                    };
+
                     const fitGraph = () => {
-                      const positions = dagLayout().positions;
-                      const keys = Object.keys(positions);
-                      if (keys.length === 0) return;
                       if (!svgEl) return;
-                      const viewportW = svgEl.clientWidth;
-                      const viewportH = svgEl.clientHeight;
-                      if (viewportW === 0 || viewportH === 0) return;
-                      const defs = props.definitions();
-                      const stubs = stubSet();
-                      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-                      for (const name of keys) {
-                        const p = positions[name];
-                        const def = defs[name];
-                        let h = HEADER_HEIGHT;
-                        if (def && !stubs.has(name)) {
-                          const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
-                          h = HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
-                        }
-                        const w = widthOf(name);
-                        if (p.x < minX) minX = p.x;
-                        if (p.y < minY) minY = p.y;
-                        if (p.x + w > maxX) maxX = p.x + w;
-                        if (p.y + h > maxY) maxY = p.y + h;
-                      }
-                      const bboxW = maxX - minX;
-                      const bboxH = maxY - minY;
-                      if (bboxW <= 0 || bboxH <= 0) return;
-                      const scale = Math.min(4, Math.max(0.1, Math.min(viewportW / bboxW, viewportH / bboxH) * 0.95));
-                      const tx = (viewportW - bboxW * scale) / 2 - minX * scale;
-                      const ty = (viewportH - bboxH * scale) / 2 - minY * scale;
+                      const target = computeFitTransform(
+                        dagLayout().positions,
+                        widthOf,
+                        heightOf,
+                        { width: svgEl.clientWidth, height: svgEl.clientHeight },
+                      );
+                      if (!target) return;
                       batch(() => {
-                        props.setGraphZoom(scale);
-                        props.setGraphPan({ x: tx, y: ty });
+                        props.setGraphZoom(target.zoom);
+                        props.setGraphPan({ x: target.panX, y: target.panY });
                       });
                     };
+
+                    // Animated pan/zoom ease. rAF loop + cubic ease-in-out.
+                    // Samples current pan/zoom via untrack so the effect
+                    // driving this does not re-subscribe to its own writes.
+                    // rafId captured in closure; a new call cancels prior
+                    // frame cleanly. onCleanup at IIFE-level owner ensures
+                    // <Show> teardown stops the loop.
+                    let rafId: number | null = null;
+                    const animatePanZoom = (
+                      targetZoom: number,
+                      targetPanX: number,
+                      targetPanY: number,
+                      durationMs = 250,
+                    ) => {
+                      if (rafId !== null) {
+                        cancelAnimationFrame(rafId);
+                        rafId = null;
+                      }
+                      const startZoom = untrack(() => props.graphZoom());
+                      const startPan = untrack(() => props.graphPan());
+                      const startX = startPan.x;
+                      const startY = startPan.y;
+                      const t0 = performance.now();
+                      const step = (now: number) => {
+                        const raw = (now - t0) / durationMs;
+                        const t = raw >= 1 ? 1 : raw <= 0 ? 0 : raw;
+                        const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+                        const z = startZoom + (targetZoom - startZoom) * eased;
+                        const px = startX + (targetPanX - startX) * eased;
+                        const py = startY + (targetPanY - startY) * eased;
+                        batch(() => {
+                          props.setGraphZoom(z);
+                          props.setGraphPan({ x: px, y: py });
+                        });
+                        if (t < 1) {
+                          rafId = requestAnimationFrame(step);
+                        } else {
+                          rafId = null;
+                        }
+                      };
+                      rafId = requestAnimationFrame(step);
+                    };
+                    onCleanup(() => {
+                      if (rafId !== null) {
+                        cancelAnimationFrame(rafId);
+                        rafId = null;
+                      }
+                    });
+
+                    // Ease camera to focal subgraph when focusSet changes.
+                    // Depends ONLY on focusSet() — dagLayout/svg dims/widthOf
+                    // read via untrack so expand/collapse (which mutates
+                    // stubSet → dagLayout) does NOT re-fire this effect.
+                    let firstFocusFit = true;
+                    createEffect(() => {
+                      const focus = focusSet();
+                      if (focus.length === 0) return;
+                      // Flip flag on any non-empty focus, regardless of whether
+                      // a valid transform could be computed (guards zero-width SVG
+                      // on first paint so the second real click animates correctly).
+                      const wasFirst = firstFocusFit;
+                      firstFocusFit = false;
+                      const target = untrack(() => {
+                        if (!svgEl) return null;
+                        return computeFitTransform(
+                          dagLayout().positions,
+                          widthOf,
+                          heightOf,
+                          { width: svgEl.clientWidth, height: svgEl.clientHeight },
+                        );
+                      });
+                      if (!target) return;
+                      if (wasFirst) {
+                        batch(() => {
+                          props.setGraphZoom(target.zoom);
+                          props.setGraphPan({ x: target.panX, y: target.panY });
+                        });
+                        return;
+                      }
+                      animatePanZoom(target.zoom, target.panX, target.panY);
+                    });
 
                     return (
                       <div class="flex-1 min-h-0 flex flex-col overflow-hidden">
