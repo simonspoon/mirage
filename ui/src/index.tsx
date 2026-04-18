@@ -12,6 +12,13 @@ import {
   computeTopHubs,
 } from "./dagLayout";
 
+export type EdgeStyle = { stroke: string; dasharray: string | undefined };
+export const EDGE_STYLE = {
+  extends: { stroke: "#a78bfa", dasharray: "4,3" },
+  ref:     { stroke: "#4b5563", dasharray: undefined },
+  items:   { stroke: "#4b5563", dasharray: undefined },
+} satisfies Record<"ref" | "items" | "extends", EdgeStyle>;
+
 interface Endpoint {
   method: string;
   path: string;
@@ -3702,6 +3709,8 @@ function SchemasPage(props: {
                                 // Approximate label rect: 6px per char + 12px padding, 14px tall.
                                 const labelWidth = () => labelText().length * 6 + 12;
 
+                                const style = EDGE_STYLE[edge.refKind] ?? EDGE_STYLE.ref;
+
                                 return (
                                   <Show when={hasPositions()}>
                                     <g>
@@ -3720,9 +3729,9 @@ function SchemasPage(props: {
                                       <path
                                         d={d()}
                                         fill="none"
-                                        stroke={isHovered() ? "#60a5fa" : "#4b5563"}
+                                        stroke={isHovered() ? "#60a5fa" : style.stroke}
                                         stroke-width={isHovered() ? 2 : 1}
-                                        stroke-dasharray="none"
+                                        stroke-dasharray={style.dasharray}
                                         data-relationship-line
                                         data-source-entity={edge.source}
                                         data-source-field={edge.sourceField}
@@ -3752,7 +3761,7 @@ function SchemasPage(props: {
                                       {/* Arrow marker at target end */}
                                       <polygon
                                         points={`${tx()},${ty()} ${tx() - 6},${ty() - 3} ${tx() - 6},${ty() + 3}`}
-                                        fill={isHovered() ? "#60a5fa" : "#4b5563"}
+                                        fill={isHovered() ? "#60a5fa" : style.stroke}
                                       />
                                       {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover) */}
                                       <Show when={showLabel()}>
