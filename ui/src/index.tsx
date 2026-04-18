@@ -3,6 +3,7 @@ import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
 import "./index.css";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
+import { computeDagPositions } from "./dagLayout";
 
 interface Endpoint {
   method: string;
@@ -2964,110 +2965,16 @@ function SchemasPage(props: {
                     });
 
                     // Compute DAG layout: positions + SVG dimensions
-                    const dagLayout = createMemo(() => {
-                      const list = visibleList();
-                      const defs = props.definitions();
-                      const edges = graphEdges();
-                      const stubs = stubSet();
-
-                      // Helper: compute box height for an entity
-                      const boxHeight = (entityName: string): number => {
-                        const def = defs[entityName];
-                        if (!def) return HEADER_HEIGHT;
-                        if (stubs.has(entityName)) return HEADER_HEIGHT;
-                        const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
-                        return HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
-                      };
-
-                      // Build adjacency: parent (target) → children (sources)
-                      const childrenOf: Record<string, string[]> = {};
-                      const listSet = new Set(list);
-                      const sourceSet = new Set<string>();
-
-                      for (const edge of edges) {
-                        sourceSet.add(edge.source);
-                        if (!childrenOf[edge.target]) childrenOf[edge.target] = [];
-                        childrenOf[edge.target].push(edge.source);
-                      }
-
-                      // Roots = entities that never appear as source (don't reference anything)
-                      const roots = list.filter(e => !sourceSet.has(e));
-                      // If no roots (pure cycle), treat all entities as roots
-                      if (roots.length === 0) {
-                        for (const e of list) roots.push(e);
-                      }
-
-                      // Longest-path BFS for depth assignment
-                      const depth: Record<string, number> = {};
-                      for (const e of list) depth[e] = -1;
-                      for (const r of roots) depth[r] = 0;
-
-                      const queue: string[] = [...roots];
-                      const processCount: Record<string, number> = {};
-                      const maxIterations = list.length * list.length + 1;
-                      let iterations = 0;
-
-                      while (queue.length > 0 && iterations < maxIterations) {
-                        iterations++;
-                        const parent = queue.shift()!;
-                        const children = childrenOf[parent] || [];
-                        for (const child of children) {
-                          if (!listSet.has(child)) continue;
-                          const newDepth = depth[parent] + 1;
-                          if (newDepth > depth[child]) {
-                            depth[child] = newDepth;
-                            processCount[child] = (processCount[child] || 0) + 1;
-                            if (processCount[child] <= list.length) {
-                              queue.push(child);
-                            }
-                          }
-                        }
-                      }
-
-                      // Entities not reachable from any root: assign depth 0
-                      for (const e of list) {
-                        if (depth[e] < 0) depth[e] = 0;
-                      }
-
-                      // Group entities by depth band, preserving visibleList order within each band
-                      const maxDepth = Math.max(0, ...Object.values(depth));
-                      const bands: string[][] = [];
-                      for (let d = 0; d <= maxDepth; d++) bands.push([]);
-                      for (const e of list) {
-                        bands[depth[e]].push(e);
-                      }
-
-                      // Compute band heights (max box height in each band)
-                      const bandHeights = bands.map(band =>
-                        band.length > 0 ? Math.max(...band.map(e => boxHeight(e))) : 0
-                      );
-
-                      // Compute Y offset per band (cumulative sum)
-                      const bandY: number[] = [];
-                      let cumY = 20;
-                      for (let d = 0; d <= maxDepth; d++) {
-                        bandY.push(cumY);
-                        cumY += bandHeights[d] + bandGap;
-                      }
-
-                      // Compute positions
-                      const positions: Record<string, { x: number; y: number }> = {};
-                      for (let d = 0; d <= maxDepth; d++) {
-                        for (let i = 0; i < bands[d].length; i++) {
-                          positions[bands[d][i]] = {
-                            x: 20 + i * boxSpacing,
-                            y: bandY[d],
-                          };
-                        }
-                      }
-
-                      // SVG dimensions
-                      const maxBandWidth = Math.max(1, ...bands.map(b => b.length));
-                      const width = maxBandWidth * boxSpacing + 40;
-                      const height = Math.max(400, cumY + 20);
-
-                      return { positions, width, height };
-                    });
+                    const dagLayout = createMemo(() =>
+                      computeDagPositions(
+                        visibleList(),
+                        graphEdges(),
+                        props.definitions(),
+                        stubSet(),
+                        boxSpacing,
+                        bandGap,
+                      )
+                    );
 
                     const entityPositions = createMemo(() => dagLayout().positions);
                     const svgWidth = () => dagLayout().width;

@@ -1,0 +1,227 @@
+// dagLayout.ts — pure DAG layout computation (no Solid dependencies)
+// Extracted from the dagLayout createMemo in index.tsx.
+//
+// Barycenter heuristic: 3 sweep pairs (top-down then bottom-up, 6 passes total).
+//   - Top-down: for each band d=1..maxDepth, sort nodes by mean sortedIndex of
+//     their band-(d-1) neighbours (xParentsOf).
+//   - Bottom-up: for each band d=maxDepth-1..0, sort nodes by mean sortedIndex of
+//     their band-(d+1) neighbours (xChildrenOf).
+// Short-circuit: bands.length <= 1 → skip sweeps.
+// NaN guard: isolated nodes (no cross-band neighbours) keep original list order.
+// Final x positions stay on uniform grid: x = 20 + sortedIndex * boxSpacing.
+
+export const ROW_HEIGHT = 24;
+export const HEADER_HEIGHT = 32;
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+export interface EntityDef {
+  properties: Record<string, unknown>;
+  extends?: string;
+}
+
+export interface DagPositions {
+  positions: Record<string, { x: number; y: number }>;
+  width: number;
+  height: number;
+}
+
+export interface DagLayoutOpts {
+  barycenter?: boolean;
+}
+
+export function computeDagPositions(
+  list: string[],
+  edges: GraphEdge[],
+  defs: Record<string, EntityDef>,
+  stubs: Set<string>,
+  boxSpacing: number,
+  bandGap: number,
+  opts?: DagLayoutOpts,
+): DagPositions {
+  const useBarycenter = opts?.barycenter ?? true;
+
+  // Helper: compute box height for an entity
+  const boxHeight = (entityName: string): number => {
+    const def = defs[entityName];
+    if (!def) return HEADER_HEIGHT;
+    if (stubs.has(entityName)) return HEADER_HEIGHT;
+    const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
+    return HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+  };
+
+  const listSet = new Set(list);
+
+  // Build adjacency maps over all edges
+  // childrenOf: target → [sources]  (parent node → its children in the DAG)
+  // parentsOf:  source → [targets]  (child node → its parents in the DAG)
+  const childrenOf: Record<string, string[]> = {};
+  const parentsOf: Record<string, string[]> = {};
+  const sourceSet = new Set<string>();
+
+  for (const edge of edges) {
+    sourceSet.add(edge.source);
+
+    if (!childrenOf[edge.target]) childrenOf[edge.target] = [];
+    childrenOf[edge.target].push(edge.source);
+
+    if (!parentsOf[edge.source]) parentsOf[edge.source] = [];
+    parentsOf[edge.source].push(edge.target);
+  }
+
+  // Roots = entities that never appear as source (don't reference anything)
+  const roots = list.filter(e => !sourceSet.has(e));
+  // Pure cycle: treat all entities as roots
+  if (roots.length === 0) {
+    for (const e of list) roots.push(e);
+  }
+
+  // Longest-path BFS for depth assignment
+  const depth: Record<string, number> = {};
+  for (const e of list) depth[e] = -1;
+  for (const r of roots) depth[r] = 0;
+
+  const queue: string[] = [...roots];
+  const processCount: Record<string, number> = {};
+  const maxIterations = list.length * list.length + 1;
+  let iterations = 0;
+
+  while (queue.length > 0 && iterations < maxIterations) {
+    iterations++;
+    const parent = queue.shift()!;
+    const children = childrenOf[parent] || [];
+    for (const child of children) {
+      if (!listSet.has(child)) continue;
+      const newDepth = depth[parent] + 1;
+      if (newDepth > depth[child]) {
+        depth[child] = newDepth;
+        processCount[child] = (processCount[child] || 0) + 1;
+        if (processCount[child] <= list.length) {
+          queue.push(child);
+        }
+      }
+    }
+  }
+
+  // Entities not reachable from any root: assign depth 0
+  for (const e of list) {
+    if (depth[e] < 0) depth[e] = 0;
+  }
+
+  // Group entities by depth band, preserving visibleList order within each band
+  const maxDepth = Math.max(0, ...Object.values(depth));
+  const bands: string[][] = [];
+  for (let d = 0; d <= maxDepth; d++) bands.push([]);
+  for (const e of list) {
+    bands[depth[e]].push(e);
+  }
+
+  // ── Barycenter x-ordering ──────────────────────────────────────────────────
+  // Reorders nodes within each band to reduce edge crossings.
+  // Only cross-band edges (depth differs by exactly 1) participate in scoring.
+  // Short-circuit: skip when there is only one band.
+  if (useBarycenter && bands.length > 1) {
+    // Original visibleList index: secondary sort key for stable tiebreak
+    const origIndex: Record<string, number> = {};
+    for (let i = 0; i < list.length; i++) origIndex[list[i]] = i;
+
+    // Restrict adjacency maps to cross-band edges (|depth diff| === 1)
+    // xParentsOf[node]  = neighbours in band(depth[node] - 1)  → used in top-down sweep
+    // xChildrenOf[node] = neighbours in band(depth[node] + 1)  → used in bottom-up sweep
+    const xChildrenOf: Record<string, string[]> = {};
+    const xParentsOf: Record<string, string[]> = {};
+    for (const edge of edges) {
+      if (!listSet.has(edge.source) || !listSet.has(edge.target)) continue;
+      if (Math.abs(depth[edge.source] - depth[edge.target]) !== 1) continue;
+      // edge.target is the "parent" (lower depth), edge.source is the "child"
+      if (!xChildrenOf[edge.target]) xChildrenOf[edge.target] = [];
+      xChildrenOf[edge.target].push(edge.source);
+      if (!xParentsOf[edge.source]) xParentsOf[edge.source] = [];
+      xParentsOf[edge.source].push(edge.target);
+    }
+
+    // sortedIndex[entity] = current rank within its band
+    const sortedIndex: Record<string, number> = {};
+    for (let d = 0; d <= maxDepth; d++) {
+      for (let i = 0; i < bands[d].length; i++) {
+        sortedIndex[bands[d][i]] = i;
+      }
+    }
+
+    // Mean sortedIndex of neighbours; NaN when node has no eligible neighbours
+    const barycenter = (node: string, neighbours: string[] | undefined): number => {
+      const nbrs = (neighbours || []).filter(n => listSet.has(n));
+      if (nbrs.length === 0) return NaN;
+      let sum = 0;
+      for (const n of nbrs) sum += sortedIndex[n];
+      return sum / nbrs.length;
+    };
+
+    // Sort one band in-place by barycenter score; update sortedIndex
+    const sortBand = (band: string[], neighboursOf: (n: string) => string[] | undefined) => {
+      const scored = band.map(node => ({
+        node,
+        key: barycenter(node, neighboursOf(node)),
+        orig: origIndex[node],
+      }));
+      scored.sort((a, b) => {
+        // NaN guard: isolated nodes fall back to original list order
+        const ak = isNaN(a.key) ? a.orig : a.key;
+        const bk = isNaN(b.key) ? b.orig : b.key;
+        if (ak !== bk) return ak - bk;
+        return a.orig - b.orig; // stable secondary key
+      });
+      for (let i = 0; i < scored.length; i++) {
+        band[i] = scored[i].node;
+        sortedIndex[scored[i].node] = i;
+      }
+    };
+
+    // 3 sweep pairs (top-down + bottom-up) = 6 passes total
+    const SWEEP_PAIRS = 3;
+    for (let pass = 0; pass < SWEEP_PAIRS; pass++) {
+      // Top-down: sort band[d] by positions of neighbours in band[d-1]
+      for (let d = 1; d <= maxDepth; d++) {
+        sortBand(bands[d], n => xParentsOf[n]);
+      }
+      // Bottom-up: sort band[d] by positions of neighbours in band[d+1]
+      for (let d = maxDepth - 1; d >= 0; d--) {
+        sortBand(bands[d], n => xChildrenOf[n]);
+      }
+    }
+  }
+
+  // Compute band heights (max box height in each band)
+  const bandHeights = bands.map(band =>
+    band.length > 0 ? Math.max(...band.map(e => boxHeight(e))) : 0,
+  );
+
+  // Compute Y offset per band (cumulative sum)
+  const bandY: number[] = [];
+  let cumY = 20;
+  for (let d = 0; d <= maxDepth; d++) {
+    bandY.push(cumY);
+    cumY += bandHeights[d] + bandGap;
+  }
+
+  // Compute positions on uniform grid: x = 20 + sortedIndex * boxSpacing
+  const positions: Record<string, { x: number; y: number }> = {};
+  for (let d = 0; d <= maxDepth; d++) {
+    for (let i = 0; i < bands[d].length; i++) {
+      positions[bands[d][i]] = {
+        x: 20 + i * boxSpacing,
+        y: bandY[d],
+      };
+    }
+  }
+
+  // SVG dimensions
+  const maxBandWidth = Math.max(1, ...bands.map(b => b.length));
+  const width = maxBandWidth * boxSpacing + 40;
+  const height = Math.max(400, cumY + 20);
+
+  return { positions, width, height };
+}
