@@ -3,7 +3,7 @@ import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
 import "./index.css";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
-import { computeDagPositions } from "./dagLayout";
+import { computeDagPositions, widthOf as widthOfRaw } from "./dagLayout";
 
 interface Endpoint {
   method: string;
@@ -2910,9 +2910,16 @@ function SchemasPage(props: {
                     const visibleList = createMemo(() => [...new Set([...focusSet(), ...immediateNeighbors()])]);
                     const stubSet = createMemo(() => new Set(stubList()));
 
-                    const boxWidth = 260;
                     const boxSpacing = 300;
                     const bandGap = 40;
+
+                    // Single source of truth for per-node width. Layout, edge
+                    // routing, fit-to-viewport, and EntityBox render all read
+                    // through this helper so widths never drift.
+                    const widthOf = (name: string): number => {
+                      const def = props.definitions()[name];
+                      return widthOfRaw(name, def, stubSet().has(name));
+                    };
 
                     const [hoveredEdgeId, setHoveredEdgeId] = createSignal<string | null>(null);
 
@@ -2999,6 +3006,7 @@ function SchemasPage(props: {
                         stubSet(),
                         boxSpacing,
                         bandGap,
+                        { widthOf },
                       )
                     );
 
@@ -3021,7 +3029,7 @@ function SchemasPage(props: {
                           const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
                           h = HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
                         }
-                        rects[name] = { x: p.x, y: p.y, w: boxWidth, h };
+                        rects[name] = { x: p.x, y: p.y, w: widthOf(name), h };
                       }
                       return rects;
                     });
@@ -3117,9 +3125,10 @@ function SchemasPage(props: {
                           const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
                           h = HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
                         }
+                        const w = widthOf(name);
                         if (p.x < minX) minX = p.x;
                         if (p.y < minY) minY = p.y;
-                        if (p.x + boxWidth > maxX) maxX = p.x + boxWidth;
+                        if (p.x + w > maxX) maxX = p.x + w;
                         if (p.y + h > maxY) maxY = p.y + h;
                       }
                       const bboxW = maxX - minX;
@@ -3182,7 +3191,7 @@ function SchemasPage(props: {
                                 };
                                 const sx = () => {
                                   const pos = sourcePos();
-                                  return pos ? pos.x + boxWidth : 0;
+                                  return pos ? pos.x + widthOf(edge.source) : 0;
                                 };
 
                                 // Target Y: header center (staggered for fan-in), or HEADER_HEIGHT/2 if collapsed
@@ -3488,7 +3497,7 @@ function SchemasPage(props: {
                                       <rect
                                         x={xPos() - 2}
                                         y={yPos() - 2}
-                                        width={boxWidth + 4}
+                                        width={widthOf(entityName) + 4}
                                         height={boxTotalHeight() + 4}
                                         rx={6}
                                         ry={6}
@@ -3504,7 +3513,7 @@ function SchemasPage(props: {
                                       extends={def()?.extends}
                                       x={xPos()}
                                       y={yPos()}
-                                      width={boxWidth}
+                                      width={widthOf(entityName)}
                                       collapsed={isStub()}
                                       onHeaderClick={
                                         isStub()

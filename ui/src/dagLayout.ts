@@ -8,10 +8,22 @@
 //     their band-(d+1) neighbours (xChildrenOf).
 // Short-circuit: bands.length <= 1 → skip sweeps.
 // NaN guard: isolated nodes (no cross-band neighbours) keep original list order.
-// Final x positions stay on uniform grid: x = 20 + sortedIndex * boxSpacing.
+// Final x positions are cumulative: x[0]=PAD; x[i]=x[i-1]+w[i-1]+NODE_GAP, so
+// boxes of different widths never overlap.
 
 export const ROW_HEIGHT = 24;
 export const HEADER_HEIGHT = 32;
+
+// Width constants. PAD is the left/right margin inside the SVG layout space;
+// NODE_GAP is the horizontal gap between adjacent boxes in the same band.
+export const PAD = 20;
+export const NODE_GAP = 40;
+
+// Per-node width bounds. Default matches the legacy uniform boxWidth.
+export const DEFAULT_WIDTH = 260;
+export const MIN_WIDTH = 260;
+export const MAX_WIDTH = 600;
+export const STUB_WIDTH = 260;
 
 export interface GraphEdge {
   source: string;
@@ -31,6 +43,32 @@ export interface DagPositions {
 
 export interface DagLayoutOpts {
   barycenter?: boolean;
+  /**
+   * Per-node width resolver. When omitted, every node falls back to
+   * DEFAULT_WIDTH (260). Return values are clamped to [MIN_WIDTH, MAX_WIDTH]
+   * (with a floor of 1 to avoid NaN/negative widths corrupting the layout).
+   */
+  widthOf?: (name: string) => number;
+}
+
+// Default width derivation. Single source of truth for both layout and render.
+// Stubs get a fixed width; full nodes scale with header name length (header is
+// the only variable-width element in EntityBox — field rows flex inside the
+// fixed column) and are clamped to [MIN_WIDTH, MAX_WIDTH].
+//
+// Rendered name in EntityBox is truncated to 29 chars (slice(0, 28) + ellipsis)
+// at font-size 13 / weight 600; ~8px/char + 24px padding approximates header
+// text width closely enough for a non-clipping column.
+export function widthOf(
+  name: string,
+  def: EntityDef | undefined,
+  isStub: boolean,
+): number {
+  if (isStub) return STUB_WIDTH;
+  if (!def) return DEFAULT_WIDTH;
+  const renderedLen = Math.min(name.length, 29);
+  const headerPx = renderedLen * 8 + 24;
+  return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, headerPx));
 }
 
 export function computeDagPositions(
@@ -201,27 +239,50 @@ export function computeDagPositions(
 
   // Compute Y offset per band (cumulative sum)
   const bandY: number[] = [];
-  let cumY = 20;
+  let cumY = PAD;
   for (let d = 0; d <= maxDepth; d++) {
     bandY.push(cumY);
     cumY += bandHeights[d] + bandGap;
   }
 
-  // Compute positions on uniform grid: x = 20 + sortedIndex * boxSpacing
+  // Per-node width resolver. Clamped to [1, MAX_WIDTH] to guard against NaN or
+  // negative values corrupting the cumulative sum. Falls back to DEFAULT_WIDTH
+  // when no resolver is supplied (preserves legacy uniform layout).
+  const resolveWidth = (name: string): number => {
+    const raw = opts?.widthOf ? opts.widthOf(name) : DEFAULT_WIDTH;
+    if (!Number.isFinite(raw)) return DEFAULT_WIDTH;
+    return Math.max(1, Math.min(MAX_WIDTH, raw));
+  };
+
+  // Pack x positions cumulatively per band: x[0]=PAD; x[i]=x[i-1]+w[i-1]+NODE_GAP.
+  // Record last-node right edge per band to compute overall SVG width below.
   const positions: Record<string, { x: number; y: number }> = {};
+  const bandRightEdges: number[] = [];
   for (let d = 0; d <= maxDepth; d++) {
+    let x = PAD;
+    let rightEdge = 0;
     for (let i = 0; i < bands[d].length; i++) {
-      positions[bands[d][i]] = {
-        x: 20 + i * boxSpacing,
-        y: bandY[d],
-      };
+      const name = bands[d][i];
+      const w = resolveWidth(name);
+      positions[name] = { x, y: bandY[d] };
+      rightEdge = x + w;
+      x = x + w + NODE_GAP;
     }
+    bandRightEdges.push(rightEdge);
   }
 
-  // SVG dimensions
-  const maxBandWidth = Math.max(1, ...bands.map(b => b.length));
-  const width = maxBandWidth * boxSpacing + 40;
-  const height = Math.max(400, cumY + 20);
+  // SVG width: widest band's right edge + PAD. Math.max(1, ...) sentinel keeps
+  // empty-layout width positive (matches legacy behaviour for the empty-list
+  // test). Non-empty bands contribute rightEdge+PAD.
+  const width = Math.max(
+    1,
+    ...bandRightEdges.filter(e => e > 0).map(e => e + PAD),
+  );
+  const height = Math.max(400, cumY + PAD);
+
+  // Silence unused-parameter lint: boxSpacing is retained on the signature for
+  // backward compatibility with standalone callers but is no longer consulted.
+  void boxSpacing;
 
   return { positions, width, height };
 }
