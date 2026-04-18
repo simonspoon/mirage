@@ -52,19 +52,20 @@ export interface DagLayoutOpts {
 }
 
 // Default width derivation. Single source of truth for both layout and render.
-// Stubs get a fixed width; full nodes scale with header name length (header is
-// the only variable-width element in EntityBox — field rows flex inside the
-// fixed column) and are clamped to [MIN_WIDTH, MAX_WIDTH].
+// Width depends only on (name, def) — stub state no longer participates so that
+// toggling a neighbour between stub and expanded does not reshuffle x packing
+// across bands. Stub state continues to drive boxHeight below.
 //
 // Rendered name in EntityBox is truncated to 29 chars (slice(0, 28) + ellipsis)
 // at font-size 13 / weight 600; ~8px/char + 24px padding approximates header
-// text width closely enough for a non-clipping column.
+// text width closely enough for a non-clipping column. Current MIN_WIDTH (260)
+// >= max headerPx (29*8+24 = 256) so every node clamps to MIN_WIDTH; if
+// MIN_WIDTH is ever lowered, x-stability across stub toggle still holds because
+// the resolver no longer reads stub state.
 export function widthOf(
   name: string,
   def: EntityDef | undefined,
-  isStub: boolean,
 ): number {
-  if (isStub) return STUB_WIDTH;
   if (!def) return DEFAULT_WIDTH;
   const renderedLen = Math.min(name.length, 29);
   const headerPx = renderedLen * 8 + 24;

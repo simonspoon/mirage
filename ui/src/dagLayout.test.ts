@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeDagPositions,
   widthOf,
+  widthOf as widthOfRaw,
   GraphEdge,
   EntityDef,
   PAD,
@@ -232,12 +233,13 @@ describe('computeDagPositions', () => {
     expect(result.positions['C'].x).toBe(201);
   });
 
-  it('W1 widthOf helper: stub → STUB_WIDTH', () => {
-    expect(widthOf('Anything', { properties: {} }, true)).toBe(STUB_WIDTH);
+  it('W1 widthOf helper: def present → MIN_WIDTH floor (STUB_WIDTH)', () => {
+    // headerPx = min(8, 29)*8 + 24 = 88, clamped up to MIN_WIDTH (=STUB_WIDTH).
+    expect(widthOf('Anything', { properties: {} })).toBe(STUB_WIDTH);
   });
 
   it('W2 widthOf helper: missing def → DEFAULT_WIDTH (260)', () => {
-    expect(widthOf('Ghost', undefined, false)).toBe(DEFAULT_WIDTH);
+    expect(widthOf('Ghost', undefined)).toBe(DEFAULT_WIDTH);
   });
 
   it('S1 two-band: SVG width = widest band cumulative', () => {
@@ -384,6 +386,86 @@ describe('computeDagPositions', () => {
       const b = result.positions[list[i + 1]];
       expect(b.x - (a.x + widths[list[i]])).toBe(NODE_GAP);
     }
+  });
+});
+
+describe('computeDagPositions — toggle stability (task yoto)', () => {
+  // Fixture: four bands so "bands above the toggled band" is non-trivial.
+  //   Band 0 (grandparents): G1, G2
+  //   Band 1 (parents):      P1, P2
+  //   Band 2 (middles):      M1, M2  — M1 has 3 properties so stubs={M1} vs
+  //                                    stubs={} changes its boxHeight (not width).
+  //   Band 3 (children):     C1, C2
+  // Edges chosen so barycenter ordering is unambiguous: P*→G*, M*→P*, C*→M*.
+  const list = ['G1', 'G2', 'P1', 'P2', 'M1', 'M2', 'C1', 'C2'];
+  const edges: GraphEdge[] = [
+    { source: 'P1', target: 'G1' },
+    { source: 'P2', target: 'G2' },
+    { source: 'M1', target: 'P1' },
+    { source: 'M2', target: 'P2' },
+    { source: 'C1', target: 'M1' },
+    { source: 'C2', target: 'M2' },
+  ];
+  const defs: Record<string, EntityDef> = {
+    M1: { properties: { a: {}, b: {}, c: {} } },
+  };
+
+  // Use the real widthOf helper exported from dagLayout. If someone
+  // re-introduces stub-sensitivity to widthOf (e.g., adding a stubs parameter
+  // that makes widthOf return STUB_WIDTH vs an expanded width), test (a)
+  // below must break: the pre-run would pass stubs={M1} and post-run stubs={},
+  // so widthOfRaw would resolve to different widths for M1 and propagate
+  // through the cumulative x-pack. As long as widthOf is (name, def) only,
+  // x-packing is stub-invariant.
+  const widthFor = (n: string) => widthOfRaw(n, defs[n]);
+
+  const run = (stubs: Set<string>) =>
+    computeDagPositions(
+      list, edges, defs, stubs, BOX_SPACING, BAND_GAP,
+      { widthOf: widthFor, barycenter: true },
+    );
+
+  it('(a) x positions identical across stub toggle for all nodes', () => {
+    const pre = run(new Set(['M1']));
+    const post = run(new Set());
+    for (const n of list) {
+      expect(pre.positions[n].x).toBe(post.positions[n].x);
+    }
+  });
+
+  it('(b) y positions above toggled band identical', () => {
+    // Focal M1 sits in band 2 → nodes with y < y_M1 span band 0 (G*) AND
+    // band 1 (P*). Band 0 y is trivially PAD, but band 1 y depends on
+    // bandHeights[0]; this test locks in that toggling M1 downstream does
+    // NOT ripple upward into G- or P-band y positions.
+    const pre = run(new Set(['M1']));
+    const post = run(new Set());
+    const yM1 = pre.positions['M1'].y;
+    // Sanity: at least one G-band node and one P-band node must sit above M1.
+    const above = list.filter(n => pre.positions[n].y < yM1);
+    expect(above).toEqual(expect.arrayContaining(['G1', 'G2', 'P1', 'P2']));
+    for (const n of above) {
+      expect(pre.positions[n].y).toBe(post.positions[n].y);
+    }
+  });
+
+  it('(c) NODE_GAP invariant per band in both runs', () => {
+    const checkBands = (res: { positions: Record<string, { x: number; y: number }> }) => {
+      const byY: Record<number, Array<{ name: string; x: number }>> = {};
+      for (const [name, p] of Object.entries(res.positions)) {
+        (byY[p.y] ||= []).push({ name, x: p.x });
+      }
+      for (const band of Object.values(byY)) {
+        band.sort((a, b) => a.x - b.x);
+        for (let i = 0; i < band.length - 1; i++) {
+          const curr = band[i];
+          const next = band[i + 1];
+          expect(next.x - (curr.x + widthFor(curr.name))).toBe(NODE_GAP);
+        }
+      }
+    };
+    checkBands(run(new Set(['M1'])));
+    checkBands(run(new Set()));
   });
 });
 

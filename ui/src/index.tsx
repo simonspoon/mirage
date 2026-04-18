@@ -2775,7 +2775,7 @@ function SchemasPage(props: {
                 // Single source of truth for per-node width.
                 const widthOf = (name: string): number => {
                   const def = props.definitions()[name];
-                  return widthOfRaw(name, def, stubSet().has(name));
+                  return widthOfRaw(name, def);
                 };
 
                 const hubLayout = createMemo(() =>
@@ -3094,7 +3094,7 @@ function SchemasPage(props: {
                     // through this helper so widths never drift.
                     const widthOf = (name: string): number => {
                       const def = props.definitions()[name];
-                      return widthOfRaw(name, def, stubSet().has(name));
+                      return widthOfRaw(name, def);
                     };
 
                     const [hoveredEdgeId, setHoveredEdgeId] = createSignal<string | null>(null);
