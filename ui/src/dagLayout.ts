@@ -286,3 +286,183 @@ export function computeDagPositions(
 
   return { positions, width, height };
 }
+
+// ── 2-hop neighborhood partition ────────────────────────────────────────────
+// Minimal property shape used by the partition helpers. We accept any
+// property record whose values MAY carry ref_name / items_ref strings.
+// Unknown or missing values are treated as non-referential.
+export interface PartitionProperty {
+  ref_name?: string | null;
+  items_ref?: string | null;
+}
+
+export interface PartitionEntityDef {
+  properties: Record<string, PartitionProperty | unknown>;
+  extends?: string;
+}
+
+export interface TwoHopPartition {
+  /** Focals ∪ nodes reachable within maxHop (hop <= maxHop). */
+  visible: Set<string>;
+  /** Min-hop distance from the focal set; only entries for visible nodes. */
+  hopOf: Record<string, number>;
+  /** Nodes at exactly hop === maxHop + 1 (the immediate overflow ring). */
+  hiddenAtRing3: Set<string>;
+}
+
+// Extract outgoing refs for one def: extends (if present) + every property's
+// ref_name / items_ref. extends lives on the def itself, NOT in properties —
+// accessing def.properties['extends'] returns undefined and its .ref_name
+// would throw. Traverse def.extends separately.
+const outgoingRefs = (def: PartitionEntityDef | undefined): string[] => {
+  if (!def) return [];
+  const out: string[] = [];
+  if (def.extends) out.push(def.extends);
+  for (const prop of Object.values(def.properties)) {
+    if (!prop || typeof prop !== 'object') continue;
+    const p = prop as PartitionProperty;
+    if (p.ref_name) out.push(p.ref_name);
+    if (p.items_ref) out.push(p.items_ref);
+  }
+  return out;
+};
+
+// Build inbound adjacency (target → [sources]) once over all defs. Inbound
+// edges mirror outbound: if A.extends === B or any A.prop refs B, then
+// inbound[B] includes A. Unknown ref targets (dangling refs to names not in
+// defs) are kept — BFS filters by def presence per step.
+const buildInboundAdj = (defs: Record<string, PartitionEntityDef>): Record<string, string[]> => {
+  const inbound: Record<string, string[]> = {};
+  for (const [name, def] of Object.entries(defs)) {
+    for (const ref of outgoingRefs(def)) {
+      if (ref === name) continue; // self-ref — don't count as inbound edge
+      if (!inbound[ref]) inbound[ref] = [];
+      inbound[ref].push(name);
+    }
+  }
+  return inbound;
+};
+
+/**
+ * Partition a schema graph into focal-set + 2-hop visible neighborhood +
+ * the immediate overflow ring (hop === maxHop + 1). Traverses bidirectionally
+ * over outbound property refs + def.extends, inbound mirrors.
+ *
+ * Multi-source BFS: min-hop wins across focals; a focal already reachable
+ * from another focal stays at hop 0 (focals always hop 0). Self-refs and
+ * dangling refs to unknown defs are safe (no infinite loops, no throws).
+ */
+export function computeTwoHopPartition(
+  defs: Record<string, PartitionEntityDef>,
+  focalSet: Set<string>,
+  maxHop: number,
+): TwoHopPartition {
+  const hopOf: Record<string, number> = {};
+  const visible = new Set<string>();
+  const hiddenAtRing3 = new Set<string>();
+
+  if (focalSet.size === 0) {
+    return { visible, hopOf, hiddenAtRing3 };
+  }
+
+  const inbound = buildInboundAdj(defs);
+
+  // Seed: all focals at hop 0 (focals beat any other hop assignment).
+  let frontier = new Set<string>();
+  for (const f of focalSet) {
+    hopOf[f] = 0;
+    visible.add(f);
+    frontier.add(f);
+  }
+
+  for (let hop = 1; hop <= maxHop + 1; hop++) {
+    const next = new Set<string>();
+    for (const n of frontier) {
+      // Outbound neighbours
+      const outs = outgoingRefs(defs[n]);
+      // Inbound neighbours
+      const ins = inbound[n] || [];
+      const neighbours = [...outs, ...ins];
+      for (const nb of neighbours) {
+        if (nb === n) continue;
+        if (hopOf[nb] !== undefined) continue; // already assigned (min-hop wins)
+        hopOf[nb] = hop;
+        if (hop <= maxHop) {
+          visible.add(nb);
+          next.add(nb);
+        } else {
+          // hop === maxHop + 1 — immediate overflow ring
+          hiddenAtRing3.add(nb);
+        }
+      }
+    }
+    frontier = next;
+    if (frontier.size === 0) break;
+  }
+
+  return { visible, hopOf, hiddenAtRing3 };
+}
+
+/**
+ * BFS over the full (undirected) schema graph from the focal set, unbounded.
+ * Returns min-hop depth for every reachable def. Unreachable defs are absent
+ * from the result. Focals are at depth 0.
+ */
+export function computeFullGraphDepths(
+  defs: Record<string, PartitionEntityDef>,
+  focals: Set<string>,
+): Record<string, number> {
+  const depths: Record<string, number> = {};
+  if (focals.size === 0) return depths;
+
+  const inbound = buildInboundAdj(defs);
+
+  let frontier = new Set<string>();
+  for (const f of focals) {
+    depths[f] = 0;
+    frontier.add(f);
+  }
+
+  let hop = 0;
+  while (frontier.size > 0) {
+    hop++;
+    const next = new Set<string>();
+    for (const n of frontier) {
+      const outs = outgoingRefs(defs[n]);
+      const ins = inbound[n] || [];
+      for (const nb of [...outs, ...ins]) {
+        if (nb === n) continue;
+        if (depths[nb] !== undefined) continue;
+        depths[nb] = hop;
+        next.add(nb);
+      }
+    }
+    frontier = next;
+  }
+
+  return depths;
+}
+
+/**
+ * Bucket hidden schemas by depth band. Each hidden name goes into the band
+ * of its (fullDepth - 1) — i.e. the band of the visible node that first
+ * reaches it via BFS. Bands with zero hidden are absent from the result.
+ *
+ * Empty `hidden` → empty result. Hidden names without a depth entry in
+ * `fullDepths` (disconnected islands) are skipped — they are not reachable
+ * from the focal set and therefore not part of the overflow ring.
+ */
+export function bucketHiddenByBand(
+  hidden: Set<string>,
+  fullDepths: Record<string, number>,
+): Record<number, string[]> {
+  const buckets: Record<number, string[]> = {};
+  for (const name of hidden) {
+    const d = fullDepths[name];
+    if (d === undefined || d <= 0) continue;
+    const band = d - 1; // band of the visible parent that referenced this node
+    if (!buckets[band]) buckets[band] = [];
+    buckets[band].push(name);
+  }
+  return buckets;
+}

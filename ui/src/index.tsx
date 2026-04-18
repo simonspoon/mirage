@@ -3,7 +3,13 @@ import type { Accessor, Setter } from "solid-js";
 import { createSignal, onMount, onCleanup, For, Index, Show, createEffect, createMemo, batch } from "solid-js";
 import "./index.css";
 import EntityBox, { ROW_HEIGHT, HEADER_HEIGHT } from "./EntityBox";
-import { computeDagPositions, widthOf as widthOfRaw } from "./dagLayout";
+import {
+  computeDagPositions,
+  widthOf as widthOfRaw,
+  computeTwoHopPartition,
+  computeFullGraphDepths,
+  bucketHiddenByBand,
+} from "./dagLayout";
 
 interface Endpoint {
   method: string;
@@ -2868,37 +2874,33 @@ function SchemasPage(props: {
                     const focusMembership = createMemo(() => new Set(focusSet()));
                     const expandedSet = createMemo(() => props.graphExpanded());
 
-                    // Derive immediate neighbors (one-hop) from relationship data, union over focusSet, exclude focals
+                    // 2-hop partition: focals + nodes within 2 hops visible;
+                    // nodes at hop=3 (immediate overflow ring) hidden behind
+                    // per-band count badges. BFS helper lives in dagLayout.ts
+                    // for pure unit coverage (vitest env is 'node', no DOM).
+                    const MAX_HOP = 2;
+                    const twoHopPartition = createMemo(() =>
+                      computeTwoHopPartition(
+                        props.definitions(),
+                        focusMembership(),
+                        MAX_HOP,
+                      ),
+                    );
+
+                    // Non-focal visible neighbors (within 2 hops, minus focals).
+                    // Filtered to defs present (skip dangling refs). The Expand
+                    // toolbar button expands all of these to full EntityBoxes.
                     const immediateNeighbors = createMemo(() => {
+                      const { visible } = twoHopPartition();
                       const focals = focusMembership();
                       const defs = props.definitions();
-                      const neighbors = new Set<string>();
-
-                      for (const f of focals) {
-                        // Outbound: properties and extends of each focal
-                        const focusedDef = defs[f];
-                        if (focusedDef) {
-                          if (focusedDef.extends && defs[focusedDef.extends] && !focals.has(focusedDef.extends)) {
-                            neighbors.add(focusedDef.extends);
-                          }
-                          for (const prop of Object.values(focusedDef.properties)) {
-                            const ref = prop.ref_name || prop.items_ref;
-                            if (ref && defs[ref] && !focals.has(ref)) neighbors.add(ref);
-                          }
-                        }
+                      const out: string[] = [];
+                      for (const n of visible) {
+                        if (focals.has(n)) continue;
+                        if (!defs[n]) continue;
+                        out.push(n);
                       }
-
-                      // Inbound: other entities that reference any focal
-                      for (const [entityName, def] of Object.entries(defs)) {
-                        if (focals.has(entityName)) continue;
-                        if (def.extends && focals.has(def.extends)) { neighbors.add(entityName); continue; }
-                        for (const prop of Object.values(def.properties)) {
-                          const ref = prop.ref_name || prop.items_ref;
-                          if (ref && focals.has(ref)) { neighbors.add(entityName); break; }
-                        }
-                      }
-
-                      return [...neighbors];
+                      return out;
                     });
 
                     // Stubs = neighbors not in expandedSet; expanded = neighbors in expandedSet
@@ -2906,8 +2908,27 @@ function SchemasPage(props: {
                       const exp = expandedSet();
                       return immediateNeighbors().filter(n => !exp.has(n));
                     });
-                    // All visible entities: focals + all neighbors (Set-deduped)
-                    const visibleList = createMemo(() => [...new Set([...focusSet(), ...immediateNeighbors()])]);
+                    // All visible entities: focals + all neighbors (Set-deduped,
+                    // filtered to defs present). Drives layout + edges.
+                    const visibleList = createMemo(() => {
+                      const defs = props.definitions();
+                      const focals = focusMembership();
+                      const out: string[] = [];
+                      const seen = new Set<string>();
+                      for (const f of focals) {
+                        if (!seen.has(f) && defs[f]) {
+                          seen.add(f);
+                          out.push(f);
+                        }
+                      }
+                      for (const n of immediateNeighbors()) {
+                        if (!seen.has(n)) {
+                          seen.add(n);
+                          out.push(n);
+                        }
+                      }
+                      return out;
+                    });
                     const stubSet = createMemo(() => new Set(stubList()));
 
                     const boxSpacing = 300;
@@ -3056,6 +3077,145 @@ function SchemasPage(props: {
                       return focals.has(edge.source) || focals.has(edge.target);
                     };
 
+                    // ── Hidden overflow badges + popover ─────────────────
+                    // Per-band count badges sit at the right edge of each band
+                    // containing >=1 hop-3 schema. Clicking a badge opens a
+                    // popover listing the hidden names alphabetically; each
+                    // row calls selectEntity(name) to add it to the focal set.
+                    //
+                    // Popover state is a primitive signal (band y-coord or
+                    // null) — no Set-valued signal means no new-instance-on-
+                    // update trap. NEVER a setter-in-updater (simaris 019d8e28).
+                    const [openBadgeBand, setOpenBadgeBand] = createSignal<number | null>(null);
+
+                    // Full-graph BFS depths from focal set — used to locate
+                    // which visible node (band) "owns" each hidden overflow
+                    // node. Unbounded; unreachable defs absent.
+                    const fullDepths = createMemo(() =>
+                      computeFullGraphDepths(props.definitions(), focusMembership()),
+                    );
+
+                    // Hidden names bucketed by band Y coordinate (key =
+                    // positions[parent].y for the visible parent that first
+                    // reaches each hidden). Lifted out of <For> to avoid
+                    // rebuilding Map/Set per row (simaris 019d930b-01e0).
+                    //
+                    // Schema of return: Map<bandY, { names: string[], rightX: number }>
+                    // where rightX = max(x + widthOf(v)) across visible nodes
+                    // v whose y === bandY. Only bands with >=1 hidden appear.
+                    const hiddenBandInfo = createMemo(() => {
+                      const { hiddenAtRing3 } = twoHopPartition();
+                      const out = new Map<number, { names: string[]; rightX: number }>();
+                      if (hiddenAtRing3.size === 0) return out;
+                      const defs = props.definitions();
+                      const positions = dagLayout().positions;
+                      const depths = fullDepths();
+
+                      // Build outgoing ref adjacency over full defs graph (once per memo run).
+                      // Used to find a visible "parent" (in dagLayout band sense)
+                      // for each hidden name.
+                      const outRefs = (name: string): string[] => {
+                        const def = defs[name];
+                        if (!def) return [];
+                        const refs: string[] = [];
+                        if (def.extends) refs.push(def.extends);
+                        for (const prop of Object.values(def.properties)) {
+                          const r = prop.ref_name || prop.items_ref;
+                          if (r) refs.push(r);
+                        }
+                        return refs;
+                      };
+
+                      // For each hidden h: find any visible node v that shares
+                      // an edge with h. Use v's layout y as the band key.
+                      // min-hop invariant → at least one such v exists (its
+                      // hopOf is hopOf(h) - 1). Fallback: if none found, use
+                      // fullDepth-based band bucket via bucketHiddenByBand as
+                      // safety net (shouldn't normally fire).
+                      const visibleSet = new Set(visibleList());
+                      const unresolved = new Set<string>();
+                      for (const h of hiddenAtRing3) {
+                        // Outbound: h → ref (visible?)
+                        let parent: string | undefined;
+                        for (const ref of outRefs(h)) {
+                          if (visibleSet.has(ref)) { parent = ref; break; }
+                        }
+                        // Inbound: some visible v → h
+                        if (!parent) {
+                          for (const v of visibleSet) {
+                            for (const r of outRefs(v)) {
+                              if (r === h) { parent = v; break; }
+                            }
+                            if (parent) break;
+                          }
+                        }
+                        if (!parent || !positions[parent]) {
+                          unresolved.add(h);
+                          continue;
+                        }
+                        const bandY = positions[parent].y;
+                        let entry = out.get(bandY);
+                        if (!entry) {
+                          entry = { names: [], rightX: 0 };
+                          out.set(bandY, entry);
+                        }
+                        entry.names.push(h);
+                      }
+
+                      // Safety net for unresolved hidden (should be empty in
+                      // practice): bucket via full-graph depth, then map to
+                      // any visible node at that depth's layout y.
+                      if (unresolved.size > 0) {
+                        const byBand = bucketHiddenByBand(unresolved, depths);
+                        // Choose a representative visible node per fullDepth-1
+                        // band from positions; pick the node with the
+                        // matching hopOf depth if available.
+                        const { hopOf } = twoHopPartition();
+                        for (const [bandStr, names] of Object.entries(byBand)) {
+                          const targetHop = Number(bandStr);
+                          let bandY: number | undefined;
+                          for (const v of visibleSet) {
+                            if (hopOf[v] === targetHop && positions[v]) {
+                              bandY = positions[v].y;
+                              break;
+                            }
+                          }
+                          if (bandY === undefined) continue;
+                          let entry = out.get(bandY);
+                          if (!entry) {
+                            entry = { names: [], rightX: 0 };
+                            out.set(bandY, entry);
+                          }
+                          for (const n of names) entry.names.push(n);
+                        }
+                      }
+
+                      // Compute rightX per band: max(x + widthOf(v)) across
+                      // all visible v with matching y. Widths vary; iterate
+                      // and pick max (NOT last in list — simaris 019d9e7e).
+                      for (const v of visibleSet) {
+                        const p = positions[v];
+                        if (!p) continue;
+                        const entry = out.get(p.y);
+                        if (!entry) continue;
+                        const right = p.x + widthOf(v);
+                        if (right > entry.rightX) entry.rightX = right;
+                      }
+
+                      // Alphabetically sort names per band (locale-aware).
+                      for (const entry of out.values()) {
+                        entry.names.sort((a, b) => a.localeCompare(b));
+                      }
+
+                      return out;
+                    });
+
+                    // Bands (y-coords) that have >=1 hidden — drives badge
+                    // render. Sorted ascending so render/DOM order is stable.
+                    const bandsWithHidden = createMemo(() =>
+                      [...hiddenBandInfo().keys()].sort((a, b) => a - b),
+                    );
+
                     // Pan/zoom interaction
                     let svgEl: SVGSVGElement | undefined;
                     let isPanning = false;
@@ -3074,6 +3234,24 @@ function SchemasPage(props: {
                       };
                       svgEl.addEventListener("wheel", wheelHandler, { passive: false });
                       onCleanup(() => svgEl?.removeEventListener("wheel", wheelHandler));
+
+                      // Dismiss badge popover on Escape / click-outside.
+                      // stopPropagation on badge + popover root prevents the
+                      // same-tick click from closing the freshly-opened popover.
+                      const keyHandler = (e: KeyboardEvent) => {
+                        if (e.key === "Escape" && openBadgeBand() !== null) {
+                          setOpenBadgeBand(null);
+                        }
+                      };
+                      const clickHandler = () => {
+                        if (openBadgeBand() !== null) setOpenBadgeBand(null);
+                      };
+                      document.addEventListener("keydown", keyHandler);
+                      document.addEventListener("click", clickHandler);
+                      onCleanup(() => {
+                        document.removeEventListener("keydown", keyHandler);
+                        document.removeEventListener("click", clickHandler);
+                      });
                     });
 
                     const handlePointerDown = (e: PointerEvent) => {
@@ -3529,6 +3707,90 @@ function SchemasPage(props: {
                               );
                             }}
                           </For>
+                          {/* Per-band hidden-count badges + popover. Rendered
+                              inside the pan/zoom <g transform> so badges track
+                              the graph. Badge click opens popover listing
+                              alphabetically-sorted hidden names; popover row
+                              click calls selectEntity (add-toggle into focals).
+                              Drag-vs-click guard mirrors stub click (L3100). */}
+                          <g data-hidden-overflow>
+                            <For each={bandsWithHidden()}>
+                              {(bandY) => {
+                                const entry = () => hiddenBandInfo().get(bandY);
+                                const count = () => entry()?.names.length ?? 0;
+                                const badgeX = () => (entry()?.rightX ?? 0) + 20; // GAP past rightmost visible
+                                const badgeY = () => bandY + HEADER_HEIGHT / 2 - 10;
+                                const label = () => `+${count()}`;
+                                const badgeWidth = () => Math.max(32, label().length * 8 + 12);
+                                const isOpen = () => openBadgeBand() === bandY;
+                                return (
+                                  <g
+                                    data-hidden-band-badge={count()}
+                                    data-band-y={bandY}
+                                  >
+                                    <rect
+                                      x={badgeX()}
+                                      y={badgeY()}
+                                      width={badgeWidth()}
+                                      height={20}
+                                      rx={10}
+                                      ry={10}
+                                      fill="#1f2937"
+                                      stroke="#60a5fa"
+                                      stroke-width={1}
+                                      style="cursor:pointer"
+                                      onClick={(e) => {
+                                        if (dragOccurred) return;
+                                        e.stopPropagation();
+                                        setOpenBadgeBand(isOpen() ? null : bandY);
+                                      }}
+                                    >
+                                      <title>{`${count()} hidden schema${count() === 1 ? "" : "s"} in this band`}</title>
+                                    </rect>
+                                    <text
+                                      x={badgeX() + badgeWidth() / 2}
+                                      y={badgeY() + 14}
+                                      fill="#93c5fd"
+                                      font-size="11"
+                                      font-family="ui-monospace, monospace"
+                                      text-anchor="middle"
+                                      pointer-events="none"
+                                    >{label()}</text>
+                                    <Show when={isOpen()}>
+                                      <foreignObject
+                                        x={badgeX()}
+                                        y={badgeY() + 24}
+                                        width={240}
+                                        height={Math.min(320, count() * 24 + 16)}
+                                      >
+                                        <div
+                                          data-hidden-popover
+                                          role="dialog"
+                                          class="bg-gray-900 border border-gray-700 rounded shadow-lg text-xs text-gray-200 overflow-y-auto max-h-[320px]"
+                                          style="font-family: ui-sans-serif, system-ui;"
+                                          onClick={(e) => e.stopPropagation()}
+                                        >
+                                          <For each={entry()?.names ?? []}>
+                                            {(name) => (
+                                              <div
+                                                data-hidden-popover-row
+                                                class="px-3 py-1.5 hover:bg-gray-800 cursor-pointer border-b border-gray-800 last:border-b-0"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  props.selectEntity(name);
+                                                  setOpenBadgeBand(null);
+                                                }}
+                                              >{name}</div>
+                                            )}
+                                          </For>
+                                        </div>
+                                      </foreignObject>
+                                    </Show>
+                                  </g>
+                                );
+                              }}
+                            </For>
+                          </g>
                           </g>
                         </svg>
                       </div>

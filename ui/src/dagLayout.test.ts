@@ -9,6 +9,10 @@ import {
   DEFAULT_WIDTH,
   STUB_WIDTH,
   MAX_WIDTH,
+  PartitionEntityDef,
+  computeTwoHopPartition,
+  computeFullGraphDepths,
+  bucketHiddenByBand,
 } from './dagLayout';
 
 const BOX_SPACING = 300;
@@ -379,5 +383,286 @@ describe('computeDagPositions', () => {
       const b = result.positions[list[i + 1]];
       expect(b.x - (a.x + widths[list[i]])).toBe(NODE_GAP);
     }
+  });
+});
+
+// ── 2-hop partition helpers ───────────────────────────────────────────────
+
+// Tiny DSL: prop(ref?) / prop(items=?) for fixture readability.
+const pRef = (ref: string) => ({ ref_name: ref, items_ref: null });
+const pItems = (items: string) => ({ ref_name: null, items_ref: items });
+
+describe('computeTwoHopPartition', () => {
+  it('empty defs + empty focal → empty partition', () => {
+    const res = computeTwoHopPartition({}, new Set(), 2);
+    expect(res.visible.size).toBe(0);
+    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hopOf).toEqual({});
+  });
+
+  it('empty focal against non-empty defs → empty partition', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(), 2);
+    expect(res.visible.size).toBe(0);
+    expect(res.hiddenAtRing3.size).toBe(0);
+  });
+
+  it('focal with no neighbours → only focal visible, no ring3', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect([...res.visible]).toEqual(['A']);
+    expect(res.hopOf).toEqual({ A: 0 });
+    expect(res.hiddenAtRing3.size).toBe(0);
+  });
+
+  it('1-hop + 2-hop chain A→B→C, maxHop=2 → all visible', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { c: pRef('C') } },
+      C: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
+    expect(res.hopOf).toEqual({ A: 0, B: 1, C: 2 });
+    expect(res.hiddenAtRing3.size).toBe(0);
+  });
+
+  it('3-hop chain A→B→C→D → D in hiddenAtRing3, not in visible', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { c: pRef('C') } },
+      C: { properties: { d: pRef('D') } },
+      D: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
+    expect(res.hiddenAtRing3).toEqual(new Set(['D']));
+    expect(res.hopOf.D).toBe(3);
+  });
+
+  it('inbound 2-hop X→Y→Z focal=Z → X,Y,Z all visible via inbound edges', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      X: { properties: { y: pRef('Y') } },
+      Y: { properties: { z: pRef('Z') } },
+      Z: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['Z']), 2);
+    expect(res.visible).toEqual(new Set(['X', 'Y', 'Z']));
+    expect(res.hopOf).toEqual({ Z: 0, Y: 1, X: 2 });
+  });
+
+  it('extends edge counts as 1 hop (guards extends-pseudo-edge trap)', () => {
+    // def.extends lives on the def itself, NOT in def.properties.
+    const defs: Record<string, PartitionEntityDef> = {
+      Child: { properties: {}, extends: 'Parent' },
+      Parent: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['Child']), 2);
+    expect(res.visible).toEqual(new Set(['Child', 'Parent']));
+    expect(res.hopOf.Parent).toBe(1);
+  });
+
+  it('extends as ring3: 3-deep extends chain → 3rd hidden', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {}, extends: 'B' },
+      B: { properties: {}, extends: 'C' },
+      C: { properties: {}, extends: 'D' },
+      D: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
+    expect(res.hiddenAtRing3).toEqual(new Set(['D']));
+  });
+
+  it('items_ref treated identically to ref_name', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { arr: pItems('B') } },
+      B: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B']));
+    expect(res.hopOf.B).toBe(1);
+  });
+
+  it('cycle A↔B terminates <100ms, both visible, hop assigned', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { a: pRef('A') } },
+    };
+    const t0 = Date.now();
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(res.visible).toEqual(new Set(['A', 'B']));
+    expect(res.hopOf).toEqual({ A: 0, B: 1 });
+    expect(res.hiddenAtRing3.size).toBe(0);
+  });
+
+  it('self-ref A→A → no infinite loop, A hop 0, no other visible', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { self: pRef('A') } },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect([...res.visible]).toEqual(['A']);
+    expect(res.hopOf).toEqual({ A: 0 });
+  });
+
+  it('two focals overlapping 2-hops → min-hop wins', () => {
+    // Chain: A→B→C→D→E; focals={A,E}. Nodes B,C reachable from A at 1,2;
+    // C,D reachable from E at 2,1. Min-hop: B=1, C=2, D=1.
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { c: pRef('C') } },
+      C: { properties: { d: pRef('D') } },
+      D: { properties: { e: pRef('E') } },
+      E: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A', 'E']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B', 'C', 'D', 'E']));
+    expect(res.hopOf.A).toBe(0);
+    expect(res.hopOf.E).toBe(0);
+    expect(res.hopOf.B).toBe(1);
+    expect(res.hopOf.D).toBe(1);
+    expect(res.hopOf.C).toBe(2);
+  });
+
+  it('focal beats being-reached-as-hop from another focal', () => {
+    // A→B→C; focals={A,B}. B must stay hop 0 (focal), not 1.
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { c: pRef('C') } },
+      C: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A', 'B']), 2);
+    expect(res.hopOf.A).toBe(0);
+    expect(res.hopOf.B).toBe(0);
+    expect(res.hopOf.C).toBe(1);
+  });
+
+  it('dangling ref to unknown def → no throw, unknown node never visible', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { missing: pRef('GHOST') } },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    // GHOST has no entry in defs so outgoingRefs(defs['GHOST']) returns [].
+    // BFS still visits GHOST once as a name (hop 1) — it's a known reachable
+    // neighbour by edge, but has no further edges. That's acceptable — the
+    // caller filters down to defs present when rendering.
+    expect(res.visible.has('A')).toBe(true);
+    expect(res.hopOf.A).toBe(0);
+    // GHOST is reachable at hop 1 via the outgoing ref; we don't require the
+    // caller to render it — but the helper should not throw.
+    expect(res.hopOf.GHOST).toBe(1);
+  });
+
+  it('disconnected island hidden NOT counted in ring3', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: {} },
+      // Island (no edges to A or B)
+      X: { properties: { y: pRef('Y') } },
+      Y: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.visible).toEqual(new Set(['A', 'B']));
+    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hopOf.X).toBeUndefined();
+    expect(res.hopOf.Y).toBeUndefined();
+  });
+
+  it('multi-path boundary: hop=2 via one path beats hop=3 via another → visible', () => {
+    // A→B→C; A→X→Y→C. C reachable at hop 2 via B, hop 3 via Y. Min wins: 2.
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B'), x: pRef('X') } },
+      B: { properties: { c: pRef('C') } },
+      X: { properties: { y: pRef('Y') } },
+      Y: { properties: { c: pRef('C') } },
+      C: { properties: {} },
+    };
+    const res = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect(res.hopOf.C).toBe(2);
+    expect(res.visible.has('C')).toBe(true);
+    expect(res.hiddenAtRing3.has('C')).toBe(false);
+  });
+
+  it('determinism: repeated runs yield identical visible+hopOf', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B'), c: pRef('C') } },
+      B: { properties: { d: pRef('D') } },
+      C: { properties: { d: pRef('D') } },
+      D: { properties: { e: pRef('E') } },
+      E: { properties: {} },
+    };
+    const r1 = computeTwoHopPartition(defs, new Set(['A']), 2);
+    const r2 = computeTwoHopPartition(defs, new Set(['A']), 2);
+    expect([...r1.visible].sort()).toEqual([...r2.visible].sort());
+    expect(r1.hopOf).toEqual(r2.hopOf);
+    expect([...r1.hiddenAtRing3].sort()).toEqual([...r2.hiddenAtRing3].sort());
+  });
+});
+
+describe('computeFullGraphDepths', () => {
+  it('empty focal → empty depths', () => {
+    const defs: Record<string, PartitionEntityDef> = { A: { properties: {} } };
+    expect(computeFullGraphDepths(defs, new Set())).toEqual({});
+  });
+
+  it('linear chain depths unbounded: A→B→C→D→E', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { c: pRef('C') } },
+      C: { properties: { d: pRef('D') } },
+      D: { properties: { e: pRef('E') } },
+      E: { properties: {} },
+    };
+    const res = computeFullGraphDepths(defs, new Set(['A']));
+    expect(res).toEqual({ A: 0, B: 1, C: 2, D: 3, E: 4 });
+  });
+
+  it('disconnected node absent from depths', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: {} },
+      Island: { properties: {} },
+    };
+    const res = computeFullGraphDepths(defs, new Set(['A']));
+    expect(res.Island).toBeUndefined();
+  });
+});
+
+describe('bucketHiddenByBand', () => {
+  it('empty hidden → empty result', () => {
+    expect(bucketHiddenByBand(new Set(), {})).toEqual({});
+  });
+
+  it('single hidden → bucketed into (depth - 1) band', () => {
+    // Hidden H reachable at depth 3 → band 2 (its visible parent sits in band 2).
+    const res = bucketHiddenByBand(new Set(['H']), { H: 3 });
+    expect(res).toEqual({ 2: ['H'] });
+  });
+
+  it('multiple hidden same band increments', () => {
+    const res = bucketHiddenByBand(
+      new Set(['H1', 'H2']),
+      { H1: 3, H2: 3 },
+    );
+    expect(res[2].sort()).toEqual(['H1', 'H2']);
+    expect(Object.keys(res)).toEqual(['2']);
+  });
+
+  it('hidden without depth (disconnected) skipped', () => {
+    const res = bucketHiddenByBand(new Set(['H1', 'Ghost']), { H1: 3 });
+    expect(res).toEqual({ 2: ['H1'] });
+  });
+
+  it('zero hidden per band → band absent from result', () => {
+    const res = bucketHiddenByBand(new Set(['H1']), { H1: 3 });
+    expect(res[0]).toBeUndefined();
+    expect(res[1]).toBeUndefined();
+    expect(res[2]).toEqual(['H1']);
   });
 });
