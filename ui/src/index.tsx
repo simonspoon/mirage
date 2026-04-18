@@ -2854,34 +2854,47 @@ function SchemasPage(props: {
                 </Show>
                 <Show when={props.graphFocused() !== null}>
                   {(() => {
-                    const focused = createMemo(() => props.graphFocused()!);
+                    // focusSet: selectedEntities filtered to known defs; fallback to graphFocused
+                    const focusSet = createMemo<string[]>(() => {
+                      const defs = props.definitions();
+                      const sel = props.selectedEntities();
+                      if (sel.size >= 1) {
+                        const filtered = [...sel].filter(e => defs[e]);
+                        if (filtered.length > 0) return filtered;
+                      }
+                      const gf = props.graphFocused();
+                      return gf ? [gf] : [];
+                    });
+                    const focusMembership = createMemo(() => new Set(focusSet()));
                     const expandedSet = createMemo(() => props.graphExpanded());
 
-                    // Derive immediate neighbors (one-hop) from relationship data
+                    // Derive immediate neighbors (one-hop) from relationship data, union over focusSet, exclude focals
                     const immediateNeighbors = createMemo(() => {
-                      const f = focused();
+                      const focals = focusMembership();
                       const defs = props.definitions();
                       const neighbors = new Set<string>();
 
-                      // Outbound: properties and extends of the focused entity
-                      const focusedDef = defs[f];
-                      if (focusedDef) {
-                        if (focusedDef.extends && defs[focusedDef.extends] && focusedDef.extends !== f) {
-                          neighbors.add(focusedDef.extends);
-                        }
-                        for (const prop of Object.values(focusedDef.properties)) {
-                          const ref = prop.ref_name || prop.items_ref;
-                          if (ref && defs[ref] && ref !== f) neighbors.add(ref);
+                      for (const f of focals) {
+                        // Outbound: properties and extends of each focal
+                        const focusedDef = defs[f];
+                        if (focusedDef) {
+                          if (focusedDef.extends && defs[focusedDef.extends] && !focals.has(focusedDef.extends)) {
+                            neighbors.add(focusedDef.extends);
+                          }
+                          for (const prop of Object.values(focusedDef.properties)) {
+                            const ref = prop.ref_name || prop.items_ref;
+                            if (ref && defs[ref] && !focals.has(ref)) neighbors.add(ref);
+                          }
                         }
                       }
 
-                      // Inbound: other entities that reference the focused entity
+                      // Inbound: other entities that reference any focal
                       for (const [entityName, def] of Object.entries(defs)) {
-                        if (entityName === f) continue;
-                        if (def.extends === f) { neighbors.add(entityName); continue; }
+                        if (focals.has(entityName)) continue;
+                        if (def.extends && focals.has(def.extends)) { neighbors.add(entityName); continue; }
                         for (const prop of Object.values(def.properties)) {
                           const ref = prop.ref_name || prop.items_ref;
-                          if (ref === f) { neighbors.add(entityName); break; }
+                          if (ref && focals.has(ref)) { neighbors.add(entityName); break; }
                         }
                       }
 
@@ -2893,8 +2906,8 @@ function SchemasPage(props: {
                       const exp = expandedSet();
                       return immediateNeighbors().filter(n => !exp.has(n));
                     });
-                    // All visible entities: focused + all neighbors
-                    const visibleList = createMemo(() => [focused(), ...immediateNeighbors()]);
+                    // All visible entities: focals + all neighbors (Set-deduped)
+                    const visibleList = createMemo(() => [...new Set([...focusSet(), ...immediateNeighbors()])]);
                     const stubSet = createMemo(() => new Set(stubList()));
 
                     const boxWidth = 260;
@@ -3313,7 +3326,7 @@ function SchemasPage(props: {
                               const xPos = () => entityPositions()[entityName]?.x ?? 0;
                               const yPos = () => entityPositions()[entityName]?.y ?? 0;
 
-                              const isFocused = () => entityName === focused();
+                              const isFocused = () => focusMembership().has(entityName);
                               const isStub = () => stubSet().has(entityName);
                               const isExpandedNeighbor = () => !isFocused() && !isStub();
 
