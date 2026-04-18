@@ -220,6 +220,8 @@ function App() {
   // Progressive exploration graph state
   const [graphFocused, setGraphFocused] = createSignal<string | null>(null);
   const [graphExpanded, setGraphExpanded] = createSignal<Set<string>>(new Set());
+  const [graphPan, setGraphPan] = createSignal<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [graphZoom, setGraphZoom] = createSignal<number>(1);
 
   onMount(async () => {
     try {
@@ -1728,6 +1730,10 @@ function App() {
               setGraphFocused={setGraphFocused}
               graphExpanded={graphExpanded}
               setGraphExpanded={setGraphExpanded}
+              graphPan={graphPan}
+              setGraphPan={setGraphPan}
+              graphZoom={graphZoom}
+              setGraphZoom={setGraphZoom}
               emptyTableNames={emptyTableNames}
               allTableNames={allTableNames}
               showEmptyTables={showEmptyTables}
@@ -2205,6 +2211,10 @@ function SchemasPage(props: {
   setGraphFocused: Setter<string | null>;
   graphExpanded: Accessor<Set<string>>;
   setGraphExpanded: Setter<Set<string>>;
+  graphPan: Accessor<{ x: number; y: number }>;
+  setGraphPan: Setter<{ x: number; y: number }>;
+  graphZoom: Accessor<number>;
+  setGraphZoom: Setter<number>;
   emptyTableNames: Accessor<Set<string>>;
   allTableNames: Accessor<Set<string>>;
   showEmptyTables: Accessor<boolean>;
@@ -2827,7 +2837,7 @@ function SchemasPage(props: {
 
               {/* Graph tab content */}
               <Show when={rightTab() === "graph"}>
-                <div class="flex items-center justify-between mb-1">
+                <div class="flex items-center justify-between mb-1 shrink-0">
                   <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entity Graph</p>
                   <Show when={props.graphFocused() !== null}>
                     <button
@@ -2837,7 +2847,7 @@ function SchemasPage(props: {
                   </Show>
                 </div>
                 <Show when={props.graphFocused() === null}>
-                  <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center" style="height: 400px;">
+                  <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg flex items-center justify-center">
                     <p class="text-sm text-gray-600">Select a schema to view its ERD box</p>
                   </div>
                 </Show>
@@ -3098,9 +3108,111 @@ function SchemasPage(props: {
                       setHoveredEdgeId(null);
                     };
 
+                    // Pan/zoom interaction
+                    let svgEl: SVGSVGElement | undefined;
+                    let isPanning = false;
+                    let dragStartX = 0;
+                    let dragStartY = 0;
+                    let panStartX = 0;
+                    let panStartY = 0;
+                    let dragOccurred = false;
+
+                    onMount(() => {
+                      if (!svgEl) return;
+                      const wheelHandler = (e: WheelEvent) => {
+                        e.preventDefault();
+                        const scaleFactor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+                        props.setGraphZoom(z => Math.min(4, Math.max(0.1, z * scaleFactor)));
+                      };
+                      svgEl.addEventListener("wheel", wheelHandler, { passive: false });
+                      onCleanup(() => svgEl?.removeEventListener("wheel", wheelHandler));
+                    });
+
+                    const handlePointerDown = (e: PointerEvent) => {
+                      if ((e.target as Element).closest("[data-entity-box]")) return;
+                      isPanning = true;
+                      dragStartX = e.clientX;
+                      dragStartY = e.clientY;
+                      panStartX = props.graphPan().x;
+                      panStartY = props.graphPan().y;
+                      dragOccurred = false;
+                      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+                    };
+
+                    const handlePointerMove = (e: PointerEvent) => {
+                      if (!isPanning) return;
+                      const dx = e.clientX - dragStartX;
+                      const dy = e.clientY - dragStartY;
+                      if (Math.hypot(dx, dy) >= 4) {
+                        dragOccurred = true;
+                        props.setGraphPan({ x: panStartX + dx, y: panStartY + dy });
+                      }
+                    };
+
+                    const handlePointerUp = (e: PointerEvent) => {
+                      if (!isPanning) return;
+                      isPanning = false;
+                      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+                      if (dragOccurred) {
+                        e.stopPropagation();
+                      }
+                    };
+
+                    const fitGraph = () => {
+                      const positions = dagLayout().positions;
+                      const keys = Object.keys(positions);
+                      if (keys.length === 0) return;
+                      if (!svgEl) return;
+                      const viewportW = svgEl.clientWidth;
+                      const viewportH = svgEl.clientHeight;
+                      if (viewportW === 0 || viewportH === 0) return;
+                      const defs = props.definitions();
+                      const stubs = stubSet();
+                      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                      for (const name of keys) {
+                        const p = positions[name];
+                        const def = defs[name];
+                        let h = HEADER_HEIGHT;
+                        if (def && !stubs.has(name)) {
+                          const rowCt = Object.keys(def.properties).length + (def.extends ? 1 : 0) || 1;
+                          h = HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+                        }
+                        if (p.x < minX) minX = p.x;
+                        if (p.y < minY) minY = p.y;
+                        if (p.x + boxWidth > maxX) maxX = p.x + boxWidth;
+                        if (p.y + h > maxY) maxY = p.y + h;
+                      }
+                      const bboxW = maxX - minX;
+                      const bboxH = maxY - minY;
+                      if (bboxW <= 0 || bboxH <= 0) return;
+                      const scale = Math.min(4, Math.max(0.1, Math.min(viewportW / bboxW, viewportH / bboxH) * 0.95));
+                      const tx = (viewportW - bboxW * scale) / 2 - minX * scale;
+                      const ty = (viewportH - bboxH * scale) / 2 - minY * scale;
+                      batch(() => {
+                        props.setGraphZoom(scale);
+                        props.setGraphPan({ x: tx, y: ty });
+                      });
+                    };
+
                     return (
-                      <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-auto" style="height: 400px;">
-                        <svg width={svgWidth()} height={svgHeight()} xmlns="http://www.w3.org/2000/svg">
+                      <div class="flex-1 min-h-0 flex flex-col overflow-hidden">
+                        <div class="flex items-center justify-end mb-1 shrink-0">
+                          <button
+                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                            onClick={fitGraph}
+                          >Fit</button>
+                        </div>
+                      <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
+                        <svg
+                          ref={el => { svgEl = el; }}
+                          width="100%"
+                          height="100%"
+                          style="display:block;"
+                          onPointerDown={handlePointerDown}
+                          onPointerMove={handlePointerMove}
+                          onPointerUp={handlePointerUp}
+                        >
+                          <g transform={`translate(${props.graphPan().x},${props.graphPan().y}) scale(${props.graphZoom()})`}>
                           {/* Relationship edges (rendered before boxes for correct z-order) */}
                           <g data-relationship-edges>
                             <For each={graphEdges()}>
@@ -3357,7 +3469,9 @@ function SchemasPage(props: {
                               );
                             }}
                           </For>
+                          </g>
                         </svg>
+                      </div>
                       </div>
                     );
                   })()}
