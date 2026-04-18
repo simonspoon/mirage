@@ -3136,7 +3136,15 @@ function SchemasPage(props: {
 
                     return (
                       <div class="flex-1 min-h-0 flex flex-col overflow-hidden">
-                        <div class="flex items-center justify-end mb-1 shrink-0">
+                        <div class="flex items-center justify-end gap-1 mb-1 shrink-0">
+                          <button
+                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                            onClick={() => props.setGraphExpanded(new Set(immediateNeighbors()))}
+                          >Expand</button>
+                          <button
+                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                            onClick={() => props.setGraphExpanded(new Set())}
+                          >Collapse</button>
                           <button
                             class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
                             onClick={fitGraph}
