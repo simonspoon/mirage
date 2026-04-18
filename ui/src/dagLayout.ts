@@ -314,7 +314,7 @@ export interface TwoHopPartition {
 // ref_name / items_ref. extends lives on the def itself, NOT in properties —
 // accessing def.properties['extends'] returns undefined and its .ref_name
 // would throw. Traverse def.extends separately.
-const outgoingRefs = (def: PartitionEntityDef | undefined): string[] => {
+export const outgoingRefs = (def: PartitionEntityDef | undefined): string[] => {
   if (!def) return [];
   const out: string[] = [];
   if (def.extends) out.push(def.extends);
@@ -330,8 +330,9 @@ const outgoingRefs = (def: PartitionEntityDef | undefined): string[] => {
 // Build inbound adjacency (target → [sources]) once over all defs. Inbound
 // edges mirror outbound: if A.extends === B or any A.prop refs B, then
 // inbound[B] includes A. Unknown ref targets (dangling refs to names not in
-// defs) are kept — BFS filters by def presence per step.
-const buildInboundAdj = (defs: Record<string, PartitionEntityDef>): Record<string, string[]> => {
+// defs) are kept — BFS filters by def presence per step. Self-refs are
+// excluded so a schema cannot be its own inbound parent.
+export const buildInboundAdj = (defs: Record<string, PartitionEntityDef>): Record<string, string[]> => {
   const inbound: Record<string, string[]> = {};
   for (const [name, def] of Object.entries(defs)) {
     for (const ref of outgoingRefs(def)) {
@@ -342,6 +343,45 @@ const buildInboundAdj = (defs: Record<string, PartitionEntityDef>): Record<strin
   }
   return inbound;
 };
+
+/**
+ * Rank schemas by inbound-reference count and return the top N names.
+ *
+ * Inbound count for a schema X = number of distinct (sourceDef, ref) edges
+ * (extends + ref_name + items_ref) that target X across `defs`. Self-refs are
+ * NOT counted (mirrors buildInboundAdj). Multiple properties on one source
+ * that all ref X each contribute one edge — matches the inbound-adj list
+ * length used elsewhere for neighborhood traversal.
+ *
+ * Sort: inbound count DESC, ties broken by name ASC. Deterministic.
+ *
+ * Edge cases:
+ *   - n <= 0  → returns []
+ *   - empty defs → returns []
+ *   - n > defs count → returns all defs ranked (no padding)
+ *   - all-zero-inbound → all defs sorted by name asc, sliced to n
+ *
+ * Used by SchemasPage to suggest entry-point schemas in the empty-state
+ * graph view (no focal selected yet).
+ */
+export function computeTopHubs(
+  defs: Record<string, PartitionEntityDef>,
+  n: number,
+): string[] {
+  if (n <= 0) return [];
+  const names = Object.keys(defs);
+  if (names.length === 0) return [];
+  const inbound = buildInboundAdj(defs);
+  const counts: Array<{ name: string; count: number }> = names.map(name => ({
+    name,
+    count: (inbound[name] || []).length,
+  }));
+  counts.sort((a, b) => {
+    if (a.count !== b.count) return b.count - a.count; // count DESC
+    return a.name.localeCompare(b.name);                // name ASC
+  });
+  return counts.slice(0, n).map(c => c.name);
+}
 
 /**
  * Partition a schema graph into focal-set + 2-hop visible neighborhood +

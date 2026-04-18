@@ -22,6 +22,12 @@ interface EntityBoxProps {
   onSelectRef?: (refName: string) => void;
   collapsed?: boolean;
   onHeaderClick?: () => void;
+  /**
+   * Hub marker for empty-state entry-point hint. Adds a distinguishing
+   * outer ring + corner dot. Optional, default false — additive only,
+   * existing callers unaffected.
+   */
+  isHub?: boolean;
 }
 
 export const ROW_HEIGHT = 24;
@@ -270,6 +276,26 @@ export default function EntityBox(props: EntityBoxProps) {
         stroke="#30363d"
         stroke-width={1}
       />
+      {/* Hub marker: amber ring + corner dot for empty-state entry points */}
+      <Show when={props.isHub}>
+        <rect
+          data-entity-hub-ring
+          x={-3} y={-3}
+          width={width() + 6} height={totalHeight() + 6}
+          rx={6} ry={6}
+          fill="none"
+          stroke="#f59e0b"
+          stroke-width={2}
+          pointer-events="none"
+        />
+        <circle
+          data-entity-hub-dot
+          cx={width() - 8} cy={8}
+          r={4}
+          fill="#f59e0b"
+          pointer-events="none"
+        />
+      </Show>
     </g>
   );
 }

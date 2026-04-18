@@ -13,6 +13,7 @@ import {
   computeTwoHopPartition,
   computeFullGraphDepths,
   bucketHiddenByBand,
+  computeTopHubs,
 } from './dagLayout';
 
 const BOX_SPACING = 300;
@@ -664,5 +665,135 @@ describe('bucketHiddenByBand', () => {
     expect(res[0]).toBeUndefined();
     expect(res[1]).toBeUndefined();
     expect(res[2]).toEqual(['H1']);
+  });
+});
+
+describe('computeTopHubs', () => {
+  it('basic ranking: 4 defs with counts 3/2/1/0, n=5 → all 4 in count-desc order', () => {
+    // Inbound count derived from outgoing refs of every def:
+    //   A inbound from B,C,D    → 3
+    //   B inbound from C,D       → 2
+    //   C inbound from D          → 1
+    //   D inbound from (none)     → 0
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+      B: { properties: { a: pRef('A') } },
+      C: { properties: { a: pRef('A'), b: pRef('B') } },
+      D: { properties: { a: pRef('A'), b: pRef('B'), c: pRef('C') } },
+    };
+    expect(computeTopHubs(defs, 5)).toEqual(['A', 'B', 'C', 'D']);
+  });
+
+  it('n < defs.length → truncate at n', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+      B: { properties: { a: pRef('A') } },
+      C: { properties: { a: pRef('A'), b: pRef('B') } },
+      D: { properties: { a: pRef('A'), b: pRef('B'), c: pRef('C') } },
+    };
+    const res = computeTopHubs(defs, 2);
+    expect(res).toEqual(['A', 'B']);
+    expect(res).toHaveLength(2);
+  });
+
+  it('tie-break by name asc when counts equal', () => {
+    // Z, A, M all referenced once → name asc: A, M, Z
+    const defs: Record<string, PartitionEntityDef> = {
+      Z: { properties: {} },
+      A: { properties: {} },
+      M: { properties: {} },
+      Ref1: { properties: { z: pRef('Z') } },
+      Ref2: { properties: { a: pRef('A') } },
+      Ref3: { properties: { m: pRef('M') } },
+    };
+    // All six defs share counts: Z=1, A=1, M=1, Ref1=0, Ref2=0, Ref3=0.
+    // Top 3 by count-desc, name-asc: A, M, Z.
+    expect(computeTopHubs(defs, 3)).toEqual(['A', 'M', 'Z']);
+  });
+
+  it('empty defs → []', () => {
+    expect(computeTopHubs({}, 5)).toStrictEqual([]);
+  });
+
+  it('n=0 → []', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+      B: { properties: { a: pRef('A') } },
+    };
+    expect(computeTopHubs(defs, 0)).toStrictEqual([]);
+  });
+
+  it('n<0 (negative) clamps to [] ', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+      B: { properties: { a: pRef('A') } },
+    };
+    expect(computeTopHubs(defs, -3)).toStrictEqual([]);
+  });
+
+  it('all-zero-inbound → returns names in asc order, sliced', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      Charlie: { properties: {} },
+      Alpha: { properties: {} },
+      Bravo: { properties: {} },
+    };
+    expect(computeTopHubs(defs, 5)).toEqual(['Alpha', 'Bravo', 'Charlie']);
+    expect(computeTopHubs(defs, 2)).toEqual(['Alpha', 'Bravo']);
+  });
+
+  it('self-ref does NOT count as inbound (mirrors buildInboundAdj)', () => {
+    // A.self → A is excluded from inbound. A inbound count stays 0.
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { self: pRef('A') } },
+      B: { properties: { a: pRef('A') } },
+    };
+    // Inbound: A from B (self skipped) → 1. B from (none) → 0.
+    // Sort: A(1) before B(0).
+    expect(computeTopHubs(defs, 5)).toEqual(['A', 'B']);
+  });
+
+  it('cyclic refs A↔B terminate fast and rank deterministically', () => {
+    // A.b → B; B.a → A. Each has inbound count 1 from the other (no self).
+    // Tie on count=1 → name asc: A, B.
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: { b: pRef('B') } },
+      B: { properties: { a: pRef('A') } },
+    };
+    const t0 = Date.now();
+    const res = computeTopHubs(defs, 5);
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(res).toEqual(['A', 'B']);
+  });
+
+  it('determinism: 3 calls → identical result', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      A: { properties: {} },
+      B: { properties: { a: pRef('A') } },
+      C: { properties: { a: pRef('A'), b: pRef('B') } },
+      D: { properties: { c: pRef('C') } },
+      E: { properties: { d: pRef('D') } },
+    };
+    const r1 = computeTopHubs(defs, 3);
+    const r2 = computeTopHubs(defs, 3);
+    const r3 = computeTopHubs(defs, 3);
+    expect(r1).toEqual(r2);
+    expect(r2).toEqual(r3);
+  });
+
+  it('extends edge counts toward inbound (mirrors outgoingRefs)', () => {
+    // Child extends Parent → Parent inbound count = 1.
+    const defs: Record<string, PartitionEntityDef> = {
+      Parent: { properties: {} },
+      Child: { properties: {}, extends: 'Parent' },
+    };
+    expect(computeTopHubs(defs, 5)).toEqual(['Parent', 'Child']);
+  });
+
+  it('items_ref counts toward inbound (mirrors ref_name)', () => {
+    const defs: Record<string, PartitionEntityDef> = {
+      Item: { properties: {} },
+      Holder: { properties: { arr: pItems('Item') } },
+    };
+    expect(computeTopHubs(defs, 5)).toEqual(['Item', 'Holder']);
   });
 });

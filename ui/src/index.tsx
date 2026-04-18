@@ -9,6 +9,7 @@ import {
   computeTwoHopPartition,
   computeFullGraphDepths,
   bucketHiddenByBand,
+  computeTopHubs,
 } from "./dagLayout";
 
 interface Endpoint {
@@ -2273,6 +2274,13 @@ function SchemasPage(props: {
     return groups;
   };
 
+  // Empty-state entry-point hint: top-N most-referenced schemas. Computed
+  // at component scope (NOT inside <For>) so we don't rebuild O(N) per row
+  // (perf rule simaris 019d930b). Hard-coded N=5 — out of scope to make
+  // user-configurable. Re-runs only when definitions() identity changes.
+  const TOP_HUBS_N = 5;
+  const topHubs = createMemo(() => computeTopHubs(props.definitions(), TOP_HUBS_N));
+
   const neighborhood = createMemo(() => {
     const entities = props.selectedEntities();
     const depth = props.schemaGraphHopDepth();
@@ -2692,11 +2700,151 @@ function SchemasPage(props: {
 
           {/* Right panel - Detail / Graph tabs */}
           <div class="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto">
-            {/* Empty state — no tabs */}
+            {/* Empty state — no entity selected. Render top-N (=5) hubs +
+                their immediate (1-hop) neighbors as an entry-point hint;
+                clicking any hub flips selectedEntities (via selectEntity),
+                which mounts the tabbed pane below. Hubs computed once at
+                component scope (topHubs memo) — NOT inside For (perf rule
+                simaris 019d930b). */}
             <Show when={props.selectedEntities().size === 0}>
-              <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-8 text-center">
-                <p class="text-gray-600 text-sm">Select a definition to view its details.</p>
-              </div>
+              {(() => {
+                const hubs = createMemo(() => topHubs().filter(n => props.definitions()[n]));
+                const hubSet = createMemo(() => new Set(hubs()));
+
+                // 1-hop neighborhood: hubs + everything one outbound/inbound
+                // ref away. Filtered to defs present (no dangling refs).
+                const neighbors = createMemo(() => {
+                  const defs = props.definitions();
+                  const partition = computeTwoHopPartition(defs, hubSet(), 1);
+                  const out: string[] = [];
+                  for (const n of partition.visible) {
+                    if (hubSet().has(n)) continue;
+                    if (!defs[n]) continue;
+                    out.push(n);
+                  }
+                  return out;
+                });
+
+                // visibleList = hubs first, then 1-hop neighbors (Set-deduped).
+                const visibleList = createMemo(() => {
+                  const out: string[] = [];
+                  const seen = new Set<string>();
+                  for (const h of hubs()) {
+                    if (!seen.has(h)) { seen.add(h); out.push(h); }
+                  }
+                  for (const n of neighbors()) {
+                    if (!seen.has(n)) { seen.add(n); out.push(n); }
+                  }
+                  return out;
+                });
+
+                // Stub set: non-hub neighbors render as collapsed stubs.
+                const stubSet = createMemo(() => new Set(neighbors()));
+
+                // Edges between visible entities (extends + property refs).
+                const hubEdges = createMemo(() => {
+                  const list = visibleList();
+                  const visibleSet = new Set(list);
+                  const defs = props.definitions();
+                  const edgeList: { source: string; target: string }[] = [];
+                  for (const name of list) {
+                    const def = defs[name];
+                    if (!def) continue;
+                    if (def.extends && visibleSet.has(def.extends) && def.extends !== name && defs[def.extends]) {
+                      edgeList.push({ source: name, target: def.extends });
+                    }
+                    for (const prop of Object.values(def.properties)) {
+                      const ref = prop.ref_name || prop.items_ref;
+                      if (!ref) continue;
+                      if (!visibleSet.has(ref)) continue;
+                      if (ref === name) continue;
+                      if (!defs[ref]) continue;
+                      edgeList.push({ source: name, target: ref });
+                    }
+                  }
+                  return edgeList;
+                });
+
+                // Single source of truth for per-node width.
+                const widthOf = (name: string): number => {
+                  const def = props.definitions()[name];
+                  return widthOfRaw(name, def, stubSet().has(name));
+                };
+
+                const hubLayout = createMemo(() =>
+                  computeDagPositions(
+                    visibleList(),
+                    hubEdges(),
+                    props.definitions(),
+                    stubSet(),
+                    300,
+                    40,
+                    { widthOf },
+                  ),
+                );
+
+                return (
+                  <div class="rounded-xl bg-[#0a101d] border border-[#141b28] flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <div class="px-4 py-3 border-b border-[#141b28]">
+                      <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Entry-point hubs</p>
+                    </div>
+                    <div class="flex-1 min-h-0 bg-[#070c17] overflow-hidden relative">
+                      <div
+                        data-hub-empty-state-overlay
+                        class="absolute top-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 text-xs text-gray-300 bg-gray-900/80 border border-gray-700 rounded-md pointer-events-none shadow-lg"
+                      >Select a schema to explore</div>
+                      <svg width="100%" height="100%" style="display:block;">
+                        <g>
+                          {/* Edge lines (simple straight lines, hub-mode only — no routing) */}
+                          <For each={hubEdges()}>
+                            {(edge) => {
+                              const sp = () => hubLayout().positions[edge.source];
+                              const tp = () => hubLayout().positions[edge.target];
+                              return (
+                                <Show when={sp() && tp()}>
+                                  <line
+                                    x1={sp()!.x + widthOf(edge.source)}
+                                    y1={sp()!.y + HEADER_HEIGHT / 2}
+                                    x2={tp()!.x}
+                                    y2={tp()!.y + HEADER_HEIGHT / 2}
+                                    stroke="#4b5563"
+                                    stroke-width={1}
+                                  />
+                                </Show>
+                              );
+                            }}
+                          </For>
+                          {/* Entity boxes */}
+                          <For each={visibleList()}>
+                            {(entityName) => {
+                              const def = () => props.definitions()[entityName];
+                              const pos = () => hubLayout().positions[entityName];
+                              const isStub = () => stubSet().has(entityName);
+                              const isHub = () => hubSet().has(entityName);
+                              return (
+                                <Show when={def() && pos()}>
+                                  <EntityBox
+                                    name={entityName}
+                                    properties={def()!.properties}
+                                    extends={def()!.extends}
+                                    x={pos()!.x}
+                                    y={pos()!.y}
+                                    width={widthOf(entityName)}
+                                    collapsed={isStub()}
+                                    isHub={isHub()}
+                                    onHeaderClick={isHub() ? () => props.selectEntity(entityName) : undefined}
+                                    onSelectRef={(refName) => props.selectEntity(refName)}
+                                  />
+                                </Show>
+                              );
+                            }}
+                          </For>
+                        </g>
+                      </svg>
+                    </div>
+                  </div>
+                );
+              })()}
             </Show>
 
             {/* Tabbed content — only when entity selected */}
