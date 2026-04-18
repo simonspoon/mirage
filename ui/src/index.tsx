@@ -3478,19 +3478,32 @@ function SchemasPage(props: {
 
                     return (
                       <div class="flex-1 min-h-0 flex flex-col overflow-hidden">
-                        <div class="flex items-center justify-end gap-1 mb-1 shrink-0">
-                          <button
-                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
-                            onClick={() => props.setGraphExpanded(new Set(immediateNeighbors()))}
-                          >Expand</button>
-                          <button
-                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
-                            onClick={() => props.setGraphExpanded(new Set())}
-                          >Collapse</button>
-                          <button
-                            class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
-                            onClick={fitGraph}
-                          >Fit</button>
+                        <div class="flex items-center justify-between gap-1 mb-1 shrink-0">
+                          {/* Edge legend — must stay in sync with EDGE_STYLE keys */}
+                          <div class="flex items-center gap-3 px-2 py-1 bg-gray-800/80 border border-gray-700/50 rounded text-[10px] text-gray-400 whitespace-nowrap">
+                            <span class="flex items-center gap-1">
+                              <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={EDGE_STYLE.extends.stroke} stroke-dasharray={EDGE_STYLE.extends.dasharray} stroke-width="1" /></svg>
+                              extends
+                            </span>
+                            <span class="flex items-center gap-1">
+                              <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={EDGE_STYLE.ref.stroke} stroke-dasharray={EDGE_STYLE.ref.dasharray} stroke-width="1" /></svg>
+                              property ref
+                            </span>
+                          </div>
+                          <div class="flex items-center gap-1">
+                            <button
+                              class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                              onClick={() => props.setGraphExpanded(new Set(immediateNeighbors()))}
+                            >Expand</button>
+                            <button
+                              class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                              onClick={() => props.setGraphExpanded(new Set())}
+                            >Collapse</button>
+                            <button
+                              class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
+                              onClick={fitGraph}
+                            >Fit</button>
+                          </div>
                         </div>
                       <div class="flex-1 min-h-0 bg-[#070c17] border border-gray-800 rounded-lg overflow-hidden">
                         <svg
