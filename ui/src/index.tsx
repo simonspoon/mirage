@@ -2924,6 +2924,9 @@ function SchemasPage(props: {
                       target: string;
                       cardinality: "1:1" | "1:N";
                       hasExtends: boolean;
+                      required: boolean;
+                      typeLabel: string;
+                      refKind: "ref" | "items" | "extends";
                     }
 
                     // Compute edges between visible entities
@@ -2949,6 +2952,9 @@ function SchemasPage(props: {
                               target: def.extends,
                               cardinality: "1:1",
                               hasExtends: true,
+                              required: false,
+                              typeLabel: `extends ${def.extends}`,
+                              refKind: "extends",
                             });
                           }
                         }
@@ -2962,6 +2968,10 @@ function SchemasPage(props: {
                           if (!visibleSet.has(refName)) continue;
                           if (refName === entityName) continue;
                           if (!defs[refName]) continue;
+                          const isItems = !!prop.items_ref;
+                          const typeLabel = isItems
+                            ? `${refName}[]`
+                            : (prop.ref_name ?? refName);
                           edgeList.push({
                             id: `${entityName}::${fieldName}::${refName}`,
                             source: entityName,
@@ -2970,6 +2980,9 @@ function SchemasPage(props: {
                             target: refName,
                             cardinality: prop.is_array || !!prop.items_ref ? "1:N" : "1:1",
                             hasExtends,
+                            required: !!prop.required,
+                            typeLabel,
+                            refKind: isItems ? "items" : "ref",
                           });
                         }
                       }
@@ -3026,6 +3039,13 @@ function SchemasPage(props: {
                       next.delete(entityName);
                       props.setGraphExpanded(next);
                       setHoveredEdgeId(null);
+                    };
+
+                    // An edge is "focal-connected" when either endpoint is a focused entity.
+                    // Focal-connected edges render a midpoint label without requiring hover.
+                    const isFocalConnected = (edge: EdgeInfo) => {
+                      const focals = focusMembership();
+                      return focals.has(edge.source) || focals.has(edge.target);
                     };
 
                     // Pan/zoom interaction
@@ -3176,10 +3196,31 @@ function SchemasPage(props: {
                                 };
 
                                 // Elbow connector: orthogonal routing that avoids box obstructions
-                                const d = () => {
+                                // Returns the SVG path plus the midpoint of the longest horizontal segment
+                                // (robust against backward/detour 5-segment elbows where simple average fails).
+                                const route = (): { d: string; labelX: number; labelY: number } => {
                                   const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
                                   const rects = boxRects();
                                   const margin = 10;
+
+                                  // Build path from a list of horizontal run x-values alternating with vertical jumps to y-values.
+                                  // segments: [{x1,x2,y}] — pick the one with greatest |x2-x1| for label placement.
+                                  const buildResult = (
+                                    runs: { x1: number; x2: number; y: number }[],
+                                    dPath: string,
+                                  ): { d: string; labelX: number; labelY: number } => {
+                                    let best = runs[0];
+                                    let bestLen = Math.abs(best.x2 - best.x1);
+                                    for (let i = 1; i < runs.length; i++) {
+                                      const len = Math.abs(runs[i].x2 - runs[i].x1);
+                                      if (len > bestLen) { best = runs[i]; bestLen = len; }
+                                    }
+                                    return {
+                                      d: dPath,
+                                      labelX: (best.x1 + best.x2) / 2,
+                                      labelY: best.y,
+                                    };
+                                  };
 
                                   // Check if a vertical segment at x=vx from y1 to y2 intersects any box (excluding source & target)
                                   const verticalHitsBox = (vx: number, y1: number, y2: number): { x: number; y: number; w: number; h: number }[] => {
@@ -3215,7 +3256,13 @@ function SchemasPage(props: {
                                     }
 
                                     // Route: right from source, down/up to target Y, left to target
-                                    return `M ${_sx} ${_sy} H ${loopX} V ${_ty} H ${_tx}`;
+                                    return buildResult(
+                                      [
+                                        { x1: _sx, x2: loopX, y: _sy },
+                                        { x1: loopX, x2: _tx, y: _ty },
+                                      ],
+                                      `M ${_sx} ${_sy} H ${loopX} V ${_ty} H ${_tx}`,
+                                    );
                                   }
 
                                   // Forward edge: source is left of target
@@ -3224,21 +3271,39 @@ function SchemasPage(props: {
 
                                   if (hits.length === 0) {
                                     // No obstruction: simple H-V-H elbow
-                                    return `M ${_sx} ${_sy} H ${midX} V ${_ty} H ${_tx}`;
+                                    return buildResult(
+                                      [
+                                        { x1: _sx, x2: midX, y: _sy },
+                                        { x1: midX, x2: _tx, y: _ty },
+                                      ],
+                                      `M ${_sx} ${_sy} H ${midX} V ${_ty} H ${_tx}`,
+                                    );
                                   }
 
                                   // Try routing the vertical segment to the right of all blocking boxes
                                   const rightmostEdge = Math.max(...hits.map(h => h.x + h.w));
                                   const shiftedRight = rightmostEdge + margin;
                                   if (shiftedRight < _tx && verticalHitsBox(shiftedRight, _sy, _ty).length === 0) {
-                                    return `M ${_sx} ${_sy} H ${shiftedRight} V ${_ty} H ${_tx}`;
+                                    return buildResult(
+                                      [
+                                        { x1: _sx, x2: shiftedRight, y: _sy },
+                                        { x1: shiftedRight, x2: _tx, y: _ty },
+                                      ],
+                                      `M ${_sx} ${_sy} H ${shiftedRight} V ${_ty} H ${_tx}`,
+                                    );
                                   }
 
                                   // Try routing to the left of all blocking boxes
                                   const leftmostEdge = Math.min(...hits.map(h => h.x));
                                   const shiftedLeft = leftmostEdge - margin;
                                   if (shiftedLeft > _sx && verticalHitsBox(shiftedLeft, _sy, _ty).length === 0) {
-                                    return `M ${_sx} ${_sy} H ${shiftedLeft} V ${_ty} H ${_tx}`;
+                                    return buildResult(
+                                      [
+                                        { x1: _sx, x2: shiftedLeft, y: _sy },
+                                        { x1: shiftedLeft, x2: _tx, y: _ty },
+                                      ],
+                                      `M ${_sx} ${_sy} H ${shiftedLeft} V ${_ty} H ${_tx}`,
+                                    );
                                   }
 
                                   // Route around: go right past all obstructions, then vertical, then left to target
@@ -3257,16 +3322,47 @@ function SchemasPage(props: {
 
                                   // H-V-H-V-H: exit source, jog vertically to clear the obstruction, then proceed to target
                                   const clearMidX = (_sx + Math.min(_tx, detourX)) / 2;
-                                  return `M ${_sx} ${_sy} H ${clearMidX} V ${detourY} H ${detourX} V ${_ty} H ${_tx}`;
+                                  return buildResult(
+                                    [
+                                      { x1: _sx, x2: clearMidX, y: _sy },
+                                      { x1: clearMidX, x2: detourX, y: detourY },
+                                      { x1: detourX, x2: _tx, y: _ty },
+                                    ],
+                                    `M ${_sx} ${_sy} H ${clearMidX} V ${detourY} H ${detourX} V ${_ty} H ${_tx}`,
+                                  );
                                 };
+
+                                const routeInfo = createMemo(route);
+                                const d = () => routeInfo().d;
+                                const labelX = () => routeInfo().labelX;
+                                const labelY = () => routeInfo().labelY;
 
                                 const isHovered = () => hoveredEdgeId() === edge.id;
                                 const hasPositions = () => sourcePos() && targetPos();
+                                const focalConnected = () => isFocalConnected(edge);
+                                const showLabel = () => isHovered() || focalConnected();
+
+                                // Midpoint label text: "extends" for extends edges, else source field name.
+                                const labelText = () =>
+                                  edge.refKind === "extends" ? "extends" : edge.sourceField;
+
+                                // Native SVG <title> content: "source.field -> target\ntype\nrequired: yes|no"
+                                const tooltipText = () => {
+                                  const head = edge.refKind === "extends"
+                                    ? `${edge.source} extends ${edge.target}`
+                                    : `${edge.source}.${edge.sourceField} -> ${edge.target}`;
+                                  const typeLine = `type: ${edge.typeLabel}`;
+                                  const reqLine = `required: ${edge.required ? "yes" : "no"}`;
+                                  return `${head}\n${typeLine}\n${reqLine}`;
+                                };
+
+                                // Approximate label rect: 6px per char + 12px padding, 14px tall.
+                                const labelWidth = () => labelText().length * 6 + 12;
 
                                 return (
                                   <Show when={hasPositions()}>
                                     <g>
-                                      {/* Wider invisible hit area */}
+                                      {/* Wider invisible hit area — carries the native tooltip */}
                                       <path
                                         d={d()}
                                         fill="none"
@@ -3274,7 +3370,9 @@ function SchemasPage(props: {
                                         stroke-width={12}
                                         onMouseEnter={() => setHoveredEdgeId(edge.id)}
                                         onMouseLeave={() => setHoveredEdgeId(null)}
-                                      />
+                                      >
+                                        <title>{tooltipText()}</title>
+                                      </path>
                                       {/* Visible path */}
                                       <path
                                         d={d()}
@@ -3313,6 +3411,31 @@ function SchemasPage(props: {
                                         points={`${tx()},${ty()} ${tx() - 6},${ty() - 3} ${tx() - 6},${ty() + 3}`}
                                         fill={isHovered() ? "#60a5fa" : "#4b5563"}
                                       />
+                                      {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover) */}
+                                      <Show when={showLabel()}>
+                                        <g pointer-events="none" data-edge-label-for={edge.id}>
+                                          <rect
+                                            x={labelX() - labelWidth() / 2}
+                                            y={labelY() - 8}
+                                            width={labelWidth()}
+                                            height={14}
+                                            rx={3}
+                                            ry={3}
+                                            fill="#070c17"
+                                            fill-opacity={0.9}
+                                            stroke={isHovered() ? "#60a5fa" : "#374151"}
+                                            stroke-width={0.5}
+                                          />
+                                          <text
+                                            x={labelX()}
+                                            y={labelY() + 3}
+                                            fill={isHovered() ? "#93c5fd" : "#9ca3af"}
+                                            font-size="10"
+                                            font-family="ui-monospace, monospace"
+                                            text-anchor="middle"
+                                          >{labelText()}</text>
+                                        </g>
+                                      </Show>
                                     </g>
                                   </Show>
                                 );
