@@ -75,6 +75,14 @@ pub enum FakerStrategy {
     PhoneNumber,
     Title,
     Suffix,
+    /// Recipe-scoped custom list: pick a random string from the embedded
+    /// values. Synthesized by `composer::parse_faker_rules` when a
+    /// `faker_rules` strategy string matches a key in the recipe's
+    /// `custom_lists` map. Never serialized from wire input — the variant
+    /// exists solely as an internal dispatch carrier, so the tuple shape is
+    /// ignored by `serde_json` when parsing user-supplied strategy strings.
+    #[serde(skip)]
+    Custom(Vec<String>),
 }
 
 fn generate_for_strategy(strategy: &FakerStrategy) -> serde_json::Value {
@@ -283,6 +291,14 @@ fn generate_for_strategy(strategy: &FakerStrategy) -> serde_json::Value {
         FakerStrategy::Suffix => {
             let s: String = fake::faker::name::en::Suffix().fake();
             serde_json::Value::String(s)
+        }
+        FakerStrategy::Custom(values) => {
+            if values.is_empty() {
+                let w: String = Word().fake();
+                return serde_json::Value::String(w);
+            }
+            let idx = rng.random_range(0..values.len());
+            serde_json::Value::String(values[idx].clone())
         }
     }
 }

@@ -570,11 +570,51 @@ pub fn parse_quantity_configs(json_str: &str) -> QuantityConfigs {
     configs
 }
 
+/// Parse custom lists from the recipe-level JSON blob.
+/// Input format: `{"ListName": ["val", "val", ...], ...}`.
+/// Non-string array elements are dropped. Empty or malformed lists are skipped.
+pub fn parse_custom_lists(json_str: &str) -> HashMap<String, Vec<String>> {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return HashMap::new(),
+    };
+
+    let mut lists = HashMap::new();
+    for (name, val) in obj {
+        let arr = match val.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        let values: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        lists.insert(name.clone(), values);
+    }
+    lists
+}
+
 /// Parse FakerRules from a JSON string.
 /// Input format: {"DefName.propName": "strategy", ...}
 /// Splits on first dot to get (def_name, prop_name). Strategy strings map to FakerStrategy via serde.
 /// Unknown strategies or "auto" are skipped (not inserted).
-pub fn parse_faker_rules(json_str: &str) -> FakerRules {
+///
+/// `custom_lists` shadows built-in strategies: if `strategy_str` matches a key
+/// in `custom_lists`, the resolved FakerStrategy becomes
+/// `Custom(values.clone())` — checked BEFORE serde lookup so collisions (e.g.
+/// a custom list named "email") win over the built-in variant.
+pub fn parse_faker_rules(
+    json_str: &str,
+    custom_lists: &HashMap<String, Vec<String>>,
+) -> FakerRules {
     let parsed: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return FakerRules::new(),
@@ -595,10 +635,15 @@ pub fn parse_faker_rules(json_str: &str) -> FakerRules {
         if strategy_str == "auto" {
             continue;
         }
-        let strategy: FakerStrategy = match serde_json::from_value(serde_json::json!(strategy_str))
-        {
-            Ok(s) => s,
-            Err(_) => continue,
+        // Custom list shadow: check user-defined lists FIRST so a name
+        // collision with a built-in (e.g. "email") resolves to the list.
+        let strategy: FakerStrategy = if let Some(values) = custom_lists.get(strategy_str) {
+            FakerStrategy::Custom(values.clone())
+        } else {
+            match serde_json::from_value(serde_json::json!(strategy_str)) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
         };
         // Split on first dot
         let dot = match key.find('.') {

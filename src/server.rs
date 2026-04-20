@@ -1701,7 +1701,8 @@ async fn admin_activate_recipe(
     // Parse shared_pools and quantity_configs from recipe
     let pool_config = crate::composer::parse_shared_pools(&recipe.shared_pools);
     let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
-    let faker_rules = crate::composer::parse_faker_rules(&recipe.faker_rules);
+    let custom_lists = crate::composer::parse_custom_lists(&recipe.custom_lists);
+    let faker_rules = crate::composer::parse_faker_rules(&recipe.faker_rules, &custom_lists);
     // Parse recipe rules. If parsing fails (corrupt store), fall back to no
     // rules but log the failure rather than aborting activation.
     let recipe_rules: Vec<crate::rules::Rule> = match crate::rules::parse_rules(&recipe.rules) {
@@ -3761,6 +3762,117 @@ definitions:
                 pet["name"].as_str().unwrap_or(""),
                 "Cosmo",
                 "all pets should be named Cosmo, got {pet}"
+            );
+        }
+    }
+
+    /// Activate a recipe whose `faker_rules` maps `Pet.name` to a strategy
+    /// string that matches a key in `custom_lists`. Every seeded pet name
+    /// must be drawn from the list values.
+    #[tokio::test]
+    async fn test_activate_recipe_custom_list_faker() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Custom List Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+            ],
+            "seed_count": 20,
+            "faker_rules": {"Pet.name": "Greetings"},
+            "custom_lists": {"Greetings": ["hi", "hey", "howdy"]},
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET /pet -- every pet.name must be drawn from the custom list.
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert!(!arr.is_empty(), "should have at least one pet");
+        let allowed: std::collections::HashSet<&str> =
+            ["hi", "hey", "howdy"].into_iter().collect();
+        for pet in arr {
+            let name = pet["name"].as_str().unwrap_or("");
+            assert!(
+                allowed.contains(name),
+                "pet.name {name:?} must be drawn from custom list Greetings, got {pet}"
+            );
+        }
+    }
+
+    /// A custom list whose name collides with a built-in faker strategy
+    /// (e.g. "email") shadows the built-in. Seeded values for a field
+    /// mapped to "email" come from the custom list, not SafeEmail.
+    #[tokio::test]
+    async fn test_activate_recipe_custom_list_shadows_builtin() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Shadow Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+            ],
+            "seed_count": 10,
+            "faker_rules": {"Pet.name": "email"},
+            "custom_lists": {"email": ["shadow@example.com"]},
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().expect("response should be an array");
+        assert!(!arr.is_empty(), "should have at least one pet");
+        for pet in arr {
+            assert_eq!(
+                pet["name"].as_str().unwrap_or(""),
+                "shadow@example.com",
+                "custom list 'email' must shadow built-in FakerStrategy::Email; got {pet}"
             );
         }
     }
