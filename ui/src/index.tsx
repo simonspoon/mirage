@@ -4754,8 +4754,7 @@ function RecipeConfigStep(props: {
             const countParts = () => {
               const parts: string[] = [];
               if (visiblePool()) parts.push("1 pool");
-              if (visibleArrays().length > 0) parts.push(`${visibleArrays().length} arrays`);
-              if (visibleFields().length > 0) parts.push(`${visibleFields().length} rules`);
+              if (visibleProps().length > 0) parts.push(`${visibleProps().length} properties`);
               if (scopedConstraints().length > 0) parts.push(`${scopedConstraints().length} constraints`);
               return parts.join(" · ");
             };
@@ -4862,27 +4861,29 @@ function RecipeConfigStep(props: {
                                   <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">
                                     {prop.isArray ? `${prop.propType}[]` : `${prop.propType}${prop.format ? `/${prop.format}` : ""}`}
                                   </span>
-                                  <Show when={prop.isArray && arrayConfig()}>
-                                    <input type="number" min="0" max="50" value={arrayConfig()!.min}
+                                  <Show when={prop.isArray}>
+                                    <input type="number" min="0" max="50" value={arrayConfig()?.min ?? 1}
                                       class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
                                       onInput={(e) => {
                                         const configs = { ...props.recipeQuantityConfigs() };
-                                        configs[fieldKey] = { ...configs[fieldKey], min: parseInt(e.target.value) || 0 };
+                                        const prev = configs[fieldKey] ?? { min: 1, max: 3 };
+                                        configs[fieldKey] = { min: parseInt(e.target.value) || 0, max: prev.max };
                                         props.setRecipeQuantityConfigs(configs);
                                       }} />
                                     <span class="text-gray-600 text-xs">–</span>
-                                    <input type="number" min="1" max="50" value={arrayConfig()!.max}
+                                    <input type="number" min="1" max="50" value={arrayConfig()?.max ?? 3}
                                       class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
                                       onInput={(e) => {
                                         const configs = { ...props.recipeQuantityConfigs() };
-                                        configs[fieldKey] = { ...configs[fieldKey], max: parseInt(e.target.value) || 3 };
+                                        const prev = configs[fieldKey] ?? { min: 1, max: 3 };
+                                        configs[fieldKey] = { min: prev.min, max: parseInt(e.target.value) || 3 };
                                         props.setRecipeQuantityConfigs(configs);
                                       }} />
                                     <span class="text-[10px] text-gray-600 w-10">items</span>
                                   </Show>
-                                  <Show when={!prop.isArray && fakerStrategy() !== undefined}>
+                                  <Show when={!prop.isArray}>
                                     <select
-                                      value={fakerStrategy()}
+                                      value={fakerStrategy() ?? "auto"}
                                       class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
                                       onChange={(e) => {
                                         const rules = { ...props.recipeFakerRules() };
