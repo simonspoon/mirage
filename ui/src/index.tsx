@@ -1974,6 +1974,7 @@ function App() {
                   recipeRules={recipeRules}
                   setRecipeRules={setRecipeRules}
                   recipeSeedCount={recipeSeedCount}
+                  setRecipeSeedCount={setRecipeSeedCount}
                   entityGraph={entityGraph}
                   configSearch={configSearch}
                   setConfigSearch={setConfigSearch}
@@ -4291,6 +4292,7 @@ function RecipeConfigStep(props: {
   recipeRules: Accessor<Rule[]>;
   setRecipeRules: Setter<Rule[]>;
   recipeSeedCount: Accessor<number>;
+  setRecipeSeedCount: Setter<number>;
   entityGraph: Accessor<any>;
   configSearch: Accessor<string>;
   setConfigSearch: Setter<string>;
@@ -4456,6 +4458,34 @@ function RecipeConfigStep(props: {
     setExpandedGroups(s);
   };
 
+  // Inline seed-count edit — raw text buffer + derived validity. Shared across all headers
+  // because recipeSeedCount() is recipe-wide. Buffer re-syncs from the signal only on
+  // external changes (recipe load, Step 5 edit), not on user typing.
+  const [seedInputRaw, setSeedInputRaw] = createSignal<string>(String(props.recipeSeedCount()));
+  let lastSyncedSeed = props.recipeSeedCount();
+  createEffect(() => {
+    const current = props.recipeSeedCount();
+    if (current !== lastSyncedSeed) {
+      lastSyncedSeed = current;
+      setSeedInputRaw(String(current));
+    }
+  });
+  const seedInputValid = () => {
+    const raw = seedInputRaw().trim();
+    if (raw === "") return false;
+    const n = Number(raw);
+    if (!Number.isInteger(n)) return false;
+    return n >= 1 && n <= 100;
+  };
+  const commitSeedInput = (raw: string) => {
+    setSeedInputRaw(raw);
+    const n = Number(raw.trim());
+    if (Number.isInteger(n) && n >= 1 && n <= 100) {
+      lastSyncedSeed = n;
+      props.setRecipeSeedCount(n);
+    }
+  };
+
   // Reset to all-collapsed when entityGraph changes (new recipe loaded)
   createEffect(() => {
     props.entityGraph();
@@ -4618,18 +4648,47 @@ function RecipeConfigStep(props: {
             return (
               <div class="rounded-md overflow-hidden border border-gray-800/50">
                 {/* Table header */}
-                <button
+                <div
                   data-testid="table-group-header"
-                  class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors"
+                  role="button"
+                  tabIndex={0}
+                  class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors cursor-pointer"
                   onClick={() => toggleGroup(tableKey())}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      toggleGroup(tableKey());
+                    }
+                  }}
                 >
                   <span class={`text-[10px] text-blue-400 transition-transform ${expandedGroups().has(tableKey()) ? "rotate-90" : ""}`}>&#9654;</span>
                   <span class="font-medium text-blue-200">{defName}</span>
                   <span
-                    class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800/60 text-gray-400 font-normal"
+                    class="flex items-center gap-1 text-[10px] text-gray-400"
                     title="Rows seeded per table (recipe-wide setting)"
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => e.stopPropagation()}
                   >
-                    {props.recipeSeedCount()} rows
+                    <input
+                      data-testid="table-header-seed-input"
+                      type="number"
+                      min={1}
+                      max={100}
+                      step={1}
+                      value={seedInputRaw()}
+                      onInput={(e) => commitSeedInput(e.currentTarget.value)}
+                      onBlur={(e) => {
+                        // On blur, reset raw to canonical valid value if current is invalid.
+                        if (!seedInputValid()) setSeedInputRaw(String(props.recipeSeedCount()));
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => e.stopPropagation()}
+                      class={`w-12 bg-[#070c17] border rounded px-1 py-0.5 text-[11px] text-gray-100 text-center focus:outline-none ${seedInputValid() ? "border-gray-800 focus:border-gray-700" : "border-red-500/70 focus:border-red-500"}`}
+                    />
+                    <span class="text-gray-500">rows</span>
+                    <Show when={!seedInputValid()}>
+                      <span class="text-[10px] text-red-400 ml-1">1–100</span>
+                    </Show>
                   </span>
                   <Show when={!isNested()}>
                     <span class="font-mono text-[10px] text-gray-500 truncate max-w-[45%]" title={endpoints().join(", ")}>
@@ -4640,7 +4699,7 @@ function RecipeConfigStep(props: {
                     <span class="text-[10px] text-gray-600 italic">nested</span>
                   </Show>
                   <span class="text-xs text-gray-600 ml-auto">{countParts()}</span>
-                </button>
+                </div>
 
                 <Show when={expandedGroups().has(tableKey())}>
                   <div class="px-2 py-2 space-y-2">
