@@ -4355,6 +4355,27 @@ function RecipeConfigStep(props: {
     return groups;
   });
 
+  // Unified per-def property enumeration — merges scalar + array props from entityGraph.
+  // Each entry: { propName, isArray, propType, format }. Sorted by propName.
+  // Scalar: propType = sp.prop_type, format = sp.format.
+  // Array:  propType = ap.target_def, format = null.
+  const propertiesByDef = createMemo((): Record<string, { propName: string; isArray: boolean; propType: string; format: string | null }[]> => {
+    const groups: Record<string, { propName: string; isArray: boolean; propType: string; format: string | null }[]> = {};
+    const graph = props.entityGraph();
+    for (const sp of graph?.scalar_properties || []) {
+      if (!groups[sp.def_name]) groups[sp.def_name] = [];
+      groups[sp.def_name].push({ propName: sp.prop_name, isArray: false, propType: sp.prop_type, format: sp.format });
+    }
+    for (const ap of graph?.array_properties || []) {
+      if (!groups[ap.def_name]) groups[ap.def_name] = [];
+      groups[ap.def_name].push({ propName: ap.prop_name, isArray: true, propType: ap.target_def, format: null });
+    }
+    for (const def of Object.keys(groups)) {
+      groups[def].sort((a, b) => a.propName.localeCompare(b.propName));
+    }
+    return groups;
+  });
+
   // Per-def faker field rules keyed by definition name, enriched with scalar_properties meta.
   const fieldRulesByDef = createMemo((): Record<string, { key: string; strategy: string; propType: string; format: string | null }[]> => {
     const groups: Record<string, { key: string; strategy: string; propType: string; format: string | null }[]> = {};
@@ -4706,6 +4727,26 @@ function RecipeConfigStep(props: {
               if (q() && !defMatchesQuery() && !i.key.toLowerCase().includes(q())) return false;
               return true;
             });
+            // Unified per-property list (scalar + array) for this def, filtered by
+            // search + changed-only. Props without a rule/config are enumerated when
+            // showNonDefault is off (parent acceptance), hidden when on.
+            const rawProps = () => propertiesByDef()[defName] || [];
+            const visibleProps = () => rawProps().filter(p => {
+              const fieldKey = `${defName}.${p.propName}`;
+              if (showNonDefault()) {
+                if (p.isArray) {
+                  const cfg = props.recipeQuantityConfigs()[fieldKey];
+                  if (!cfg) return false;
+                  if (cfg.min === 1 && cfg.max === 3) return false;
+                } else {
+                  const strat = props.recipeFakerRules()[fieldKey];
+                  if (strat === undefined) return false;
+                  if (strat === "auto") return false;
+                }
+              }
+              if (q() && !defMatchesQuery() && !fieldKey.toLowerCase().includes(q()) && !p.propName.toLowerCase().includes(q())) return false;
+              return true;
+            });
             const scopedConstraints = () => constraintsByDef()[defName] || [];
 
             const tableKey = () => `table:${defName}`;
@@ -4805,66 +4846,55 @@ function RecipeConfigStep(props: {
                       </div>
                     </Show>
 
-                    {/* Array Quantities — inline, no nested collapse */}
-                    <Show when={visibleArrays().length > 0}>
+                    {/* Properties — unified scalar + array enumeration, one row per prop */}
+                    <Show when={visibleProps().length > 0}>
                       <div>
-                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Array Quantities</div>
+                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Properties</div>
                         <div class="space-y-1 ml-2">
-                          <For each={visibleArrays()}>
-                            {(item) => {
-                              const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
+                          <For each={visibleProps()}>
+                            {(prop) => {
+                              const fieldKey = `${defName}.${prop.propName}`;
+                              const fakerStrategy = () => props.recipeFakerRules()[fieldKey];
+                              const arrayConfig = () => props.recipeQuantityConfigs()[fieldKey];
                               return (
-                                <div class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
-                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                  <input type="number" min="0" max="50" value={item.config.min}
-                                    class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                    onInput={(e) => {
-                                      const configs = { ...props.recipeQuantityConfigs() };
-                                      configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
-                                      props.setRecipeQuantityConfigs(configs);
-                                    }} />
-                                  <span class="text-gray-600 text-xs">–</span>
-                                  <input type="number" min="1" max="50" value={item.config.max}
-                                    class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                    onInput={(e) => {
-                                      const configs = { ...props.recipeQuantityConfigs() };
-                                      configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
-                                      props.setRecipeQuantityConfigs(configs);
-                                    }} />
-                                  <span class="text-[10px] text-gray-600 w-10">items</span>
-                                </div>
-                              );
-                            }}
-                          </For>
-                        </div>
-                      </div>
-                    </Show>
-
-                    {/* Field Rules — inline, no nested collapse */}
-                    <Show when={visibleFields().length > 0}>
-                      <div>
-                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Field Rules</div>
-                        <div class="space-y-1 ml-2">
-                          <For each={visibleFields()}>
-                            {(item) => {
-                              const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                              return (
-                                <div class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
-                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
-                                  <select
-                                    value={item.strategy}
-                                    class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                    onChange={(e) => {
-                                      const rules = { ...props.recipeFakerRules() };
-                                      rules[item.key] = e.target.value;
-                                      props.setRecipeFakerRules(rules);
-                                    }}
-                                  >
-                                    <For each={FAKER_STRATEGIES}>
-                                      {(s) => <option value={s}>{s}</option>}
-                                    </For>
-                                  </select>
+                                <div data-testid="property-row" class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
+                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{prop.propName}</span>
+                                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">
+                                    {prop.isArray ? `${prop.propType}[]` : `${prop.propType}${prop.format ? `/${prop.format}` : ""}`}
+                                  </span>
+                                  <Show when={prop.isArray && arrayConfig()}>
+                                    <input type="number" min="0" max="50" value={arrayConfig()!.min}
+                                      class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                      onInput={(e) => {
+                                        const configs = { ...props.recipeQuantityConfigs() };
+                                        configs[fieldKey] = { ...configs[fieldKey], min: parseInt(e.target.value) || 0 };
+                                        props.setRecipeQuantityConfigs(configs);
+                                      }} />
+                                    <span class="text-gray-600 text-xs">–</span>
+                                    <input type="number" min="1" max="50" value={arrayConfig()!.max}
+                                      class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                      onInput={(e) => {
+                                        const configs = { ...props.recipeQuantityConfigs() };
+                                        configs[fieldKey] = { ...configs[fieldKey], max: parseInt(e.target.value) || 3 };
+                                        props.setRecipeQuantityConfigs(configs);
+                                      }} />
+                                    <span class="text-[10px] text-gray-600 w-10">items</span>
+                                  </Show>
+                                  <Show when={!prop.isArray && fakerStrategy() !== undefined}>
+                                    <select
+                                      value={fakerStrategy()}
+                                      class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                      onChange={(e) => {
+                                        const rules = { ...props.recipeFakerRules() };
+                                        rules[fieldKey] = e.target.value;
+                                        props.setRecipeFakerRules(rules);
+                                      }}
+                                    >
+                                      <For each={FAKER_STRATEGIES}>
+                                        {(s) => <option value={s}>{s}</option>}
+                                      </For>
+                                    </select>
+                                  </Show>
                                 </div>
                               );
                             }}
