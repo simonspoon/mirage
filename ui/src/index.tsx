@@ -103,6 +103,7 @@ interface Recipe {
   faker_rules: string;
   rules: string;
   frozen_rows: string;
+  custom_lists: string;
 }
 
 // Recipe rule data model — mirrors the Rust serde tagged union in src/rules.rs.
@@ -250,6 +251,7 @@ function App() {
   const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
   const [recipeFakerRules, setRecipeFakerRules] = createSignal<Record<string, string>>({});
+  const [recipeCustomLists, setRecipeCustomLists] = createSignal<Record<string, string[]>>({});
   const [recipeRules, setRecipeRules] = createSignal<Rule[]>([]);
   const [configSearch, setConfigSearch] = createSignal("");
   const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
@@ -493,6 +495,7 @@ function App() {
           faker_rules: currentConfig.faker_rules || {},
           rules: currentConfig.rules || [],
           frozen_rows: updatedFrozen,
+          custom_lists: currentConfig.custom_lists || {},
         }),
       });
       if (res.ok) {
@@ -726,6 +729,7 @@ function App() {
             quantity_configs: recipeQuantityConfigs(),
             faker_rules: recipeFakerRules(),
             rules: recipeRules(),
+            custom_lists: recipeCustomLists(),
           }),
         });
         if (!res.ok) {
@@ -747,6 +751,7 @@ function App() {
         setRecipeSharedPools({});
         setRecipeQuantityConfigs({});
         setRecipeFakerRules({});
+        setRecipeCustomLists({});
         setRecipeRules([]);
         setEditingRecipeId(null);
         setSaveActivatePhase("idle");
@@ -778,6 +783,7 @@ function App() {
           quantity_configs: recipeQuantityConfigs(),
           faker_rules: recipeFakerRules(),
           rules: recipeRules(),
+          custom_lists: recipeCustomLists(),
         }),
       });
       if (!res.ok) {
@@ -835,6 +841,7 @@ function App() {
       setRecipeSharedPools({});
       setRecipeQuantityConfigs({});
       setRecipeFakerRules({});
+      setRecipeCustomLists({});
       setRecipeRules([]);
       setEntityGraph(null);
       setSavedRecipeId(null);
@@ -947,6 +954,17 @@ function App() {
       try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
       let fakerRules: Record<string, string> = {};
       try { fakerRules = JSON.parse(recipe.faker_rules); } catch { /* empty */ }
+      let customLists: Record<string, string[]> = {};
+      try {
+        const parsed = JSON.parse(recipe.custom_lists ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [name, values] of Object.entries(parsed)) {
+            if (Array.isArray(values)) {
+              customLists[name] = values.map((v) => String(v));
+            }
+          }
+        }
+      } catch { /* empty */ }
       let rules: Rule[] = [];
       try {
         const parsed = JSON.parse(recipe.rules ?? "[]");
@@ -961,6 +979,7 @@ function App() {
       setRecipeSharedPools(sharedPools);
       setRecipeQuantityConfigs(quantityConfigs);
       setRecipeFakerRules(fakerRules);
+      setRecipeCustomLists(customLists);
       setRecipeRules(rules);
       setEditingRecipeId(recipe.id);
       setRecipeStep("select");
@@ -983,6 +1002,7 @@ function App() {
     setRecipeSharedPools({});
     setRecipeQuantityConfigs({});
     setRecipeFakerRules({});
+    setRecipeCustomLists({});
     setRecipeRules([]);
     setEditingRecipeId(null);
     setError(null);
@@ -1971,6 +1991,8 @@ function App() {
                   setRecipeQuantityConfigs={setRecipeQuantityConfigs}
                   recipeFakerRules={recipeFakerRules}
                   setRecipeFakerRules={setRecipeFakerRules}
+                  recipeCustomLists={recipeCustomLists}
+                  setRecipeCustomLists={setRecipeCustomLists}
                   recipeRules={recipeRules}
                   setRecipeRules={setRecipeRules}
                   recipeSeedCount={recipeSeedCount}
@@ -4289,6 +4311,8 @@ function RecipeConfigStep(props: {
   setRecipeQuantityConfigs: Setter<Record<string, { min: number; max: number }>>;
   recipeFakerRules: Accessor<Record<string, string>>;
   setRecipeFakerRules: Setter<Record<string, string>>;
+  recipeCustomLists: Accessor<Record<string, string[]>>;
+  setRecipeCustomLists: Setter<Record<string, string[]>>;
   recipeRules: Accessor<Rule[]>;
   setRecipeRules: Setter<Rule[]>;
   recipeSeedCount: Accessor<number>;
@@ -4303,7 +4327,92 @@ function RecipeConfigStep(props: {
   const hasConfigs = () => Object.keys(props.recipeQuantityConfigs()).length > 0;
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
 
-  const FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
+  const BUILTIN_FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
+  // Derived faker strategy list: custom list names prepended so they shadow built-ins on collision.
+  // Set-dedupe preserves first occurrence, so a custom list named "email" keeps the custom entry.
+  const fakerStrategies = createMemo((): string[] => {
+    const set = new Set<string>();
+    for (const name of Object.keys(props.recipeCustomLists())) set.add(name);
+    for (const s of BUILTIN_FAKER_STRATEGIES) set.add(s);
+    return [...set];
+  });
+
+  // Custom-lists panel state.
+  const [customListsExpanded, setCustomListsExpanded] = createSignal(false);
+  const [newListName, setNewListName] = createSignal("");
+  const [newListValuesText, setNewListValuesText] = createSignal("");
+  const [customListsError, setCustomListsError] = createSignal("");
+  // Raw buffers per-list for textarea two-way sync without destroying in-progress typing.
+  const [listBuffers, setListBuffers] = createSignal<Record<string, string>>({});
+
+  const parseValuesBlob = (text: string): string[] =>
+    text.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+
+  const getListBuffer = (name: string): string => {
+    const b = listBuffers()[name];
+    if (b !== undefined) return b;
+    return (props.recipeCustomLists()[name] || []).join("\n");
+  };
+  const setListBufferFor = (name: string, text: string) => {
+    setListBuffers({ ...listBuffers(), [name]: text });
+  };
+  const commitListBuffer = (name: string) => {
+    const b = listBuffers()[name];
+    if (b === undefined) return;
+    const values = parseValuesBlob(b);
+    if (values.length === 0) {
+      // Empty after parse — revert buffer to last-saved value; do not silently delete the list.
+      const buf = { ...listBuffers() };
+      delete buf[name];
+      setListBuffers(buf);
+      setCustomListsError(`list "${name}" cannot be empty — reverted`);
+      return;
+    }
+    props.setRecipeCustomLists({ ...props.recipeCustomLists(), [name]: values });
+    const buf = { ...listBuffers() };
+    delete buf[name];
+    setListBuffers(buf);
+    setCustomListsError("");
+  };
+
+  const handleAddList = () => {
+    const name = newListName().trim();
+    if (!name) {
+      setCustomListsError("list name required");
+      return;
+    }
+    const values = parseValuesBlob(newListValuesText());
+    if (values.length === 0) {
+      setCustomListsError("list cannot be empty");
+      return;
+    }
+    const existing = props.recipeCustomLists();
+    if (Object.prototype.hasOwnProperty.call(existing, name)) {
+      setCustomListsError("list name already used");
+      return;
+    }
+    props.setRecipeCustomLists({ ...existing, [name]: values });
+    setNewListName("");
+    setNewListValuesText("");
+    setCustomListsError("");
+  };
+
+  const handleDeleteList = (name: string) => {
+    const next = { ...props.recipeCustomLists() };
+    delete next[name];
+    props.setRecipeCustomLists(next);
+    const buf = { ...listBuffers() };
+    delete buf[name];
+    setListBuffers(buf);
+    setCustomListsError("");
+  };
+
+  const handlePasteBlob = () => {
+    const parsed = parseValuesBlob(newListValuesText());
+    setNewListValuesText(parsed.join("\n"));
+  };
+
+  const customListNames = createMemo((): string[] => Object.keys(props.recipeCustomLists()).sort());
 
   // All table (definition) names with at least one rule/pool/config/constraint attached.
   const allDefinitions = createMemo((): string[] => {
@@ -4573,6 +4682,113 @@ function RecipeConfigStep(props: {
         />
       </Show>
 
+      {/* Custom lists panel — recipe-scoped named string lists usable as faker strategies. */}
+      <div class="mb-4 rounded-md border border-gray-800/50">
+        <div
+          data-testid="custom-lists-header"
+          role="button"
+          tabIndex={0}
+          class="w-full flex items-center gap-2 px-3 py-2 bg-purple-900/20 hover:bg-purple-900/30 text-sm text-purple-200 transition-colors cursor-pointer"
+          onClick={() => setCustomListsExpanded(!customListsExpanded())}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setCustomListsExpanded(!customListsExpanded());
+            }
+          }}
+        >
+          <span class={`text-[10px] text-purple-300 transition-transform ${customListsExpanded() ? "rotate-90" : ""}`}>&#9654;</span>
+          <span class="font-medium">Custom lists</span>
+          <span class="text-[10px] text-gray-400">
+            {customListNames().length === 0 ? "none" : `${customListNames().length} defined`}
+          </span>
+        </div>
+        <Show when={customListsExpanded()}>
+          <div data-testid="custom-lists-body" class="px-3 py-3 bg-[#070c17] space-y-3">
+            <p class="text-[11px] text-gray-500">
+              Named lists of string values scoped to this recipe. List names appear in every field's faker-strategy selector and shadow built-ins on collision.
+            </p>
+
+            {/* Existing lists */}
+            <Show when={customListNames().length > 0}>
+              <div class="space-y-2">
+                <For each={customListNames()}>
+                  {(name) => (
+                    <div data-testid="custom-list-row" class="rounded border border-gray-800/60 bg-[#0a101d] p-2">
+                      <div class="flex items-center justify-between mb-1">
+                        <span data-testid="custom-list-name" class="font-mono text-xs text-purple-200">{name}</span>
+                        <button
+                          type="button"
+                          data-testid="custom-list-delete"
+                          class="text-[10px] text-red-400 hover:text-red-300 px-2 py-0.5 border border-red-900/50 rounded"
+                          onClick={() => handleDeleteList(name)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                      <textarea
+                        data-testid="custom-list-values"
+                        class="w-full bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs font-mono text-gray-100 focus:outline-none focus:border-gray-700"
+                        rows={Math.min(8, Math.max(2, (props.recipeCustomLists()[name] || []).length))}
+                        placeholder="one value per line"
+                        value={getListBuffer(name)}
+                        onInput={(e) => setListBufferFor(name, e.currentTarget.value)}
+                        onBlur={() => commitListBuffer(name)}
+                      />
+                      <p class="text-[10px] text-gray-600 mt-0.5">
+                        {(props.recipeCustomLists()[name] || []).length} values · edits commit on blur
+                      </p>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+
+            {/* Add-list form */}
+            <div data-testid="custom-list-add" class="rounded border border-gray-800/60 bg-[#0a101d] p-2 space-y-1.5">
+              <div class="flex items-center gap-2">
+                <input
+                  type="text"
+                  data-testid="custom-list-new-name"
+                  placeholder="list name"
+                  value={newListName()}
+                  onInput={(e) => setNewListName(e.currentTarget.value)}
+                  class="flex-1 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700"
+                />
+                <button
+                  type="button"
+                  data-testid="custom-list-paste-blob"
+                  class="text-[10px] text-gray-300 hover:text-white px-2 py-1 border border-gray-700 rounded"
+                  onClick={handlePasteBlob}
+                >
+                  Paste blob
+                </button>
+                <button
+                  type="button"
+                  data-testid="custom-list-add-submit"
+                  class="text-[10px] text-white bg-purple-700 hover:bg-purple-600 px-3 py-1 rounded"
+                  onClick={handleAddList}
+                >
+                  Add list
+                </button>
+              </div>
+              <textarea
+                data-testid="custom-list-new-values"
+                placeholder="one value per line, or paste a comma/newline blob and click Paste blob"
+                rows={3}
+                value={newListValuesText()}
+                onInput={(e) => setNewListValuesText(e.currentTarget.value)}
+                class="w-full bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs font-mono text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700"
+              />
+            </div>
+
+            <Show when={customListsError() !== ""}>
+              <p data-testid="custom-lists-error" class="text-[11px] text-red-400">{customListsError()}</p>
+            </Show>
+          </div>
+        </Show>
+      </div>
+
       {/* Endpoint chip filter — select one or more endpoints to narrow table list */}
       <Show when={hasAnything() && allEndpointLabels().length > 0}>
         <div class="mb-4">
@@ -4689,7 +4905,7 @@ function RecipeConfigStep(props: {
                 }}
               >
                 <option value="">--</option>
-                <For each={FAKER_STRATEGIES}>
+                <For each={fakerStrategies()}>
                   {(s) => <option value={s}>{s}</option>}
                 </For>
               </select>
@@ -4930,7 +5146,7 @@ function RecipeConfigStep(props: {
                                           props.setRecipeFakerRules(rules);
                                         }}
                                       >
-                                        <For each={FAKER_STRATEGIES}>
+                                        <For each={fakerStrategies()}>
                                           {(s) => <option value={s}>{s}</option>}
                                         </For>
                                       </select>
