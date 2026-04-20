@@ -3593,6 +3593,32 @@ function SchemasPage(props: {
                       animatePanZoom(target.zoom, target.panX, target.panY);
                     });
 
+                    // Re-fit camera on expand/collapse. Tracks ONLY
+                    // props.graphExpanded(); dagLayout/svg dims/widthOf
+                    // read via untrack so the effect does not re-subscribe
+                    // to its own downstream writes. Skips on mount (no
+                    // double-fit with initial paint) and when focus is
+                    // empty (no subgraph to frame). Fit button (fitGraph)
+                    // does not write graphExpanded, so its instant snap
+                    // is preserved.
+                    let firstExpandFit = true;
+                    createEffect(() => {
+                      props.graphExpanded(); // track
+                      if (firstExpandFit) { firstExpandFit = false; return; }
+                      if (untrack(() => focusSet().length) === 0) return;
+                      const target = untrack(() => {
+                        if (!svgEl) return null;
+                        return computeFitTransform(
+                          dagLayout().positions,
+                          widthOf,
+                          heightOf,
+                          { width: svgEl.clientWidth, height: svgEl.clientHeight },
+                        );
+                      });
+                      if (!target) return;
+                      animatePanZoom(target.zoom, target.panX, target.panY);
+                    });
+
                     return (
                       <div class="flex-1 min-h-0 flex flex-col overflow-hidden">
                         <div class="flex items-center justify-between gap-1 mb-1 shrink-0">
