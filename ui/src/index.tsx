@@ -1973,6 +1973,7 @@ function App() {
                   setRecipeFakerRules={setRecipeFakerRules}
                   recipeRules={recipeRules}
                   setRecipeRules={setRecipeRules}
+                  recipeSeedCount={recipeSeedCount}
                   entityGraph={entityGraph}
                   configSearch={configSearch}
                   setConfigSearch={setConfigSearch}
@@ -4289,6 +4290,7 @@ function RecipeConfigStep(props: {
   setRecipeFakerRules: Setter<Record<string, string>>;
   recipeRules: Accessor<Rule[]>;
   setRecipeRules: Setter<Rule[]>;
+  recipeSeedCount: Accessor<number>;
   entityGraph: Accessor<any>;
   configSearch: Accessor<string>;
   setConfigSearch: Setter<string>;
@@ -4299,114 +4301,45 @@ function RecipeConfigStep(props: {
   const hasConfigs = () => Object.keys(props.recipeQuantityConfigs()).length > 0;
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
 
-  // Invert graph.roots: defName→endpoints[] into endpointLabel→defNames[]
-  // Classify definitions into single-endpoint, shared, or nested buckets
-  type EndpointBucket = { label: string; defs: string[] };
-  const endpointBuckets = createMemo((): EndpointBucket[] => {
-    const graph = props.entityGraph();
-    const roots: Record<string, { method: string; path: string }[]> = graph?.roots || {};
-    const epToDefs: Record<string, Set<string>> = {};
-    const defToEps: Record<string, string[]> = {};
+  const FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
 
-    for (const [defName, eps] of Object.entries(roots)) {
-      for (const ep of eps) {
-        const label = `${ep.method.toUpperCase()} ${ep.path}`;
-        if (!epToDefs[label]) epToDefs[label] = new Set();
-        epToDefs[label].add(defName);
-        if (!defToEps[defName]) defToEps[defName] = [];
-        defToEps[defName].push(label);
-      }
-    }
-
-    // Collect all known definition names across pools, configs, faker rules
-    const allDefs = new Set<string>();
-    for (const name of Object.keys(props.recipeSharedPools())) allDefs.add(name);
+  // All table (definition) names with at least one rule/pool/config/constraint attached.
+  const allDefinitions = createMemo((): string[] => {
+    const set = new Set<string>();
+    for (const name of Object.keys(props.recipeSharedPools())) set.add(name);
     for (const key of Object.keys(props.recipeQuantityConfigs())) {
       const dot = key.indexOf(".");
-      allDefs.add(dot >= 0 ? key.slice(0, dot) : key);
+      set.add(dot >= 0 ? key.slice(0, dot) : key);
     }
     for (const key of Object.keys(props.recipeFakerRules())) {
       const dot = key.indexOf(".");
-      allDefs.add(dot >= 0 ? key.slice(0, dot) : key);
+      set.add(dot >= 0 ? key.slice(0, dot) : key);
     }
-
-    // Sort endpoint labels by path then method
-    const sortedLabels = Object.keys(epToDefs).sort((a, b) => {
-      const [am, ...ap] = a.split(" ");
-      const [bm, ...bp] = b.split(" ");
-      const pathCmp = ap.join(" ").localeCompare(bp.join(" "));
-      return pathCmp !== 0 ? pathCmp : am.localeCompare(bm);
-    });
-
-    const buckets: EndpointBucket[] = [];
-    const assignedSingle = new Set<string>();
-    const sharedDefs = new Set<string>();
-
-    // Single-endpoint roots go under their endpoint
-    for (const label of sortedLabels) {
-      const defs: string[] = [];
-      for (const d of epToDefs[label]) {
-        if ((defToEps[d] || []).length === 1) {
-          defs.push(d);
-          assignedSingle.add(d);
-        } else {
-          sharedDefs.add(d);
-        }
-      }
-      if (defs.length > 0) {
-        buckets.push({ label, defs: defs.sort() });
-      }
+    for (const r of props.recipeRules()) {
+      const fieldPath = r.kind === "compare"
+        ? (r as CompareRule).left
+        : (r as Exclude<Rule, CompareRule>).field;
+      const dot = typeof fieldPath === "string" ? fieldPath.indexOf(".") : -1;
+      if (dot > 0) set.add((fieldPath as string).slice(0, dot));
     }
-
-    // Shared bucket: definitions that appear in 2+ endpoints
-    const sharedArr = [...sharedDefs].sort();
-    if (sharedArr.length > 0) {
-      buckets.push({ label: "Shared", defs: sharedArr });
-    }
-
-    // Nested bucket: definitions not in roots at all
-    const nestedDefs = [...allDefs].filter(d => !assignedSingle.has(d) && !sharedDefs.has(d)).sort();
-    if (nestedDefs.length > 0) {
-      buckets.push({ label: "Nested", defs: nestedDefs });
-    }
-
-    return buckets;
+    return [...set].sort();
   });
 
-  // Map from defName to its bucket label (for search matching)
-  const defToBucket = createMemo((): Record<string, string> => {
-    const map: Record<string, string> = {};
-    for (const bucket of endpointBuckets()) {
-      for (const d of bucket.defs) {
-        map[d] = bucket.label;
-      }
+  // Map def -> endpoint labels (from graph.roots) for header badge + search.
+  const defToEndpoints = createMemo((): Record<string, string[]> => {
+    const graph = props.entityGraph();
+    const roots: Record<string, { method: string; path: string }[]> = graph?.roots || {};
+    const map: Record<string, string[]> = {};
+    for (const [defName, eps] of Object.entries(roots)) {
+      map[defName] = eps
+        .map(ep => `${ep.method.toUpperCase()} ${ep.path}`)
+        .sort();
     }
     return map;
   });
 
-  // Virtual buckets: unmapped endpoints with non-$ref response shapes
-  type VirtualBucket = { label: string; shape_label: string };
-  const virtualBuckets = createMemo((): VirtualBucket[] => {
-    const graph = props.entityGraph();
-    const vrs: { endpoint: { method: string; path: string }; shape: string }[] = graph?.virtual_roots || [];
-    const existingLabels = new Set(endpointBuckets().map(b => b.label));
-    return vrs
-      .map(vr => ({ label: `${vr.endpoint.method.toUpperCase()} ${vr.endpoint.path}`, shape_label: vr.shape }))
-      .filter(vb => !existingLabels.has(vb.label));
-  });
-
-  const hasAnything = () => hasPools() || hasConfigs() || hasRules() || virtualBuckets().length > 0;
-
-  const filteredVirtualBuckets = createMemo((): VirtualBucket[] => {
-    const q = props.configSearch().toLowerCase();
-    if (!q) return virtualBuckets();
-    return virtualBuckets().filter(vb =>
-      vb.label.toLowerCase().includes(q) || vb.shape_label.toLowerCase().includes(q)
-    );
-  });
-
-  // Group array quantity configs by entity (part before the dot)
-  const groupedConfigs = () => {
+  // Per-def array quantity configs keyed by definition name.
+  const arrayConfigsByDef = createMemo((): Record<string, { key: string; config: { min: number; max: number } }[]> => {
     const groups: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
     for (const [key, config] of Object.entries(props.recipeQuantityConfigs())) {
       const dot = key.indexOf(".");
@@ -4414,83 +4347,14 @@ function RecipeConfigStep(props: {
       if (!groups[entity]) groups[entity] = [];
       groups[entity].push({ key, config });
     }
+    for (const entity of Object.keys(groups)) {
+      groups[entity].sort((a, b) => a.key.localeCompare(b.key));
+    }
     return groups;
-  };
+  });
 
-  // Check if search query matches an endpoint bucket label
-  const bucketMatchesSearch = (bucketLabel: string, q: string): boolean => {
-    if (!q) return true;
-    return bucketLabel.toLowerCase().includes(q);
-  };
-
-  // Filter by search — also match endpoint paths
-  const filteredPools = () => {
-    const q = props.configSearch().toLowerCase();
-    const entries = Object.entries(props.recipeSharedPools());
-    const filtered = q ? entries.filter(([e]) => {
-      const bucket = defToBucket()[e] || "";
-      return e.toLowerCase().includes(q) || bucket.toLowerCase().includes(q);
-    }) : entries;
-    if (props.configShowNonDefault()) return filtered.filter(([_, c]) => !c.is_shared || c.pool_size !== 10);
-    return filtered;
-  };
-
-  // Group filtered pools by endpoint bucket
-  const poolsByBucket = () => {
-    const pools = filteredPools();
-    const poolMap = new Map(pools);
-    const buckets = endpointBuckets();
-    const result: { label: string; pools: [string, { is_shared: boolean; pool_size: number }][] }[] = [];
-    for (const bucket of buckets) {
-      const bucketPools: [string, { is_shared: boolean; pool_size: number }][] = [];
-      for (const def of bucket.defs) {
-        if (poolMap.has(def)) {
-          bucketPools.push([def, poolMap.get(def)!]);
-        }
-      }
-      if (bucketPools.length > 0) {
-        result.push({ label: bucket.label, pools: bucketPools });
-      }
-    }
-    return result;
-  };
-
-  const filteredConfigGroups = () => {
-    const q = props.configSearch().toLowerCase();
-    const groups = groupedConfigs();
-    const result: Record<string, { key: string; config: { min: number; max: number } }[]> = {};
-    for (const [entity, items] of Object.entries(groups)) {
-      const bucket = defToBucket()[entity] || "";
-      const matchesBucket = bucketMatchesSearch(bucket, q);
-      const matching = items.filter(i => !q || matchesBucket || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
-      const visible = props.configShowNonDefault() ? matching.filter(i => i.config.min !== 1 || i.config.max !== 3) : matching;
-      if (visible.length > 0) result[entity] = visible;
-    }
-    return result;
-  };
-
-  // Group filtered config groups by endpoint bucket
-  const configsByBucket = () => {
-    const configs = filteredConfigGroups();
-    const buckets = endpointBuckets();
-    const result: { label: string; entities: [string, { key: string; config: { min: number; max: number } }[]][] }[] = [];
-    for (const bucket of buckets) {
-      const entities: [string, { key: string; config: { min: number; max: number } }[]][] = [];
-      for (const def of bucket.defs) {
-        if (configs[def]) {
-          entities.push([def, configs[def]]);
-        }
-      }
-      if (entities.length > 0) {
-        result.push({ label: bucket.label, entities });
-      }
-    }
-    return result;
-  };
-
-  const FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
-
-  const groupedRules = () => {
+  // Per-def faker field rules keyed by definition name, enriched with scalar_properties meta.
+  const fieldRulesByDef = createMemo((): Record<string, { key: string; strategy: string; propType: string; format: string | null }[]> => {
     const groups: Record<string, { key: string; strategy: string; propType: string; format: string | null }[]> = {};
     const graph = props.entityGraph();
     const scalarMap: Record<string, { prop_type: string; format: string | null }> = {};
@@ -4504,105 +4368,84 @@ function RecipeConfigStep(props: {
       const meta = scalarMap[key] || { prop_type: "string", format: null };
       groups[entity].push({ key, strategy, propType: meta.prop_type, format: meta.format });
     }
+    for (const entity of Object.keys(groups)) {
+      groups[entity].sort((a, b) => a.key.localeCompare(b.key));
+    }
     return groups;
-  };
-
-  const filteredRuleGroups = () => {
-    const q = props.configSearch().toLowerCase();
-    const groups = groupedRules();
-    const result: typeof groups = {};
-    for (const [entity, items] of Object.entries(groups)) {
-      const bucket = defToBucket()[entity] || "";
-      const matchesBucket = bucketMatchesSearch(bucket, q);
-      const matching = items.filter(i => !q || matchesBucket || i.key.toLowerCase().includes(q) || entity.toLowerCase().includes(q));
-      const visible = props.configShowNonDefault() ? matching.filter(i => i.strategy !== "auto") : matching;
-      if (visible.length > 0) result[entity] = visible;
-    }
-    return result;
-  };
-
-  // Group filtered rule groups by endpoint bucket
-  const rulesByBucket = () => {
-    const rules = filteredRuleGroups();
-    const buckets = endpointBuckets();
-    const result: { label: string; entities: [string, { key: string; strategy: string; propType: string; format: string | null }[]][] }[] = [];
-    for (const bucket of buckets) {
-      const entities: [string, { key: string; strategy: string; propType: string; format: string | null }[]][] = [];
-      for (const def of bucket.defs) {
-        if (rules[def]) {
-          entities.push([def, rules[def]]);
-        }
-      }
-      if (entities.length > 0) {
-        result.push({ label: bucket.label, entities });
-      }
-    }
-    return result;
-  };
-
-  // Indexed lookups: bucket label → data for O(1) access in endpoint-first rendering
-  const poolsByLabel = createMemo((): Record<string, [string, { is_shared: boolean; pool_size: number }][]> => {
-    const map: Record<string, [string, { is_shared: boolean; pool_size: number }][]> = {};
-    for (const b of poolsByBucket()) map[b.label] = b.pools;
-    return map;
   });
 
-  const configsByLabel = createMemo((): Record<string, [string, { key: string; config: { min: number; max: number } }[]][]> => {
-    const map: Record<string, [string, { key: string; config: { min: number; max: number } }[]][]> = {};
-    for (const b of configsByBucket()) map[b.label] = b.entities;
-    return map;
-  });
-
-  const rulesByLabel = createMemo((): Record<string, [string, { key: string; strategy: string; propType: string; format: string | null }[]][]> => {
-    const map: Record<string, [string, { key: string; strategy: string; propType: string; format: string | null }[]][]> = {};
-    for (const b of rulesByBucket()) map[b.label] = b.entities;
-    return map;
-  });
-
-  // Bucket constraint rules (recipeRules) by endpoint, preserving global indices for mutations
-  const constraintsByBucket = createMemo((): { label: string; rules: { rule: Rule; globalIndex: number }[] }[] => {
-    const allRules = props.recipeRules();
-    const dtb = defToBucket();
-    const buckets = endpointBuckets();
-    // Build a map: bucket label → entries
-    const bucketMap: Record<string, { rule: Rule; globalIndex: number }[]> = {};
-    for (let i = 0; i < allRules.length; i++) {
-      const rule = allRules[i];
-      const defName = rule.kind === "compare"
-        ? (rule as CompareRule).left.split(".")[0]
-        : (rule as Exclude<Rule, CompareRule>).field.split(".")[0];
-      const bucketLabel = dtb[defName] || "Shared";
-      if (!bucketMap[bucketLabel]) bucketMap[bucketLabel] = [];
-      bucketMap[bucketLabel].push({ rule, globalIndex: i });
-    }
-    const result: { label: string; rules: { rule: Rule; globalIndex: number }[] }[] = [];
-    for (const bucket of buckets) {
-      if (bucketMap[bucket.label]) {
-        result.push({ label: bucket.label, rules: bucketMap[bucket.label] });
-      }
-    }
-    // Include rules for labels not matched to any bucket (fallback to Shared)
-    if (bucketMap["Shared"] && !result.some(r => r.label === "Shared")) {
-      result.push({ label: "Shared", rules: bucketMap["Shared"] });
-    }
-    return result;
-  });
-
-  const constraintsByLabel = createMemo((): Record<string, { rule: Rule; globalIndex: number }[]> => {
+  // Per-def constraint rules (with global index preserved for mutations).
+  const constraintsByDef = createMemo((): Record<string, { rule: Rule; globalIndex: number }[]> => {
+    const all = props.recipeRules();
     const map: Record<string, { rule: Rule; globalIndex: number }[]> = {};
-    for (const b of constraintsByBucket()) map[b.label] = b.rules;
+    for (let i = 0; i < all.length; i++) {
+      const rule = all[i];
+      const fieldPath = rule.kind === "compare"
+        ? (rule as CompareRule).left
+        : (rule as Exclude<Rule, CompareRule>).field;
+      if (typeof fieldPath !== "string") continue;
+      const dot = fieldPath.indexOf(".");
+      const defName = dot > 0 ? fieldPath.slice(0, dot) : "";
+      if (!defName) continue;
+      if (!map[defName]) map[defName] = [];
+      map[defName].push({ rule, globalIndex: i });
+    }
     return map;
   });
 
-  // Combined list of endpoint labels that have any visible data
-  const activeEndpoints = createMemo((): string[] => {
-    const pools = poolsByLabel();
-    const configs = configsByLabel();
-    const rules = rulesByLabel();
-    const constraints = constraintsByLabel();
-    return endpointBuckets()
-      .map(b => b.label)
-      .filter(label => (pools[label]?.length ?? 0) > 0 || (configs[label]?.length ?? 0) > 0 || (rules[label]?.length ?? 0) > 0 || (constraints[label]?.length ?? 0) > 0);
+  // Virtual buckets: endpoints with non-$ref response shapes (no definition attached).
+  type VirtualBucket = { label: string; shape_label: string };
+  const virtualBuckets = createMemo((): VirtualBucket[] => {
+    const graph = props.entityGraph();
+    const vrs: { endpoint: { method: string; path: string }; shape: string }[] = graph?.virtual_roots || [];
+    const rooted = new Set<string>();
+    const roots: Record<string, { method: string; path: string }[]> = graph?.roots || {};
+    for (const eps of Object.values(roots)) {
+      for (const ep of eps) rooted.add(`${ep.method.toUpperCase()} ${ep.path}`);
+    }
+    return vrs
+      .map(vr => ({ label: `${vr.endpoint.method.toUpperCase()} ${vr.endpoint.path}`, shape_label: vr.shape }))
+      .filter(vb => !rooted.has(vb.label));
+  });
+
+  const hasAnything = () => hasPools() || hasConfigs() || hasRules() || props.recipeRules().length > 0 || virtualBuckets().length > 0;
+
+  const filteredVirtualBuckets = createMemo((): VirtualBucket[] => {
+    const q = props.configSearch().toLowerCase();
+    if (!q) return virtualBuckets();
+    return virtualBuckets().filter(vb =>
+      vb.label.toLowerCase().includes(q) || vb.shape_label.toLowerCase().includes(q)
+    );
+  });
+
+  // Decide which tables render given search + changed-only filters.
+  const activeTables = createMemo((): string[] => {
+    const q = props.configSearch().toLowerCase();
+    const showNonDefault = props.configShowNonDefault();
+    const pools = props.recipeSharedPools();
+    const arrays = arrayConfigsByDef();
+    const fields = fieldRulesByDef();
+    const constraints = constraintsByDef();
+    const d2e = defToEndpoints();
+    return allDefinitions().filter(def => {
+      // Search: match def name, any endpoint label for the def, or any prop key.
+      if (q) {
+        const defMatch = def.toLowerCase().includes(q);
+        const epMatch = (d2e[def] || []).some(ep => ep.toLowerCase().includes(q));
+        const arrMatch = (arrays[def] || []).some(i => i.key.toLowerCase().includes(q));
+        const fldMatch = (fields[def] || []).some(i => i.key.toLowerCase().includes(q));
+        if (!defMatch && !epMatch && !arrMatch && !fldMatch) return false;
+      }
+      if (showNonDefault) {
+        const p = pools[def];
+        const poolChanged = !!p && (!p.is_shared || p.pool_size !== 10);
+        const arrayChanged = (arrays[def] || []).some(i => i.config.min !== 1 || i.config.max !== 3);
+        const fieldChanged = (fields[def] || []).some(i => i.strategy !== "auto");
+        const hasConstraints = (constraints[def] || []).length > 0;
+        if (!poolChanged && !arrayChanged && !fieldChanged && !hasConstraints) return false;
+      }
+      return true;
+    });
   });
 
   // Collapsed state for endpoint and entity groups
@@ -4730,120 +4573,132 @@ function RecipeConfigStep(props: {
         </div>
       </Show>
 
-      {/* Endpoint-first groups */}
+      {/* Table-first groups — one block per definition with inline per-property config */}
       <div class="space-y-3">
-        <For each={activeEndpoints()}>
-          {(label) => {
-            const epPools = () => poolsByLabel()[label] || [];
-            const epConfigs = () => configsByLabel()[label] || [];
-            const epRules = () => rulesByLabel()[label] || [];
-            const epConstraints = () => constraintsByLabel()[label] || [];
-            const epBucket = () => endpointBuckets().find(b => b.label === label);
-            const epKey = () => `ep:${label}`;
+        <For each={activeTables()}>
+          {(defName) => {
+            const q = () => props.configSearch().toLowerCase();
+            const showNonDefault = () => props.configShowNonDefault();
+            const rawPool = () => props.recipeSharedPools()[defName];
+            const rawArrays = () => arrayConfigsByDef()[defName] || [];
+            const rawFields = () => fieldRulesByDef()[defName] || [];
+            const endpoints = () => defToEndpoints()[defName] || [];
+            const isNested = () => endpoints().length === 0;
+            const defMatchesQuery = () => !q() || defName.toLowerCase().includes(q()) || endpoints().some(e => e.toLowerCase().includes(q()));
+
+            const visiblePool = () => {
+              const p = rawPool();
+              if (!p) return null;
+              if (showNonDefault() && p.is_shared && p.pool_size === 10) return null;
+              return p;
+            };
+            const visibleArrays = () => rawArrays().filter(i => {
+              if (showNonDefault() && i.config.min === 1 && i.config.max === 3) return false;
+              if (q() && !defMatchesQuery() && !i.key.toLowerCase().includes(q())) return false;
+              return true;
+            });
+            const visibleFields = () => rawFields().filter(i => {
+              if (showNonDefault() && i.strategy === "auto") return false;
+              if (q() && !defMatchesQuery() && !i.key.toLowerCase().includes(q())) return false;
+              return true;
+            });
+            const scopedConstraints = () => constraintsByDef()[defName] || [];
+
+            const tableKey = () => `table:${defName}`;
+
+            const countParts = () => {
+              const parts: string[] = [];
+              if (visiblePool()) parts.push("1 pool");
+              if (visibleArrays().length > 0) parts.push(`${visibleArrays().length} arrays`);
+              if (visibleFields().length > 0) parts.push(`${visibleFields().length} rules`);
+              if (scopedConstraints().length > 0) parts.push(`${scopedConstraints().length} constraints`);
+              return parts.join(" · ");
+            };
 
             return (
               <div class="rounded-md overflow-hidden border border-gray-800/50">
-                {/* Endpoint header */}
+                {/* Table header */}
                 <button
-                  data-testid="endpoint-group-header"
+                  data-testid="table-group-header"
                   class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors"
-                  onClick={() => toggleGroup(epKey())}
+                  onClick={() => toggleGroup(tableKey())}
                 >
-                  <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(epKey()) ? "" : "rotate-90"}`}>&#9654;</span>
-                  <span class="font-mono text-xs">{label}</span>
-                  <span class="text-xs text-gray-600 ml-auto">
-                    {epPools().length > 0 ? `${epPools().length} pools` : ""}
-                    {epPools().length > 0 && (epConfigs().length > 0 || epRules().length > 0 || epConstraints().length > 0) ? " · " : ""}
-                    {epConfigs().length > 0 ? `${epConfigs().reduce((n, [, items]) => n + items.length, 0)} arrays` : ""}
-                    {epConfigs().length > 0 && (epRules().length > 0 || epConstraints().length > 0) ? " · " : ""}
-                    {epRules().length > 0 ? `${epRules().reduce((n, [, items]) => n + items.length, 0)} rules` : ""}
-                    {epRules().length > 0 && epConstraints().length > 0 ? " · " : ""}
-                    {epConstraints().length > 0 ? `${epConstraints().length} constraints` : ""}
+                  <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(tableKey()) ? "" : "rotate-90"}`}>&#9654;</span>
+                  <span class="font-medium text-blue-200">{defName}</span>
+                  <span
+                    class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800/60 text-gray-400 font-normal"
+                    title="Rows seeded per table (recipe-wide setting)"
+                  >
+                    {props.recipeSeedCount()} rows
                   </span>
+                  <Show when={!isNested()}>
+                    <span class="font-mono text-[10px] text-gray-500 truncate max-w-[45%]" title={endpoints().join(", ")}>
+                      {endpoints().join(", ")}
+                    </span>
+                  </Show>
+                  <Show when={isNested()}>
+                    <span class="text-[10px] text-gray-600 italic">nested</span>
+                  </Show>
+                  <span class="text-xs text-gray-600 ml-auto">{countParts()}</span>
                 </button>
 
-                <Show when={!collapsedGroups().has(epKey())}>
+                <Show when={!collapsedGroups().has(tableKey())}>
                   <div class="px-2 py-2 space-y-2">
 
-                    {/* Pools sub-section */}
-                    <Show when={epPools().length > 0}>
+                    {/* Shared Pool */}
+                    <Show when={visiblePool() !== null}>
                       <div>
-                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Shared Pools</div>
-                        <div class="space-y-1">
-                          <For each={epPools()}>
-                            {([entity, config]) => (
-                              <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-2">
-                                <input type="checkbox" checked={config.is_shared}
-                                  class="accent-blue-500 rounded"
-                                  onChange={(e) => {
-                                    const pools = { ...props.recipeSharedPools() };
-                                    pools[entity] = { ...pools[entity], is_shared: e.target.checked };
-                                    props.setRecipeSharedPools(pools);
-                                  }} />
-                                <span class="text-sm text-gray-200 flex-1 truncate">{entity}</span>
-                                <input type="number" min="1" max="100" value={config.pool_size}
-                                  class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                  onInput={(e) => {
-                                    const pools = { ...props.recipeSharedPools() };
-                                    pools[entity] = { ...pools[entity], pool_size: parseInt(e.target.value) || 10 };
-                                    props.setRecipeSharedPools(pools);
-                                  }} />
-                                <span class="text-xs text-gray-600 w-14">instances</span>
-                              </div>
-                            )}
-                          </For>
+                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Shared Pool</div>
+                        <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-2">
+                          <input type="checkbox" checked={visiblePool()!.is_shared}
+                            class="accent-blue-500 rounded"
+                            onChange={(e) => {
+                              const pools = { ...props.recipeSharedPools() };
+                              pools[defName] = { ...pools[defName], is_shared: e.target.checked };
+                              props.setRecipeSharedPools(pools);
+                            }} />
+                          <span class="text-xs text-gray-500 flex-1">
+                            {visiblePool()!.is_shared ? "Shared across endpoints" : "Unique per endpoint"}
+                          </span>
+                          <input type="number" min="1" max="100" value={visiblePool()!.pool_size}
+                            class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                            onInput={(e) => {
+                              const pools = { ...props.recipeSharedPools() };
+                              pools[defName] = { ...pools[defName], pool_size: parseInt(e.target.value) || 10 };
+                              props.setRecipeSharedPools(pools);
+                            }} />
+                          <span class="text-xs text-gray-600 w-14">instances</span>
                         </div>
                       </div>
                     </Show>
 
-                    {/* Arrays sub-section */}
-                    <Show when={epConfigs().length > 0}>
+                    {/* Array Quantities — inline, no nested collapse */}
+                    <Show when={visibleArrays().length > 0}>
                       <div>
                         <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Array Quantities</div>
                         <div class="space-y-1 ml-2">
-                          <For each={epConfigs()}>
-                            {([entity, items]) => {
-                              const arrKey = () => `ep:${label}:arrays:${entity}`;
+                          <For each={visibleArrays()}>
+                            {(item) => {
+                              const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
                               return (
-                                <div class="rounded-md overflow-hidden">
-                                  <button
-                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                                    onClick={() => toggleGroup(arrKey())}
-                                  >
-                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(arrKey()) ? "" : "rotate-90"}`}>&#9654;</span>
-                                    <span class="font-medium">{entity}</span>
-                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "property" : "properties"}</span>
-                                  </button>
-                                  <Show when={!collapsedGroups().has(arrKey())}>
-                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                      <For each={items}>
-                                        {(item) => {
-                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                          return (
-                                            <div class="flex items-center gap-3 px-3 py-1.5">
-                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                              <input type="number" min="0" max="50" value={item.config.min}
-                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                                onInput={(e) => {
-                                                  const configs = { ...props.recipeQuantityConfigs() };
-                                                  configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
-                                                  props.setRecipeQuantityConfigs(configs);
-                                                }} />
-                                              <span class="text-gray-600 text-xs">–</span>
-                                              <input type="number" min="1" max="50" value={item.config.max}
-                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                                onInput={(e) => {
-                                                  const configs = { ...props.recipeQuantityConfigs() };
-                                                  configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
-                                                  props.setRecipeQuantityConfigs(configs);
-                                                }} />
-                                              <span class="text-[10px] text-gray-600 w-10">items</span>
-                                            </div>
-                                          );
-                                        }}
-                                      </For>
-                                    </div>
-                                  </Show>
+                                <div class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
+                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                  <input type="number" min="0" max="50" value={item.config.min}
+                                    class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                    onInput={(e) => {
+                                      const configs = { ...props.recipeQuantityConfigs() };
+                                      configs[item.key] = { ...configs[item.key], min: parseInt(e.target.value) || 0 };
+                                      props.setRecipeQuantityConfigs(configs);
+                                    }} />
+                                  <span class="text-gray-600 text-xs">–</span>
+                                  <input type="number" min="1" max="50" value={item.config.max}
+                                    class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                    onInput={(e) => {
+                                      const configs = { ...props.recipeQuantityConfigs() };
+                                      configs[item.key] = { ...configs[item.key], max: parseInt(e.target.value) || 3 };
+                                      props.setRecipeQuantityConfigs(configs);
+                                    }} />
+                                  <span class="text-[10px] text-gray-600 w-10">items</span>
                                 </div>
                               );
                             }}
@@ -4852,52 +4707,31 @@ function RecipeConfigStep(props: {
                       </div>
                     </Show>
 
-                    {/* Rules sub-section */}
-                    <Show when={epRules().length > 0}>
+                    {/* Field Rules — inline, no nested collapse */}
+                    <Show when={visibleFields().length > 0}>
                       <div>
                         <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Field Rules</div>
                         <div class="space-y-1 ml-2">
-                          <For each={epRules()}>
-                            {([entity, items]) => {
-                              const ruleKey = () => `ep:${label}:rules:${entity}`;
+                          <For each={visibleFields()}>
+                            {(item) => {
+                              const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
                               return (
-                                <div class="rounded-md overflow-hidden">
-                                  <button
-                                    class="w-full flex items-center gap-2 px-3 py-2 bg-gray-800/70 hover:bg-gray-800 text-sm text-gray-200 transition-colors"
-                                    onClick={() => toggleGroup(ruleKey())}
+                                <div class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
+                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
+                                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
+                                  <select
+                                    value={item.strategy}
+                                    class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                    onChange={(e) => {
+                                      const rules = { ...props.recipeFakerRules() };
+                                      rules[item.key] = e.target.value;
+                                      props.setRecipeFakerRules(rules);
+                                    }}
                                   >
-                                    <span class={`text-[10px] text-gray-500 transition-transform ${collapsedGroups().has(ruleKey()) ? "" : "rotate-90"}`}>&#9654;</span>
-                                    <span class="font-medium">{entity}</span>
-                                    <span class="text-xs text-gray-600 ml-auto">{items.length} {items.length === 1 ? "field" : "fields"}</span>
-                                  </button>
-                                  <Show when={!collapsedGroups().has(ruleKey())}>
-                                    <div class="bg-gray-900/30 border-l-2 border-gray-800 ml-3">
-                                      <For each={items}>
-                                        {(item) => {
-                                          const propName = item.key.includes(".") ? item.key.split(".").slice(1).join(".") : item.key;
-                                          return (
-                                            <div class="flex items-center gap-3 px-3 py-1.5">
-                                              <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{propName}</span>
-                                              <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">{item.propType}{item.format ? `/${item.format}` : ""}</span>
-                                              <select
-                                                value={item.strategy}
-                                                class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                                onChange={(e) => {
-                                                  const rules = { ...props.recipeFakerRules() };
-                                                  rules[item.key] = e.target.value;
-                                                  props.setRecipeFakerRules(rules);
-                                                }}
-                                              >
-                                                <For each={FAKER_STRATEGIES}>
-                                                  {(s) => <option value={s}>{s}</option>}
-                                                </For>
-                                              </select>
-                                            </div>
-                                          );
-                                        }}
-                                      </For>
-                                    </div>
-                                  </Show>
+                                    <For each={FAKER_STRATEGIES}>
+                                      {(s) => <option value={s}>{s}</option>}
+                                    </For>
+                                  </select>
                                 </div>
                               );
                             }}
@@ -4906,13 +4740,13 @@ function RecipeConfigStep(props: {
                       </div>
                     </Show>
 
-                    {/* Constraint Rules sub-section */}
+                    {/* Constraint Rules scoped to this table */}
                     <ConstraintRulesEditor
-                      rules={epConstraints}
+                      rules={scopedConstraints}
                       recipeRules={props.recipeRules}
                       setRecipeRules={props.setRecipeRules}
                       entityGraph={props.entityGraph}
-                      scopedDefs={epBucket()?.defs}
+                      scopedDefs={[defName]}
                     />
 
                   </div>
