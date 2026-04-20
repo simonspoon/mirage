@@ -135,7 +135,7 @@ pub struct ConfigureRequest {
 /// Query PRAGMA table_info for `table` and return the set of column names whose
 /// declared type is BOOLEAN (case-insensitive). Used by row_to_json to emit
 /// JSON true/false for boolean-typed columns instead of integer 0/1.
-fn bool_cols_for_table(conn: &rusqlite::Connection, table: &str) -> HashSet<String> {
+pub fn bool_cols_for_table(conn: &rusqlite::Connection, table: &str) -> HashSet<String> {
     let sql = format!("PRAGMA table_info(\"{table}\")");
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -157,7 +157,7 @@ fn bool_cols_for_table(conn: &rusqlite::Connection, table: &str) -> HashSet<Stri
     set
 }
 
-fn row_to_json(
+pub fn row_to_json(
     col_names: &[String],
     bool_cols: &HashSet<String>,
     row: &rusqlite::Row,
@@ -1947,15 +1947,19 @@ async fn admin_activate_recipe(
             });
     }
 
-    let composed = crate::composer::compose_documents(
-        &spec,
-        &raw_spec,
-        &entity_graph,
-        &effective_quantities,
-        &endpoints,
-        &faker_rules,
-        &recipe_rules,
-    );
+    let composed = {
+        let conn = state.db.lock().unwrap();
+        crate::composer::compose_documents(
+            &spec,
+            &raw_spec,
+            &entity_graph,
+            &effective_quantities,
+            &endpoints,
+            &faker_rules,
+            &recipe_rules,
+            &conn,
+        )
+    };
 
     // Write composed documents to SQLite, then re-apply frozen rows
     {

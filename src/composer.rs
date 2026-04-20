@@ -24,6 +24,10 @@ pub type DocumentStore = HashMap<String, Vec<serde_json::Value>>;
 /// Compose documents for each selected endpoint's response definition.
 /// `spec` (resolved) is used for schema generation (inlined properties).
 /// `raw_spec` (unresolved) is used for definition name lookup (retains $ref paths).
+/// `conn` lets nested `$ref` properties sample from the referenced def's
+/// already-seeded SQLite table (see task yhgg / baqf — implicit pool via
+/// backing table).
+#[allow(clippy::too_many_arguments)]
 pub fn compose_documents(
     spec: &SwaggerSpec,
     raw_spec: &SwaggerSpec,
@@ -32,6 +36,7 @@ pub fn compose_documents(
     selected_endpoints: &[EndpointInfo],
     faker_rules: &FakerRules,
     recipe_rules: &[Rule],
+    conn: &rusqlite::Connection,
 ) -> DocumentStore {
     let defs = match &spec.definitions {
         Some(d) => d,
@@ -103,6 +108,7 @@ pub fn compose_documents(
                 faker_rules,
                 &field_rule_map,
                 def_compare_rules,
+                conn,
             );
             // Assign incremental id
             if let serde_json::Value::Object(ref mut map) = doc {
@@ -164,6 +170,7 @@ fn topo_sort_endpoints_by_def(
 }
 
 /// Generate a single document from a schema by faking each property.
+#[allow(clippy::too_many_arguments)]
 fn generate_document_from_schema(
     def_name: &str,
     schema: &SchemaObject,
@@ -172,6 +179,7 @@ fn generate_document_from_schema(
     faker_rules: &FakerRules,
     field_rule_map: &FieldRuleMap,
     compare_rules: Option<&[Rule]>,
+    conn: &rusqlite::Connection,
 ) -> serde_json::Value {
     let props = match &schema.properties {
         Some(p) => p,
@@ -200,6 +208,7 @@ fn generate_document_from_schema(
             def_name,
             faker_rules,
             field_rule_map,
+            conn,
         );
         map.insert(prop_name.clone(), value);
     }
@@ -212,6 +221,12 @@ fn generate_document_from_schema(
 }
 
 /// Generate a value for a single property via faker rules + schema heuristics.
+///
+/// If the raw property carries a `$ref` to another definition, try to sample
+/// a random row from that definition's backing SQLite table (implicit pool —
+/// task yhgg / baqf). On empty table or SQLite error, fall back to the
+/// inline fake and log a warning with the def name. Preserves natural-key
+/// joinability between composed docs and backing tables.
 fn generate_property_value(
     prop_name: &str,
     prop_schema: &SchemaObject,
@@ -219,10 +234,57 @@ fn generate_property_value(
     def_name: &str,
     faker_rules: &FakerRules,
     field_rule_map: &FieldRuleMap,
+    conn: &rusqlite::Connection,
 ) -> serde_json::Value {
+    // Implicit pool: if raw prop has a $ref, sample from the target table.
+    if let Some(ref_path) = _raw_prop.and_then(|p| p.ref_path.as_deref())
+        && let Some(target_def) = ref_path.strip_prefix("#/definitions/")
+        && let Some(sampled) = sample_row_from_table(conn, target_def)
+    {
+        return sampled;
+    }
+
     let recipe_rule = field_rule_map.get(&(def_name.to_string(), prop_name.to_string()));
     let faker_rule = faker_rules.get(def_name).and_then(|m| m.get(prop_name));
     fake_value_for_field_layered(prop_name, prop_schema, recipe_rule, faker_rule)
+}
+
+/// Sample a random row from `<target_def>` table as a JSON object.
+/// Returns `None` if the table is missing, empty, or SQLite errors. Callers
+/// fall back to the inline fake path on `None`.
+fn sample_row_from_table(
+    conn: &rusqlite::Connection,
+    target_def: &str,
+) -> Option<serde_json::Value> {
+    let bool_cols = crate::server::bool_cols_for_table(conn, target_def);
+    let sql = format!("SELECT * FROM \"{target_def}\" ORDER BY RANDOM() LIMIT 1");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[composer] nested $ref sample: prepare failed for \"{target_def}\": {e} — falling back to fake"
+            );
+            return None;
+        }
+    };
+    let col_names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    match stmt.query_row([], |row| {
+        crate::server::row_to_json(&col_names, &bool_cols, row)
+    }) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            eprintln!(
+                "[composer] nested $ref sample: table \"{target_def}\" empty — falling back to fake"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "[composer] nested $ref sample: query failed for \"{target_def}\": {e} — falling back to fake"
+            );
+            None
+        }
+    }
 }
 
 /// Flatten a raw schema's allOf members into a single property map, preserving
@@ -420,6 +482,7 @@ mod tests {
             path: "/pet/{petId}".to_string(),
         }];
 
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         let docs = compose_documents(
             &spec,
             &raw_spec,
@@ -428,6 +491,7 @@ mod tests {
             &endpoints,
             &FakerRules::new(),
             &[],
+            &conn,
         );
 
         assert!(docs.contains_key("Pet"), "should have Pet documents");
@@ -656,6 +720,172 @@ mod tests {
         assert!(
             merged.is_some(),
             "cyclic allOf should return Some (possibly empty), not panic"
+        );
+    }
+
+    #[test]
+    fn test_generate_property_value_samples_from_sqlite_on_ref() {
+        // When the raw prop carries a $ref and the target table has rows,
+        // generate_property_value returns a JSON object pulled from SQLite
+        // instead of faking a fresh value.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE \"Address\" (id INTEGER, city TEXT, country TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO \"Address\" (id, city, country) VALUES (42, 'Atlantis', 'Pangaea')",
+            [],
+        )
+        .unwrap();
+
+        let raw_prop = SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: Some("#/definitions/Address".to_string()),
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        // Resolved prop schema (after resolve_refs) has object type, no ref_path.
+        let prop_schema = SchemaObject {
+            schema_type: Some("object".to_string()),
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+
+        let value = generate_property_value(
+            "address",
+            &prop_schema,
+            Some(&raw_prop),
+            "Owner",
+            &FakerRules::new(),
+            &FieldRuleMap::new(),
+            &conn,
+        );
+
+        let obj = value
+            .as_object()
+            .expect("sampled row must be a JSON object");
+        assert_eq!(obj.get("id").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(obj.get("city").and_then(|v| v.as_str()), Some("Atlantis"));
+        assert_eq!(obj.get("country").and_then(|v| v.as_str()), Some("Pangaea"));
+    }
+
+    #[test]
+    fn test_generate_property_value_falls_back_when_table_empty_or_missing() {
+        // Empty target table (or missing) -> sampler returns None and
+        // generate_property_value falls through to fake_value_for_field_layered.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Intentionally no CREATE TABLE — simulates missing backing table.
+
+        let raw_prop = SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: Some("#/definitions/DoesNotExist".to_string()),
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        let prop_schema = SchemaObject {
+            schema_type: Some("string".to_string()),
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+
+        let value = generate_property_value(
+            "nickname",
+            &prop_schema,
+            Some(&raw_prop),
+            "Owner",
+            &FakerRules::new(),
+            &FieldRuleMap::new(),
+            &conn,
+        );
+
+        // Fallback path -> fake_value_for_field_layered on a string schema
+        // produces a JSON string (never a null).
+        assert!(
+            value.is_string(),
+            "expected fallback fake string, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn test_generate_property_value_samples_from_empty_table_fallbacks() {
+        // Table EXISTS but has zero rows -> QueryReturnedNoRows branch ->
+        // fallback to fake.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE \"Empty\" (id INTEGER, label TEXT)", [])
+            .unwrap();
+
+        let raw_prop = SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: Some("#/definitions/Empty".to_string()),
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+        let prop_schema = SchemaObject {
+            schema_type: Some("string".to_string()),
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        };
+
+        let value = generate_property_value(
+            "label",
+            &prop_schema,
+            Some(&raw_prop),
+            "Owner",
+            &FakerRules::new(),
+            &FieldRuleMap::new(),
+            &conn,
+        );
+
+        assert!(
+            value.is_string(),
+            "empty-table path must fall back to fake string, got {value:?}"
         );
     }
 

@@ -786,15 +786,19 @@ async fn main() {
                 path: path.to_string(),
             })
             .collect();
-        let composed = composer::compose_documents(
-            &spec,
-            &raw_spec,
-            &entity_graph,
-            &quantities,
-            &all_endpoints,
-            &no_faker_rules,
-            &no_recipe_rules,
-        );
+        let composed = {
+            let conn = db.lock().unwrap();
+            composer::compose_documents(
+                &spec,
+                &raw_spec,
+                &entity_graph,
+                &quantities,
+                &all_endpoints,
+                &no_faker_rules,
+                &no_recipe_rules,
+                &conn,
+            )
+        };
         seeder::insert_composed_rows(&db.lock().unwrap(), &composed).unwrap();
     }
 
