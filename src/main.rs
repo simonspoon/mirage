@@ -118,6 +118,33 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
+    /// Manage a recipe's parsed config (shared pools, quantity configs, faker rules, rules, frozen rows)
+    Config(ConfigArgs),
+}
+
+#[derive(clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    verb: ConfigCommand,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Replace a recipe's config from a JSON file
+    ///
+    /// The file must match the body accepted by
+    /// `PUT /_api/admin/recipes/:id/config` (an object with any of
+    /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows).
+    /// The whole config is replaced; there are no partial-patch semantics.
+    Apply {
+        /// Recipe id
+        id: i64,
+        /// Path to a JSON file matching the admin API config body
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
 }
 
 /// SQL reserved words that may cause issues as column names.
@@ -647,6 +674,25 @@ async fn run_recipes(args: &RecipesArgs) {
                 }
             }
         }
+        RecipesCommand::Config(cfg_args) => match &cfg_args.verb {
+            ConfigCommand::Apply { id, file, url } => {
+                let base = resolve_base_url(url);
+                let raw = read_file_or_exit(file);
+                let body = parse_json_or_exit(&raw, "--file");
+                let resp = client
+                    .put(format!("{base}/_api/admin/recipes/{id}/config"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+                let resp = ensure_success(resp).await;
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+                println!("{body}");
+            }
+        },
     }
 }
 

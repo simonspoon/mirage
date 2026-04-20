@@ -1660,3 +1660,181 @@ fn test_recipes_cli_import_bad_file() {
 
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+#[test]
+fn test_recipes_cli_config_apply() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Apply Me");
+    let id = created["id"].as_i64().unwrap();
+    let scratch = scratch_dir("config-apply");
+
+    let cfg_path = scratch.join("cfg.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{
+            "shared_pools": {"Pet": {"is_shared": true, "pool_size": 7}},
+            "quantity_configs": {"Pet.tags": {"min": 1, "max": 3}},
+            "faker_rules": {"Pet.name": {"kind": "FirstName"}},
+            "rules": [],
+            "frozen_rows": {}
+        }"#,
+    )
+    .unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "config",
+            "apply",
+            &id.to_string(),
+            "--file",
+            cfg_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "recipes config apply should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let echoed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert_eq!(echoed["shared_pools"]["Pet"]["pool_size"], 7);
+    assert_eq!(echoed["quantity_configs"]["Pet.tags"]["max"], 3);
+    assert_eq!(echoed["faker_rules"]["Pet.name"]["kind"], "FirstName");
+    assert!(echoed["rules"].is_array());
+    assert!(echoed["frozen_rows"].is_object());
+
+    // Re-fetch via show to confirm server persisted the replacement.
+    let out = mirage_cli(&server, &["show", &id.to_string()]);
+    assert!(out.status.success());
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("show stdout should be JSON");
+    assert_eq!(recipe["shared_pools"]["Pet"]["pool_size"], 7);
+    assert_eq!(recipe["quantity_configs"]["Pet.tags"]["min"], 1);
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_config_apply_404() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("config-apply-404");
+
+    let cfg_path = scratch.join("cfg.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{"shared_pools":{},"quantity_configs":{},"faker_rules":{}}"#,
+    )
+    .unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "config",
+            "apply",
+            "999999",
+            "--file",
+            cfg_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "config apply on missing id should exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_config_apply_bad_file() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Bad File Target");
+    let id = created["id"].as_i64().unwrap();
+    let scratch = scratch_dir("config-apply-bad");
+
+    // File that is not valid JSON at all.
+    let bad = scratch.join("bad.json");
+    std::fs::write(&bad, "not json").unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "config",
+            "apply",
+            &id.to_string(),
+            "--file",
+            bad.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success(), "bad JSON must exit non-zero");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err["error"].as_str().unwrap().contains("invalid JSON"),
+        "error should mention invalid JSON: {stderr}"
+    );
+
+    // JSON but missing required keys (server rejects deserialize).
+    let missing = scratch.join("missing.json");
+    std::fs::write(&missing, r#"{"shared_pools": {}}"#).unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "config",
+            "apply",
+            &id.to_string(),
+            "--file",
+            missing.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "missing required config keys must exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_config_apply_honours_mirage_url_env() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Env URL");
+    let id = created["id"].as_i64().unwrap();
+    let scratch = scratch_dir("config-apply-env");
+
+    let cfg_path = scratch.join("cfg.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{"shared_pools":{},"quantity_configs":{},"faker_rules":{}}"#,
+    )
+    .unwrap();
+
+    // No --url flag; MIRAGE_URL env points at the server.
+    let out = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .arg("recipes")
+        .arg("config")
+        .arg("apply")
+        .arg(id.to_string())
+        .arg("--file")
+        .arg(cfg_path.to_str().unwrap())
+        .env("MIRAGE_URL", server.base())
+        .output()
+        .expect("failed to invoke mirage binary");
+    assert!(
+        out.status.success(),
+        "config apply should honour MIRAGE_URL env. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
