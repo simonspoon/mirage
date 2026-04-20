@@ -4748,6 +4748,7 @@ function RecipeConfigStep(props: {
               return true;
             });
             const scopedConstraints = () => constraintsByDef()[defName] || [];
+            const scopedCompareConstraints = () => scopedConstraints().filter((e) => e.rule.kind === "compare");
 
             const tableKey = () => `table:${defName}`;
 
@@ -4855,47 +4856,190 @@ function RecipeConfigStep(props: {
                               const fieldKey = `${defName}.${prop.propName}`;
                               const fakerStrategy = () => props.recipeFakerRules()[fieldKey];
                               const arrayConfig = () => props.recipeQuantityConfigs()[fieldKey];
+                              // Per-property constraint rules — scoped by def.prop field match.
+                              // compare rules (two-field) stay in the block-level editor below.
+                              const propConstraints = () =>
+                                scopedConstraints().filter((entry) => {
+                                  if (entry.rule.kind === "compare") return false;
+                                  const f = (entry.rule as Exclude<Rule, CompareRule>).field;
+                                  return f === fieldKey;
+                                });
+                              const [newPropRuleKind, setNewPropRuleKind] =
+                                createSignal<Exclude<RuleKind, "compare">>("range");
+                              const addPropRule = () => {
+                                const kind = newPropRuleKind();
+                                let rule: Rule;
+                                switch (kind) {
+                                  case "range": rule = { kind: "range", field: fieldKey, min: 0, max: 100 }; break;
+                                  case "choice": rule = { kind: "choice", field: fieldKey, options: [] }; break;
+                                  case "const": rule = { kind: "const", field: fieldKey, value: "" }; break;
+                                  case "pattern": rule = { kind: "pattern", field: fieldKey, regex: "" }; break;
+                                }
+                                props.setRecipeRules([...props.recipeRules(), rule]);
+                              };
+                              const removePropRule = (globalIdx: number) => {
+                                props.setRecipeRules(props.recipeRules().filter((_, i) => i !== globalIdx));
+                              };
+                              const updatePropRule = (globalIdx: number, patch: Partial<Rule>) => {
+                                const next = [...props.recipeRules()];
+                                next[globalIdx] = { ...next[globalIdx], ...patch } as Rule;
+                                props.setRecipeRules(next);
+                              };
                               return (
-                                <div data-testid="property-row" class="flex items-center gap-3 px-3 py-1.5 bg-gray-800/40 rounded">
-                                  <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{prop.propName}</span>
-                                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">
-                                    {prop.isArray ? `${prop.propType}[]` : `${prop.propType}${prop.format ? `/${prop.format}` : ""}`}
-                                  </span>
-                                  <Show when={prop.isArray}>
-                                    <input type="number" min="0" max="50" value={arrayConfig()?.min ?? 1}
-                                      class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                      onInput={(e) => {
-                                        const configs = { ...props.recipeQuantityConfigs() };
-                                        const prev = configs[fieldKey] ?? { min: 1, max: 3 };
-                                        configs[fieldKey] = { min: parseInt(e.target.value) || 0, max: prev.max };
-                                        props.setRecipeQuantityConfigs(configs);
-                                      }} />
-                                    <span class="text-gray-600 text-xs">–</span>
-                                    <input type="number" min="1" max="50" value={arrayConfig()?.max ?? 3}
-                                      class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                                      onInput={(e) => {
-                                        const configs = { ...props.recipeQuantityConfigs() };
-                                        const prev = configs[fieldKey] ?? { min: 1, max: 3 };
-                                        configs[fieldKey] = { min: prev.min, max: parseInt(e.target.value) || 3 };
-                                        props.setRecipeQuantityConfigs(configs);
-                                      }} />
-                                    <span class="text-[10px] text-gray-600 w-10">items</span>
-                                  </Show>
-                                  <Show when={!prop.isArray}>
-                                    <select
-                                      value={fakerStrategy() ?? "auto"}
-                                      class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                                      onChange={(e) => {
-                                        const rules = { ...props.recipeFakerRules() };
-                                        rules[fieldKey] = e.target.value;
-                                        props.setRecipeFakerRules(rules);
+                                <div data-testid="property-row" class="bg-gray-800/40 rounded">
+                                  <div class="flex items-center gap-3 px-3 py-1.5">
+                                    <span class="font-mono text-xs text-gray-400 flex-1 truncate">.{prop.propName}</span>
+                                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">
+                                      {prop.isArray ? `${prop.propType}[]` : `${prop.propType}${prop.format ? `/${prop.format}` : ""}`}
+                                    </span>
+                                    <Show when={prop.isArray}>
+                                      <input type="number" min="0" max="50" value={arrayConfig()?.min ?? 1}
+                                        class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => {
+                                          const configs = { ...props.recipeQuantityConfigs() };
+                                          const prev = configs[fieldKey] ?? { min: 1, max: 3 };
+                                          configs[fieldKey] = { min: parseInt(e.target.value) || 0, max: prev.max };
+                                          props.setRecipeQuantityConfigs(configs);
+                                        }} />
+                                      <span class="text-gray-600 text-xs">–</span>
+                                      <input type="number" min="1" max="50" value={arrayConfig()?.max ?? 3}
+                                        class="w-14 bg-[#070c17] border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                        onInput={(e) => {
+                                          const configs = { ...props.recipeQuantityConfigs() };
+                                          const prev = configs[fieldKey] ?? { min: 1, max: 3 };
+                                          configs[fieldKey] = { min: prev.min, max: parseInt(e.target.value) || 3 };
+                                          props.setRecipeQuantityConfigs(configs);
+                                        }} />
+                                      <span class="text-[10px] text-gray-600 w-10">items</span>
+                                    </Show>
+                                    <Show when={!prop.isArray}>
+                                      <select
+                                        value={fakerStrategy() ?? "auto"}
+                                        class="bg-[#070c17] border border-gray-800 rounded-md px-2 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
+                                        onChange={(e) => {
+                                          const rules = { ...props.recipeFakerRules() };
+                                          rules[fieldKey] = e.target.value;
+                                          props.setRecipeFakerRules(rules);
+                                        }}
+                                      >
+                                        <For each={FAKER_STRATEGIES}>
+                                          {(s) => <option value={s}>{s}</option>}
+                                        </For>
+                                      </select>
+                                    </Show>
+                                  </div>
+                                  {/* Per-prop constraint rules (single-field kinds only). */}
+                                  <div
+                                    data-testid="property-row-constraints"
+                                    class="flex items-center gap-1.5 px-3 pb-1.5 flex-wrap"
+                                  >
+                                    <Index each={propConstraints()}>
+                                      {(entry) => {
+                                        const rule = () => entry().rule;
+                                        const globalIdx = () => entry().globalIndex;
+                                        return (
+                                          <div
+                                            data-testid={`prop-rule-chip-${rule().kind}`}
+                                            class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-gray-700/60 rounded text-[10px]"
+                                          >
+                                            <span class="uppercase tracking-wider text-blue-300 font-medium">
+                                              {rule().kind}
+                                            </span>
+                                            <Show when={rule().kind === "range"}>
+                                              <input
+                                                type="number"
+                                                value={(rule() as RangeRule).min}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1 py-0 text-[10px] text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) =>
+                                                  updatePropRule(globalIdx(), {
+                                                    min: parseFloat(e.currentTarget.value) || 0,
+                                                  } as Partial<RangeRule>)
+                                                }
+                                              />
+                                              <span class="text-gray-500">–</span>
+                                              <input
+                                                type="number"
+                                                value={(rule() as RangeRule).max}
+                                                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1 py-0 text-[10px] text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                                                onInput={(e) =>
+                                                  updatePropRule(globalIdx(), {
+                                                    max: parseFloat(e.currentTarget.value) || 0,
+                                                  } as Partial<RangeRule>)
+                                                }
+                                              />
+                                            </Show>
+                                            <Show when={rule().kind === "choice"}>
+                                              <input
+                                                type="text"
+                                                placeholder="a, b, c"
+                                                value={stringifyChoiceOptions((rule() as ChoiceRule).options)}
+                                                class="w-40 bg-[#070c17] border border-gray-800 rounded px-1 py-0 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
+                                                onInput={(e) =>
+                                                  updatePropRule(globalIdx(), {
+                                                    options: parseChoiceOptions(e.currentTarget.value),
+                                                  } as Partial<ChoiceRule>)
+                                                }
+                                              />
+                                            </Show>
+                                            <Show when={rule().kind === "const"}>
+                                              <input
+                                                type="text"
+                                                placeholder="value"
+                                                value={String((rule() as ConstRule).value ?? "")}
+                                                class="w-32 bg-[#070c17] border border-gray-800 rounded px-1 py-0 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
+                                                onInput={(e) =>
+                                                  updatePropRule(globalIdx(), {
+                                                    value: parseLiteral(e.currentTarget.value),
+                                                  } as Partial<ConstRule>)
+                                                }
+                                              />
+                                            </Show>
+                                            <Show when={rule().kind === "pattern"}>
+                                              <input
+                                                type="text"
+                                                placeholder="[A-Z]{3}"
+                                                value={(rule() as PatternRule).regex}
+                                                class="w-40 bg-[#070c17] border border-gray-800 rounded px-1 py-0 text-[10px] text-gray-100 font-mono focus:outline-none focus:border-gray-700"
+                                                onInput={(e) =>
+                                                  updatePropRule(globalIdx(), {
+                                                    regex: e.currentTarget.value,
+                                                  } as Partial<PatternRule>)
+                                                }
+                                              />
+                                            </Show>
+                                            <button
+                                              class="text-gray-500 hover:text-red-400 w-4 h-4 flex items-center justify-center rounded hover:bg-red-500/10"
+                                              onClick={() => removePropRule(globalIdx())}
+                                              title="Remove rule"
+                                              data-testid="prop-rule-remove-btn"
+                                            >
+                                              ×
+                                            </button>
+                                          </div>
+                                        );
                                       }}
+                                    </Index>
+                                    <select
+                                      data-testid="prop-rule-kind-picker"
+                                      value={newPropRuleKind()}
+                                      class="bg-[#070c17] border border-gray-800 rounded px-1 py-0.5 text-[10px] text-gray-100 focus:outline-none focus:border-gray-700"
+                                      onChange={(e) =>
+                                        setNewPropRuleKind(e.target.value as Exclude<RuleKind, "compare">)
+                                      }
                                     >
-                                      <For each={FAKER_STRATEGIES}>
-                                        {(s) => <option value={s}>{s}</option>}
-                                      </For>
+                                      <option value="range">range</option>
+                                      <option value="choice">choice</option>
+                                      <option value="const">const</option>
+                                      <option value="pattern">pattern</option>
                                     </select>
-                                  </Show>
+                                    <button
+                                      data-testid="prop-rule-add-btn"
+                                      class="px-1.5 py-0.5 text-[10px] font-medium text-blue-300 hover:text-blue-200 border border-blue-500/30 hover:border-blue-500/60 rounded transition-colors"
+                                      onClick={addPropRule}
+                                    >
+                                      + rule
+                                    </button>
+                                  </div>
                                 </div>
                               );
                             }}
@@ -4904,13 +5048,15 @@ function RecipeConfigStep(props: {
                       </div>
                     </Show>
 
-                    {/* Constraint Rules scoped to this table */}
+                    {/* Compare rules (two-field) — block-level editor. Single-field rules
+                        (range/choice/const/pattern) appear inline on each property row above. */}
                     <ConstraintRulesEditor
-                      rules={scopedConstraints}
+                      rules={scopedCompareConstraints}
                       recipeRules={props.recipeRules}
                       setRecipeRules={props.setRecipeRules}
                       entityGraph={props.entityGraph}
                       scopedDefs={[defName]}
+                      allowedKinds={["compare"]}
                     />
 
                   </div>
@@ -4954,6 +5100,7 @@ function ConstraintRulesEditor(props: {
   setRecipeRules: Setter<Rule[]>;
   entityGraph: Accessor<any>;
   scopedDefs?: string[];
+  allowedKinds?: RuleKind[];
 }) {
   // Field options derived from entityGraph().scalar_properties.
   // When scopedDefs is provided, filter to only fields whose def is in the scope.
@@ -4981,7 +5128,10 @@ function ConstraintRulesEditor(props: {
     return groups;
   };
 
-  const [newRuleKind, setNewRuleKind] = createSignal<RuleKind>("range");
+  const kindOptions = (): RuleKind[] => props.allowedKinds ?? RULE_KINDS;
+  const [newRuleKind, setNewRuleKind] = createSignal<RuleKind>(
+    (props.allowedKinds ?? RULE_KINDS)[0] ?? "range",
+  );
 
   const firstFieldPath = (): string => {
     const fs = scalarFields();
@@ -5029,7 +5179,7 @@ function ConstraintRulesEditor(props: {
             onChange={(e) => setNewRuleKind(e.target.value as RuleKind)}
             data-testid="rule-kind-picker"
           >
-            <For each={RULE_KINDS}>
+            <For each={kindOptions()}>
               {(k) => <option value={k}>{k}</option>}
             </For>
           </select>
