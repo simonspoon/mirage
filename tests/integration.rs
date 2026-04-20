@@ -514,6 +514,222 @@ fn test_composition_merged_fields() {
 // Cross-endpoint nested-$ref reuse is now driven by the SQLite backing table
 // (task yhgg); coverage for that behavior lives in that task's tests.
 
+/// Implicit pool identity (one-hop): every nested $ref value in an endpoint
+/// response must resolve to an actual row in the target def's backing SQLite
+/// table. Asserts the invariant parent task baqf requires — composer samples
+/// nested $refs from the backing table (sibling kxlm) after topological
+/// seeding (sibling vjeu), so embedded rows are joinable back to their source
+/// table.
+///
+/// One-hop: /owners → owner.address must exist in the Address table. Address
+/// has no endpoint of its own so its seeded rows are never overwritten by a
+/// later compose pass, which is exactly why this hop holds.
+///
+/// The two-hop chain (/composed → composed.owner ⊆ Owner table) lives in
+/// `test_implicit_pool_two_hop_composed_owner` below, currently `#[ignore]`
+/// pending the streaming-insert follow-up (limbo task thoh).
+#[test]
+fn test_implicit_pool_nested_ref() {
+    use std::collections::HashSet;
+
+    let server = MirageServer::start("tests/fixtures/mega.yaml", "/owners");
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client.get(server.url("/owners")).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let owners_body: serde_json::Value = resp.json().unwrap();
+    let owners = owners_body
+        .as_array()
+        .expect("/owners response should be a JSON array");
+    assert!(
+        !owners.is_empty(),
+        "/owners array should have >=1 seeded row"
+    );
+
+    let owner_addr_tuples: HashSet<(String, String)> = owners
+        .iter()
+        .map(|row| {
+            let addr = unwrap_json(&row["address"]);
+            let city = addr["city"]
+                .as_str()
+                .unwrap_or_else(|| panic!("owner.address.city missing — row: {row}"))
+                .to_string();
+            let country = addr["country"]
+                .as_str()
+                .unwrap_or_else(|| panic!("owner.address.country missing — row: {row}"))
+                .to_string();
+            (city, country)
+        })
+        .collect();
+    assert!(
+        !owner_addr_tuples.is_empty(),
+        "expected at least one owner.address tuple"
+    );
+
+    let resp = client
+        .get(server.url("/_api/admin/tables/Address"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "Address admin table endpoint should exist"
+    );
+    let addr_body: serde_json::Value = resp.json().unwrap();
+    let addr_rows = addr_body["rows"]
+        .as_array()
+        .expect("/_api/admin/tables/Address should return {rows: [...]}");
+    assert!(
+        !addr_rows.is_empty(),
+        "Address table should have seeded rows"
+    );
+
+    let addr_table_tuples: HashSet<(String, String)> = addr_rows
+        .iter()
+        .map(|row| {
+            let city = row["city"]
+                .as_str()
+                .unwrap_or_else(|| panic!("Address.city missing — row: {row}"))
+                .to_string();
+            let country = row["country"]
+                .as_str()
+                .unwrap_or_else(|| panic!("Address.country missing — row: {row}"))
+                .to_string();
+            (city, country)
+        })
+        .collect();
+
+    let missing: Vec<_> = owner_addr_tuples
+        .difference(&addr_table_tuples)
+        .cloned()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every owner.address (city,country) must exist in Address table \
+         — {} missing tuples: {:?}; owners={:?}; table={:?}",
+        missing.len(),
+        missing,
+        owner_addr_tuples,
+        addr_table_tuples
+    );
+}
+
+/// Implicit pool identity (two-hop chain): every nested $ref value two levels
+/// deep must still resolve to a row in the target def's backing table. For
+/// mega.yaml this is /composed → composed.owner ⊆ Owner table (and by
+/// extension, composed.owner.address ⊆ Address table, already covered by the
+/// one-hop test).
+///
+/// Currently `#[ignore]`: the activation path in `src/main.rs` (~line 789)
+/// and `src/server.rs::admin_activate_recipe` (~line 1967) composes ALL
+/// endpoint docs into an in-memory `DocumentStore` and then bulk-inserts via
+/// `seeder::insert_composed_rows`. That means ComposedEntity's `owner`
+/// property is sampled from the SEEDER-populated Owner table, and the Owner
+/// table is later replaced by /owners' composed rows. Final Owner table ≠
+/// the Owner rows composed.owner actually sampled from → this assertion
+/// fails. Fix requires streaming insert per-def in topo order (new sibling
+/// task `thoh` under parent `baqf`).
+///
+/// Un-ignore once `thoh` lands.
+#[test]
+#[ignore = "pending streaming insert per-def in activation path (limbo task thoh, parent baqf)"]
+fn test_implicit_pool_two_hop_composed_owner() {
+    use std::collections::HashSet;
+
+    let server = MirageServer::start("tests/fixtures/mega.yaml", "/composed");
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client.get(server.url("/composed")).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let composed_body: serde_json::Value = resp.json().unwrap();
+    let composed = composed_body
+        .as_array()
+        .expect("/composed response should be a JSON array");
+    assert!(
+        !composed.is_empty(),
+        "/composed array should have >=1 seeded row"
+    );
+
+    // Owner has no id in mega.yaml — natural key is (name, address.city,
+    // address.country). Use that tuple to join composed.owner to Owner rows.
+    let composed_owner_keys: HashSet<(String, String, String)> = composed
+        .iter()
+        .map(|row| {
+            let owner = unwrap_json(&row["owner"]);
+            let name = owner["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("composed.owner.name missing — row: {row}"))
+                .to_string();
+            let addr = unwrap_json(&owner["address"]);
+            let city = addr["city"]
+                .as_str()
+                .unwrap_or_else(|| panic!("composed.owner.address.city missing — row: {row}"))
+                .to_string();
+            let country = addr["country"]
+                .as_str()
+                .unwrap_or_else(|| panic!("composed.owner.address.country missing — row: {row}"))
+                .to_string();
+            (name, city, country)
+        })
+        .collect();
+    assert!(
+        !composed_owner_keys.is_empty(),
+        "expected at least one composed.owner key"
+    );
+
+    let resp = client
+        .get(server.url("/_api/admin/tables/Owner"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "Owner admin table endpoint should exist"
+    );
+    let owner_body: serde_json::Value = resp.json().unwrap();
+    let owner_rows = owner_body["rows"]
+        .as_array()
+        .expect("/_api/admin/tables/Owner should return {rows: [...]}");
+    assert!(
+        !owner_rows.is_empty(),
+        "Owner table should have seeded rows"
+    );
+
+    let owner_table_keys: HashSet<(String, String, String)> = owner_rows
+        .iter()
+        .map(|row| {
+            let name = row["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("Owner.name missing — row: {row}"))
+                .to_string();
+            let addr = unwrap_json(&row["address"]);
+            let city = addr["city"]
+                .as_str()
+                .unwrap_or_else(|| panic!("Owner.address.city missing — row: {row}"))
+                .to_string();
+            let country = addr["country"]
+                .as_str()
+                .unwrap_or_else(|| panic!("Owner.address.country missing — row: {row}"))
+                .to_string();
+            (name, city, country)
+        })
+        .collect();
+
+    let owner_missing: Vec<_> = composed_owner_keys
+        .difference(&owner_table_keys)
+        .cloned()
+        .collect();
+    assert!(
+        owner_missing.is_empty(),
+        "every composed.owner (name, city, country) must exist in Owner table \
+         — {} missing keys: {:?}; composed_owners={:?}; table={:?}",
+        owner_missing.len(),
+        owner_missing,
+        composed_owner_keys,
+        owner_table_keys
+    );
+}
+
 #[test]
 fn test_endpoint_method_coverage() {
     // Exercises every supported HTTP method + parameter style on a flat-primitive
