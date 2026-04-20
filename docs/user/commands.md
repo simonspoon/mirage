@@ -352,7 +352,6 @@ Creates a new recipe. Validates constraint rules at create time (see [Constraint
 | `spec_source` | string | Yes | Raw Swagger spec text (YAML or JSON) |
 | `selected_endpoints` | string (JSON array) | Yes | Serialized `[{method, path}, ...]` |
 | `seed_count` | integer | No | Rows per table (default 10) |
-| `shared_pools` | string (JSON object) | No | `{"DefName": poolSize, ...}` (default `{}`) |
 | `quantity_configs` | string (JSON object) | No | `{"DefName.prop": {min, max}, ...}` (default `{}`) |
 | `faker_rules` | string (JSON object) | No | `{"DefName": {"prop": "strategy"}}` (default `{}`) |
 | `rules` | string (JSON array) | No | Constraint rules (default `[]`) |

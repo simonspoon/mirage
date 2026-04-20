@@ -12,7 +12,6 @@ pub struct Recipe {
     pub selected_endpoints: String,
     pub seed_count: i64,
     pub created_at: String,
-    pub shared_pools: String,
     pub quantity_configs: String,
     pub faker_rules: String,
     pub rules: String,
@@ -96,7 +95,6 @@ pub fn create_recipe(
     spec_source: &str,
     selected_endpoints_json: &str,
     seed_count: i64,
-    shared_pools: Option<&str>,
     quantity_configs: Option<&str>,
     faker_rules: Option<&str>,
     rules: Option<&str>,
@@ -104,15 +102,17 @@ pub fn create_recipe(
     custom_lists: Option<&str>,
 ) -> Result<Recipe, rusqlite::Error> {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let shared_pools = shared_pools.unwrap_or("{}");
     let quantity_configs = quantity_configs.unwrap_or("{}");
     let faker_rules = faker_rules.unwrap_or("{}");
     let rules = rules.unwrap_or("[]");
     let frozen_rows = frozen_rows.unwrap_or("{}");
     let custom_lists = custom_lists.unwrap_or("{}");
+    // "shared_pools" column retained for schema back-compat; we write the
+    // default empty-object literal so old deployments do not break, but the
+    // value is never read back out.
     conn.execute(
-        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, shared_pools, quantity_configs, faker_rules, rules, frozen_rows, custom_lists],
+        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\") VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, quantity_configs, faker_rules, rules, frozen_rows, custom_lists],
     )?;
     let id = conn.last_insert_rowid();
     Ok(Recipe {
@@ -122,7 +122,6 @@ pub fn create_recipe(
         selected_endpoints: selected_endpoints_json.to_string(),
         seed_count,
         created_at,
-        shared_pools: shared_pools.to_string(),
         quantity_configs: quantity_configs.to_string(),
         faker_rules: faker_rules.to_string(),
         rules: rules.to_string(),
@@ -133,7 +132,7 @@ pub fn create_recipe(
 
 pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" ORDER BY \"id\"",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" ORDER BY \"id\"",
     )?;
     let recipes = stmt
         .query_map([], |row| {
@@ -144,12 +143,11 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
                 selected_endpoints: row.get(3)?,
                 seed_count: row.get(4)?,
                 created_at: row.get(5)?,
-                shared_pools: row.get(6)?,
-                quantity_configs: row.get(7)?,
-                faker_rules: row.get(8)?,
-                rules: row.get(9)?,
-                frozen_rows: row.get(10)?,
-                custom_lists: row.get(11)?,
+                quantity_configs: row.get(6)?,
+                faker_rules: row.get(7)?,
+                rules: row.get(8)?,
+                frozen_rows: row.get(9)?,
+                custom_lists: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -158,7 +156,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
 
 pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" WHERE \"id\" = ?1",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" WHERE \"id\" = ?1",
     )?;
     match stmt.query_row([id], |row| {
         Ok(Recipe {
@@ -168,12 +166,11 @@ pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite
             selected_endpoints: row.get(3)?,
             seed_count: row.get(4)?,
             created_at: row.get(5)?,
-            shared_pools: row.get(6)?,
-            quantity_configs: row.get(7)?,
-            faker_rules: row.get(8)?,
-            rules: row.get(9)?,
-            frozen_rows: row.get(10)?,
-            custom_lists: row.get(11)?,
+            quantity_configs: row.get(6)?,
+            faker_rules: row.get(7)?,
+            rules: row.get(8)?,
+            frozen_rows: row.get(9)?,
+            custom_lists: row.get(10)?,
         })
     }) {
         Ok(recipe) => Ok(Some(recipe)),
@@ -182,20 +179,20 @@ pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn update_recipe_config(
     conn: &Connection,
     id: i64,
-    shared_pools: &str,
     quantity_configs: &str,
     faker_rules: &str,
     rules: &str,
     frozen_rows: &str,
     custom_lists: &str,
 ) -> Result<bool, rusqlite::Error> {
+    // "shared_pools" column retained for schema back-compat; the column is
+    // deliberately not updated here so old rows keep whatever they had.
     let changes = conn.execute(
-        "UPDATE \"recipes\" SET \"shared_pools\" = ?1, \"quantity_configs\" = ?2, \"faker_rules\" = ?3, \"rules\" = ?4, \"frozen_rows\" = ?5, \"custom_lists\" = ?6 WHERE \"id\" = ?7",
-        rusqlite::params![shared_pools, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, id],
+        "UPDATE \"recipes\" SET \"quantity_configs\" = ?1, \"faker_rules\" = ?2, \"rules\" = ?3, \"frozen_rows\" = ?4, \"custom_lists\" = ?5 WHERE \"id\" = ?6",
+        rusqlite::params![quantity_configs, faker_rules, rules, frozen_rows, custom_lists, id],
     )?;
     Ok(changes > 0)
 }
@@ -208,16 +205,17 @@ pub fn update_recipe(
     spec_source: &str,
     selected_endpoints_json: &str,
     seed_count: i64,
-    shared_pools: &str,
     quantity_configs: &str,
     faker_rules: &str,
     rules: &str,
     frozen_rows: &str,
     custom_lists: &str,
 ) -> Result<bool, rusqlite::Error> {
+    // "shared_pools" column retained for schema back-compat; the column is
+    // deliberately not updated here so old rows keep whatever they had.
     let changes = conn.execute(
-        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"shared_pools\" = ?5, \"quantity_configs\" = ?6, \"faker_rules\" = ?7, \"rules\" = ?8, \"frozen_rows\" = ?9, \"custom_lists\" = ?10 WHERE \"id\" = ?11",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, shared_pools, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, id],
+        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"quantity_configs\" = ?5, \"faker_rules\" = ?6, \"rules\" = ?7, \"frozen_rows\" = ?8, \"custom_lists\" = ?9 WHERE \"id\" = ?10",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, id],
     )?;
     Ok(changes > 0)
 }
@@ -264,10 +262,7 @@ mod tests {
     }
 
     fn insert_recipe(conn: &Connection, name: &str) {
-        create_recipe(
-            conn, name, "spec", "[]", 10, None, None, None, None, None, None,
-        )
-        .unwrap();
+        create_recipe(conn, name, "spec", "[]", 10, None, None, None, None, None).unwrap();
     }
 
     #[test]

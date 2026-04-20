@@ -1114,7 +1114,6 @@ struct CreateRecipeRequest {
     spec_source: String,
     endpoints: Vec<EndpointInfo>,
     seed_count: Option<i64>,
-    shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
@@ -1128,7 +1127,6 @@ struct UpdateRecipeRequest {
     spec_source: String,
     endpoints: Vec<EndpointInfo>,
     seed_count: Option<i64>,
-    shared_pools: Option<serde_json::Value>,
     quantity_configs: Option<serde_json::Value>,
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
@@ -1164,10 +1162,6 @@ async fn admin_create_recipe(
     };
 
     let seed_count = body.seed_count.unwrap_or(10);
-    let shared_pools_str = body
-        .shared_pools
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
     let quantity_configs_str = body
         .quantity_configs
         .as_ref()
@@ -1208,7 +1202,6 @@ async fn admin_create_recipe(
             &body.spec_source,
             &endpoints_json,
             seed_count,
-            shared_pools_str.as_deref(),
             quantity_configs_str.as_deref(),
             faker_rules_str.as_deref(),
             rules_str.as_deref(),
@@ -1331,7 +1324,6 @@ async fn admin_clone_recipe(
         &recipe.spec_source,
         &recipe.selected_endpoints,
         recipe.seed_count,
-        Some(&recipe.shared_pools),
         Some(&recipe.quantity_configs),
         Some(&recipe.faker_rules),
         Some(&recipe.rules),
@@ -1378,11 +1370,6 @@ async fn admin_update_recipe(
     };
 
     let seed_count = body.seed_count.unwrap_or(10);
-    let shared_pools_str = body
-        .shared_pools
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
-        .unwrap_or_else(|| "{}".to_string());
     let quantity_configs_str = body
         .quantity_configs
         .as_ref()
@@ -1426,7 +1413,6 @@ async fn admin_update_recipe(
         &body.spec_source,
         &endpoints_json,
         seed_count,
-        &shared_pools_str,
         &quantity_configs_str,
         &faker_rules_str,
         &rules_str,
@@ -1459,8 +1445,6 @@ async fn admin_export_recipe(
         Ok(Some(recipe)) => {
             let endpoints: serde_json::Value =
                 serde_json::from_str(&recipe.selected_endpoints).unwrap_or(serde_json::json!([]));
-            let shared_pools: serde_json::Value =
-                serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
             let quantity_configs: serde_json::Value =
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
             let faker_rules: serde_json::Value =
@@ -1478,7 +1462,6 @@ async fn admin_export_recipe(
                 "spec_source": recipe.spec_source,
                 "selected_endpoints": endpoints,
                 "seed_count": recipe.seed_count,
-                "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
                 "rules": rules,
@@ -1591,9 +1574,6 @@ async fn admin_import_recipe(
         .get("seed_count")
         .and_then(|v| v.as_i64())
         .unwrap_or(10);
-    let shared_pools_str = body
-        .get("shared_pools")
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
     let quantity_configs_str = body
         .get("quantity_configs")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
@@ -1628,7 +1608,6 @@ async fn admin_import_recipe(
         &spec_source,
         &endpoints,
         seed_count,
-        shared_pools_str.as_deref(),
         quantity_configs_str.as_deref(),
         faker_rules_str.as_deref(),
         rules_str.as_deref(),
@@ -1698,8 +1677,7 @@ async fn admin_activate_recipe(
 
     let seed_count = recipe.seed_count as usize;
 
-    // Parse shared_pools and quantity_configs from recipe
-    let pool_config = crate::composer::parse_shared_pools(&recipe.shared_pools);
+    // Parse quantity_configs from recipe
     let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
     let custom_lists = crate::composer::parse_custom_lists(&recipe.custom_lists);
     let faker_rules = crate::composer::parse_faker_rules(&recipe.faker_rules, &custom_lists);
@@ -1940,16 +1918,9 @@ async fn admin_activate_recipe(
 
     // Generate document store using composer
     let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
-    let pools = crate::composer::generate_pools(
-        &spec,
-        &raw_spec,
-        &pool_config,
-        &faker_rules,
-        &recipe_rules,
-    );
 
-    // Build quantity configs: use recipe quantity_configs, with seed_count as default
-    // Only populate defaults for response_defs (no meaningless pools for input-only types)
+    // Build quantity configs: use recipe quantity_configs, with seed_count as default.
+    // Only populate defaults for response_defs (no meaningless defaults for input-only types).
     let mut effective_quantities = quantity_configs;
     for def_name in &response_defs {
         effective_quantities
@@ -1964,7 +1935,6 @@ async fn admin_activate_recipe(
         &spec,
         &raw_spec,
         &entity_graph,
-        &pools,
         &effective_quantities,
         &endpoints,
         &faker_rules,
@@ -2075,8 +2045,6 @@ async fn admin_get_recipe_config(
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::get_recipe(&conn, id) {
         Ok(Some(recipe)) => {
-            let shared_pools: serde_json::Value =
-                serde_json::from_str(&recipe.shared_pools).unwrap_or(serde_json::json!({}));
             let quantity_configs: serde_json::Value =
                 serde_json::from_str(&recipe.quantity_configs).unwrap_or(serde_json::json!({}));
             let faker_rules: serde_json::Value =
@@ -2088,7 +2056,6 @@ async fn admin_get_recipe_config(
             let custom_lists: serde_json::Value =
                 serde_json::from_str(&recipe.custom_lists).unwrap_or(serde_json::json!({}));
             Json(serde_json::json!({
-                "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
                 "rules": rules,
@@ -2112,7 +2079,6 @@ async fn admin_get_recipe_config(
 
 #[derive(Deserialize)]
 struct UpdateRecipeConfigRequest {
-    shared_pools: serde_json::Value,
     quantity_configs: serde_json::Value,
     faker_rules: serde_json::Value,
     #[serde(default)]
@@ -2136,8 +2102,6 @@ async fn admin_put_recipe_config(
     axum::extract::Path(id): axum::extract::Path<i64>,
     Json(body): Json<UpdateRecipeConfigRequest>,
 ) -> Response {
-    let shared_pools_str =
-        serde_json::to_string(&body.shared_pools).unwrap_or_else(|_| "{}".to_string());
     let quantity_configs_str =
         serde_json::to_string(&body.quantity_configs).unwrap_or_else(|_| "{}".to_string());
     let faker_rules_str =
@@ -2201,7 +2165,6 @@ async fn admin_put_recipe_config(
     match crate::recipe::update_recipe_config(
         &conn,
         id,
-        &shared_pools_str,
         &quantity_configs_str,
         &faker_rules_str,
         &rules_str,
@@ -2209,7 +2172,6 @@ async fn admin_put_recipe_config(
         &custom_lists_str,
     ) {
         Ok(true) => Json(serde_json::json!({
-            "shared_pools": body.shared_pools,
             "quantity_configs": body.quantity_configs,
             "faker_rules": body.faker_rules,
             "rules": serde_json::from_str::<serde_json::Value>(&rules_str).unwrap_or(serde_json::json!([])),
@@ -3282,7 +3244,7 @@ definitions:
         let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let id = created["id"].as_i64().unwrap();
 
-        // GET config -> 200 with default empty pools/configs
+        // GET config -> 200 with default empty configs
         let req = Request::builder()
             .uri(format!("/_api/admin/recipes/{id}/config"))
             .body(Body::empty())
@@ -3291,7 +3253,10 @@ definitions:
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["shared_pools"], serde_json::json!({}));
+        assert!(
+            json.get("shared_pools").is_none(),
+            "shared_pools surface removed; response must omit the key"
+        );
         assert_eq!(json["quantity_configs"], serde_json::json!({}));
     }
 
@@ -3313,7 +3278,9 @@ definitions:
         let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let id = created["id"].as_i64().unwrap();
 
-        // PUT config with values
+        // PUT config with values. An extra `shared_pools` key is still
+        // accepted for back-compat with old clients; the server parses and
+        // ignores it.
         let config = serde_json::json!({
             "shared_pools": {"Pet": {"is_shared": true, "pool_size": 5}},
             "quantity_configs": {"Pet.tags": {"min": 1, "max": 3}},
@@ -3337,9 +3304,9 @@ definitions:
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["shared_pools"]["Pet"]["pool_size"],
-            serde_json::json!(5)
+        assert!(
+            json.get("shared_pools").is_none(),
+            "shared_pools surface removed; response must omit the key even if the PUT included it"
         );
         assert_eq!(
             json["quantity_configs"]["Pet.tags"]["max"],
@@ -3396,7 +3363,8 @@ definitions:
         let id = created["id"].as_i64().unwrap();
         assert_eq!(created["name"], "Configured Petstore");
 
-        // GET recipe shows config fields
+        // GET recipe shows config fields. shared_pools is no longer surfaced;
+        // extra key on the create request parses-ignore per back-compat.
         let req = Request::builder()
             .uri(format!("/_api/admin/recipes/{id}"))
             .body(Body::empty())
@@ -3405,11 +3373,12 @@ definitions:
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // shared_pools and quantity_configs are stored as JSON strings; the server
-        // serializes Recipe with serde so they come back as strings
-        let shared_pools: serde_json::Value =
-            serde_json::from_str(json["shared_pools"].as_str().unwrap()).unwrap();
-        assert_eq!(shared_pools["Pet"]["pool_size"], serde_json::json!(10));
+        assert!(
+            json.get("shared_pools").is_none(),
+            "shared_pools removed from Recipe serialization"
+        );
+        // quantity_configs is stored as a JSON string; the server serializes
+        // Recipe with serde so it comes back as a string.
         let quantity_configs: serde_json::Value =
             serde_json::from_str(json["quantity_configs"].as_str().unwrap()).unwrap();
         assert_eq!(quantity_configs["Pet.tags"]["max"], serde_json::json!(5));
@@ -3812,8 +3781,7 @@ definitions:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().expect("response should be an array");
         assert!(!arr.is_empty(), "should have at least one pet");
-        let allowed: std::collections::HashSet<&str> =
-            ["hi", "hey", "howdy"].into_iter().collect();
+        let allowed: std::collections::HashSet<&str> = ["hi", "hey", "howdy"].into_iter().collect();
         for pet in arr {
             let name = pet["name"].as_str().unwrap_or("");
             assert!(
@@ -5167,7 +5135,6 @@ definitions:
         assert_eq!(cloned["seed_count"], created["seed_count"]);
         assert_eq!(cloned["spec_source"], created["spec_source"]);
         assert_eq!(cloned["selected_endpoints"], created["selected_endpoints"]);
-        assert_eq!(cloned["shared_pools"], created["shared_pools"]);
         assert_eq!(cloned["quantity_configs"], created["quantity_configs"]);
         assert_eq!(cloned["faker_rules"], created["faker_rules"]);
         assert_eq!(cloned["rules"], created["rules"]);

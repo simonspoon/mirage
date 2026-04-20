@@ -71,12 +71,14 @@ Generates fake data for each table (the **SQLite row path**). Uses field name he
 ### `composer.rs`
 
 Document-based generator that produces the canonical row set for every
-active endpoint. `generate_pools` builds shared entity pools; then
-`compose_documents` assembles a full structured response document for
-each endpoint and returns a `DocumentStore` (the in-memory intermediate
-type — `HashMap<String, Vec<serde_json::Value>>` keyed by table name).
-The same constraint-rule machinery as the seeder is applied (field-level
-pre-pass + compare-repair post-pass).
+active endpoint. `compose_documents` assembles a full structured
+response document for each endpoint and returns a `DocumentStore`
+(the in-memory intermediate type —
+`HashMap<String, Vec<serde_json::Value>>` keyed by table name). The
+same constraint-rule machinery as the seeder is applied (field-level
+pre-pass + compare-repair post-pass). Nested-$ref samples are sourced
+implicitly from each def's SQLite backing table at compose time — the
+old user-facing `shared_pools` opt-in surface is gone.
 
 The composer does not serve responses directly. The caller
 (`server.rs:admin_activate_recipe` and `main.rs` boot) hands the
@@ -94,23 +96,25 @@ The constraint-rules subsystem. Defines the `Rule` enum (five variants: `Range`,
 - **Apply (field-level)** `generate_for_field_rule()` / `generate_for_pattern()` (via `rand_regex` with `max_repeat=100`) — resolve Range/Choice/Const/Pattern rules before falling through to the x-faker / format / heuristic / type layers
 - **Apply (cross-field)** `apply_compare_rules()` + `repair_left()` — in-place row repair after initial generation, i64-preserving for ints, all-op repair for strings
 
-The same rule machinery is used by both `seeder::seed_table` (SQLite rows) and `composer::generate_pools` / `compose_documents` (JSON documents).
+The same rule machinery is used by both `seeder::seed_table` (SQLite rows) and `composer::compose_documents` (JSON documents).
 
 ### `recipe.rs`
 
 SQLite-backed recipe persistence. A recipe bundles everything a user
-configures for a spec: selected endpoints, seed count, shared pool
-sizes, quantity configs, faker rules, constraint rules, and
-**frozen rows** (user-pinned rows replayed after recomposition).
-Stored as JSON-string columns in a `recipes` table. Idempotent
-`ALTER TABLE ... ADD COLUMN`-style migrations so existing databases
-pick up new columns (`shared_pools`, `quantity_configs`, `faker_rules`,
-`rules TEXT NOT NULL DEFAULT '[]'`, `frozen_rows TEXT NOT NULL DEFAULT '{}'`)
-without a schema reset. `FrozenRows` is
-`HashMap<String, Vec<serde_json::Value>>` keyed by table name. CRUD
-helpers: `create_recipe`, `list_recipes`, `get_recipe`, `update_recipe`,
-`update_recipe_config`, `delete_recipe`, plus `find_unique_clone_name`
-used by the clone endpoint.
+configures for a spec: selected endpoints, seed count, quantity
+configs, faker rules, constraint rules, and **frozen rows**
+(user-pinned rows replayed after recomposition). Stored as JSON-string
+columns in a `recipes` table. Idempotent `ALTER TABLE ... ADD COLUMN`-style
+migrations so existing databases pick up new columns
+(`quantity_configs`, `faker_rules`, `rules TEXT NOT NULL DEFAULT '[]'`,
+`frozen_rows TEXT NOT NULL DEFAULT '{}'`) without a schema reset. The
+legacy `shared_pools` column is retained for schema back-compat — old
+rows still carry it but the value is no longer read; nested-$ref
+samples are sourced implicitly from each def's SQLite backing table at
+compose time. `FrozenRows` is `HashMap<String, Vec<serde_json::Value>>`
+keyed by table name. CRUD helpers: `create_recipe`, `list_recipes`,
+`get_recipe`, `update_recipe`, `update_recipe_config`, `delete_recipe`,
+plus `find_unique_clone_name` used by the clone endpoint.
 
 ### `entity_graph.rs`
 

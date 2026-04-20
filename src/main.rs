@@ -94,7 +94,7 @@ enum RecipesCommand {
         #[arg(long)]
         seed_count: Option<i64>,
         /// Optional JSON file containing any of
-        /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows / custom_lists
+        /// quantity_configs / faker_rules / rules / frozen_rows / custom_lists
         #[arg(long)]
         config_file: Option<PathBuf>,
         #[arg(long, env = "MIRAGE_URL")]
@@ -118,7 +118,7 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
-    /// Manage a recipe's parsed config (shared pools, quantity configs, faker rules, rules, frozen rows, custom lists)
+    /// Manage a recipe's parsed config (quantity configs, faker rules, rules, frozen rows, custom lists)
     Config(ConfigArgs),
 }
 
@@ -134,7 +134,7 @@ enum ConfigCommand {
     ///
     /// The file must match the body accepted by
     /// `PUT /_api/admin/recipes/:id/config` (an object with any of
-    /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows / custom_lists).
+    /// quantity_configs / faker_rules / rules / frozen_rows / custom_lists).
     /// The whole config is replaced; there are no partial-patch semantics.
     Apply {
         /// Recipe id
@@ -421,14 +421,12 @@ fn parse_json_or_exit(s: &str, ctx: &str) -> serde_json::Value {
 }
 
 /// Take a recipe JSON value (as returned by the admin API) and expand the
-/// JSON-string config fields (`selected_endpoints`, `shared_pools`,
-/// `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`, `custom_lists`)
-/// into nested JSON values so downstream consumers do not see double-encoded
-/// strings.
+/// JSON-string config fields (`selected_endpoints`, `quantity_configs`,
+/// `faker_rules`, `rules`, `frozen_rows`, `custom_lists`) into nested JSON
+/// values so downstream consumers do not see double-encoded strings.
 fn parse_nested_config(recipe: &mut serde_json::Value) {
     const STRING_JSON_FIELDS: &[&str] = &[
         "selected_endpoints",
-        "shared_pools",
         "quantity_configs",
         "faker_rules",
         "rules",
@@ -610,7 +608,6 @@ async fn run_recipes(args: &RecipesArgs) {
                     emit_err_and_exit("--config-file must contain a JSON object")
                 });
                 const CONFIG_KEYS: &[&str] = &[
-                    "shared_pools",
                     "quantity_configs",
                     "faker_rules",
                     "rules",
@@ -759,16 +756,8 @@ async fn main() {
 
         // Populate document store using composer with default configs
         let entity_graph = entity_graph::build_entity_graph(&raw_spec, &all_ops);
-        let pool_config = composer::SharedPoolConfig::new();
         let no_faker_rules = composer::FakerRules::new();
         let no_recipe_rules: Vec<rules::Rule> = Vec::new();
-        let pools = composer::generate_pools(
-            &spec,
-            &raw_spec,
-            &pool_config,
-            &no_faker_rules,
-            &no_recipe_rules,
-        );
         let mut quantities = composer::QuantityConfigs::new();
         for def_name in &response_defs {
             quantities.insert(
@@ -788,7 +777,6 @@ async fn main() {
             &spec,
             &raw_spec,
             &entity_graph,
-            &pools,
             &quantities,
             &all_endpoints,
             &no_faker_rules,

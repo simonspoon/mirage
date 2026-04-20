@@ -92,11 +92,7 @@ impl MirageServer {
     /// Relaunch mirage against an existing workdir (carrying forward its
     /// `mirage.db`). Picks a fresh port so tests do not race on the old one.
     #[allow(dead_code)]
-    fn start_in_existing_dir(
-        workdir: PathBuf,
-        spec_rel_path: &str,
-        probe_path: &str,
-    ) -> Self {
+    fn start_in_existing_dir(workdir: PathBuf, spec_rel_path: &str, probe_path: &str) -> Self {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -514,171 +510,9 @@ fn test_composition_merged_fields() {
     }
 }
 
-#[test]
-fn test_shared_type_pool() {
-    // Owner appears via two paths — directly at /owners (array) and indirectly
-    // as ComposedEntity.owner (embedded $ref) on /composed. After recipe
-    // activation, the composed collection URL is /{table.to_lowercase()}, i.e.
-    // /composedentity per src/server.rs:1768.
-    //
-    // This test guards endpoint reachability + Owner shape round-trip through
-    // DB for both paths AND cross-endpoint pool-consumption identity:
-    // every composed.owner (name, city) tuple must be a member of the
-    // /owners pool's (name, city) tuple set.
-    let server = MirageServer::start("tests/fixtures/mega.yaml", "/owners");
-    let client = reqwest::blocking::Client::new();
-
-    let spec_source = std::fs::read_to_string("tests/fixtures/mega.yaml").unwrap();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let recipe_name = format!("mega-shared-owner-{nanos}");
-    let body = serde_json::json!({
-        "name": recipe_name,
-        "spec_source": spec_source,
-        "endpoints": [
-            {"method": "get", "path": "/owners"},
-            {"method": "get", "path": "/composed/{id}"}
-        ],
-        "seed_count": 5,
-        "shared_pools": {
-            "Owner": {"is_shared": true, "pool_size": 3}
-        }
-    });
-    let resp = client
-        .post(server.url("/_api/admin/recipes"))
-        .json(&body)
-        .send()
-        .unwrap();
-    assert_eq!(resp.status(), 201, "create recipe should return 201");
-    let created: serde_json::Value = resp.json().unwrap();
-    let id = created["id"]
-        .as_i64()
-        .expect("recipe response should contain numeric id");
-
-    let resp = client
-        .post(server.url(&format!("/_api/admin/recipes/{id}/activate")))
-        .send()
-        .unwrap();
-    assert_eq!(resp.status(), 200, "activate recipe should return 200");
-
-    // /owners — direct Owner array endpoint.
-    let resp = client.get(server.url("/owners")).send().unwrap();
-    assert_eq!(resp.status(), 200, "/owners should return 200");
-    let body: serde_json::Value = resp.json().unwrap();
-    let owners = body
-        .as_array()
-        .expect("/owners response should be a JSON array");
-    assert!(!owners.is_empty(), "/owners array should be non-empty");
-
-    let mut pool_tuples: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    for (idx, row) in owners.iter().enumerate() {
-        let ctx = || format!("/owners row {idx}: {row}");
-        assert!(
-            row["name"].is_string(),
-            "owner.name must be string — {}",
-            ctx()
-        );
-        let address_raw = &row["address"];
-        assert!(
-            address_raw.is_string() || address_raw.is_object(),
-            "owner.address must be string or object — {}",
-            ctx()
-        );
-        let address = unwrap_json(address_raw);
-        assert!(
-            address["city"].is_string(),
-            "owner.address.city must be string — {}",
-            ctx()
-        );
-        assert!(
-            address["country"].is_string(),
-            "owner.address.country must be string — {}",
-            ctx()
-        );
-        let name = row["name"].as_str().unwrap().to_string();
-        let city = address["city"].as_str().unwrap().to_string();
-        pool_tuples.insert((name, city));
-    }
-
-    // Guard against tautological pass if pool short-circuit regresses: we
-    // requested pool_size=3, so /owners must surface exactly 3 rows and
-    // the (name, city) tuples must all be distinct.
-    assert_eq!(
-        owners.len(),
-        3,
-        "/owners should surface exactly pool_size=3 rows, got {}",
-        owners.len()
-    );
-    assert_eq!(
-        pool_tuples.len(),
-        3,
-        "/owners (name, city) tuples should all be distinct, got {} unique of {} rows: {:?}",
-        pool_tuples.len(),
-        owners.len(),
-        pool_tuples
-    );
-
-    // /composedentity — ComposedEntity collection URL post-activation is
-    // /{table.to_lowercase()} (src/server.rs:1768), NOT /composed.
-    let resp = client.get(server.url("/composedentity")).send().unwrap();
-    assert_eq!(resp.status(), 200, "/composedentity should return 200");
-    let body: serde_json::Value = resp.json().unwrap();
-    let composed = body
-        .as_array()
-        .expect("/composedentity response should be a JSON array");
-    assert!(
-        !composed.is_empty(),
-        "/composedentity array should be non-empty"
-    );
-
-    for (idx, row) in composed.iter().enumerate() {
-        let ctx = || format!("/composedentity row {idx}: {row}");
-        let owner_raw = &row["owner"];
-        assert!(
-            owner_raw.is_string() || owner_raw.is_object(),
-            "composed.owner must be string or object — {}",
-            ctx()
-        );
-        let owner = unwrap_json(owner_raw);
-        assert!(
-            owner["name"].is_string(),
-            "composed.owner.name must be string — {}",
-            ctx()
-        );
-        let address_raw = &owner["address"];
-        assert!(
-            address_raw.is_string() || address_raw.is_object(),
-            "composed.owner.address must be string or object — {}",
-            ctx()
-        );
-        let address = unwrap_json(address_raw);
-        assert!(
-            address["city"].is_string(),
-            "composed.owner.address.city must be string — {}",
-            ctx()
-        );
-        assert!(
-            address["country"].is_string(),
-            "composed.owner.address.country must be string — {}",
-            ctx()
-        );
-
-        let tup = (
-            owner["name"].as_str().unwrap().to_string(),
-            address["city"].as_str().unwrap().to_string(),
-        );
-        assert!(
-            pool_tuples.contains(&tup),
-            "composed.owner (name, city) {:?} must be drawn from /owners pool {:?} — {}",
-            tup,
-            pool_tuples,
-            ctx()
-        );
-    }
-}
+// `test_shared_type_pool` deleted — the shared_pools user surface is gone.
+// Cross-endpoint nested-$ref reuse is now driven by the SQLite backing table
+// (task yhgg); coverage for that behavior lives in that task's tests.
 
 #[test]
 fn test_endpoint_method_coverage() {
@@ -1162,7 +996,7 @@ fn test_recipes_cli_list() {
     assert_eq!(sa["endpoint_count"], 2);
     // Summary must NOT include the full config fields.
     assert!(sa.get("spec_source").is_none());
-    assert!(sa.get("shared_pools").is_none());
+    assert!(sa.get("quantity_configs").is_none());
 
     let sb = find(b["id"].as_i64().unwrap()).expect("recipe B summary");
     assert_eq!(sb["name"], "Recipe B");
@@ -1187,8 +1021,8 @@ fn test_recipes_cli_show() {
     );
     assert_eq!(recipe["selected_endpoints"].as_array().unwrap().len(), 2);
     assert!(
-        recipe["shared_pools"].is_object(),
-        "shared_pools should be parsed into an object"
+        recipe.get("shared_pools").is_none(),
+        "shared_pools surface removed; show response must omit the key"
     );
     assert!(recipe["quantity_configs"].is_object());
     assert!(recipe["faker_rules"].is_object());
@@ -1261,7 +1095,10 @@ fn test_recipes_cli_clone() {
     // Config fields expanded.
     assert!(cloned["selected_endpoints"].is_array());
     assert_eq!(cloned["selected_endpoints"].as_array().unwrap().len(), 2);
-    assert!(cloned["shared_pools"].is_object());
+    assert!(
+        cloned.get("shared_pools").is_none(),
+        "shared_pools surface removed; clone response must omit the key"
+    );
 }
 
 #[test]
@@ -1377,12 +1214,15 @@ fn test_recipes_cli_create() {
     .unwrap();
 
     let config_path = scratch.join("config.json");
+    // An extra `shared_pools` key exercises back-compat parse-ignore on the
+    // server; the `custom_lists` payload is what we actually round-trip.
     std::fs::write(
         &config_path,
         r#"{
-            "shared_pools": {"color": ["red","blue"]},
+            "shared_pools": {"legacy": {"is_shared": true, "pool_size": 3}},
             "quantity_configs": {},
             "faker_rules": {},
+            "custom_lists": {"color": ["red","blue"]},
             "rules": [],
             "frozen_rows": {}
         }"#,
@@ -1427,11 +1267,18 @@ fn test_recipes_cli_create() {
     assert_eq!(endpoints_parsed.len(), 3);
     assert_eq!(endpoints_parsed[0]["method"], "GET");
     assert_eq!(endpoints_parsed[0]["path"], "/foo");
-    // Shared pools round-tripped.
-    let pools_str = recipe["shared_pools"]
+    // shared_pools has been removed from the Recipe struct — the create
+    // response must omit the key entirely, even though the CLI body may have
+    // included it (back-compat parse-ignore).
+    assert!(
+        recipe.get("shared_pools").is_none(),
+        "shared_pools surface removed; raw create response must omit the key"
+    );
+    // custom_lists round-tripped as a JSON string on the raw create response.
+    let lists_str = recipe["custom_lists"]
         .as_str()
-        .expect("shared_pools string");
-    assert!(pools_str.contains("color"));
+        .expect("custom_lists string");
+    assert!(lists_str.contains("color"));
 
     std::fs::remove_dir_all(&scratch).ok();
 }
@@ -1571,7 +1418,10 @@ fn test_recipes_cli_export_stdout() {
         exported["selected_endpoints"].is_array(),
         "selected_endpoints should be expanded (not JSON string)"
     );
-    assert!(exported["shared_pools"].is_object());
+    assert!(
+        exported.get("shared_pools").is_none(),
+        "shared_pools surface removed; export must omit the key"
+    );
     assert!(exported["rules"].is_array());
 }
 
@@ -1721,6 +1571,8 @@ fn test_recipes_cli_config_apply() {
     let scratch = scratch_dir("config-apply");
 
     let cfg_path = scratch.join("cfg.json");
+    // An extra `shared_pools` key exercises back-compat parse-ignore on the
+    // server; the rest of the payload is what we actually round-trip.
     std::fs::write(
         &cfg_path,
         r#"{
@@ -1750,7 +1602,10 @@ fn test_recipes_cli_config_apply() {
     );
     let echoed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
-    assert_eq!(echoed["shared_pools"]["Pet"]["pool_size"], 7);
+    assert!(
+        echoed.get("shared_pools").is_none(),
+        "shared_pools surface removed; config apply echo must omit the key"
+    );
     assert_eq!(echoed["quantity_configs"]["Pet.tags"]["max"], 3);
     assert_eq!(echoed["faker_rules"]["Pet.name"]["kind"], "FirstName");
     assert!(echoed["rules"].is_array());
@@ -1761,7 +1616,10 @@ fn test_recipes_cli_config_apply() {
     assert!(out.status.success());
     let recipe: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("show stdout should be JSON");
-    assert_eq!(recipe["shared_pools"]["Pet"]["pool_size"], 7);
+    assert!(
+        recipe.get("shared_pools").is_none(),
+        "shared_pools surface removed; show response must omit the key"
+    );
     assert_eq!(recipe["quantity_configs"]["Pet.tags"]["min"], 1);
 
     std::fs::remove_dir_all(&scratch).ok();
@@ -2155,7 +2013,11 @@ fn test_recipe_custom_lists_persist_activate_seed() {
     assert_eq!(resp.status(), 200, "activate should return 200");
 
     let resp = client.get(server.url("/pet")).send().unwrap();
-    assert_eq!(resp.status(), 200, "GET /pet should return 200 post-activate");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /pet should return 200 post-activate"
+    );
     let body: serde_json::Value = resp.json().unwrap();
     let arr = body
         .as_array()

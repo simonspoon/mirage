@@ -98,7 +98,6 @@ interface Recipe {
   selected_endpoints: string;
   seed_count: number;
   created_at: string;
-  shared_pools: string;
   quantity_configs: string;
   faker_rules: string;
   rules: string;
@@ -248,7 +247,6 @@ function App() {
   const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "config" | "name">("paste");
   const [entityGraph, setEntityGraph] = createSignal<any>(null);
   const [graphLoading, setGraphLoading] = createSignal(false);
-  const [recipeSharedPools, setRecipeSharedPools] = createSignal<Record<string, {is_shared: boolean, pool_size: number}>>({});
   const [recipeQuantityConfigs, setRecipeQuantityConfigs] = createSignal<Record<string, {min: number, max: number}>>({});
   const [recipeFakerRules, setRecipeFakerRules] = createSignal<Record<string, string>>({});
   const [recipeCustomLists, setRecipeCustomLists] = createSignal<Record<string, string[]>>({});
@@ -490,7 +488,6 @@ function App() {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          shared_pools: currentConfig.shared_pools || {},
           quantity_configs: currentConfig.quantity_configs || {},
           faker_rules: currentConfig.faker_rules || {},
           rules: currentConfig.rules || [],
@@ -668,14 +665,6 @@ function App() {
     if (!graph) return;
 
     // Preserve existing config if already populated (edit mode tab switching)
-    if (Object.keys(recipeSharedPools()).length === 0) {
-      const pools: Record<string, {is_shared: boolean, pool_size: number}> = {};
-      for (const entity of graph.shared_entities || []) {
-        pools[entity] = { is_shared: true, pool_size: 10 };
-      }
-      setRecipeSharedPools(pools);
-    }
-
     if (Object.keys(recipeQuantityConfigs()).length === 0) {
       const configs: Record<string, {min: number, max: number}> = {};
       for (const ap of graph.array_properties || []) {
@@ -725,7 +714,6 @@ function App() {
             spec_source: recipeSpecText().trim(),
             endpoints,
             seed_count: recipeSeedCount(),
-            shared_pools: recipeSharedPools(),
             quantity_configs: recipeQuantityConfigs(),
             faker_rules: recipeFakerRules(),
             rules: recipeRules(),
@@ -748,7 +736,6 @@ function App() {
         setRecipeSelectedEndpoints([]);
         setRecipeStep("paste");
         setEntityGraph(null);
-        setRecipeSharedPools({});
         setRecipeQuantityConfigs({});
         setRecipeFakerRules({});
         setRecipeCustomLists({});
@@ -779,7 +766,6 @@ function App() {
           spec_source: recipeSpecText().trim(),
           endpoints,
           seed_count: recipeSeedCount(),
-          shared_pools: recipeSharedPools(),
           quantity_configs: recipeQuantityConfigs(),
           faker_rules: recipeFakerRules(),
           rules: recipeRules(),
@@ -838,7 +824,6 @@ function App() {
       setRecipeAvailableEndpoints([]);
       setRecipeSelectedEndpoints([]);
       setRecipeStep("paste");
-      setRecipeSharedPools({});
       setRecipeQuantityConfigs({});
       setRecipeFakerRules({});
       setRecipeCustomLists({});
@@ -947,9 +932,7 @@ function App() {
         selectedEps.some((sel) => sel.method === ep.method && sel.path === ep.path)
       );
 
-      // Parse shared_pools, quantity_configs, faker_rules, and rules
-      let sharedPools: Record<string, {is_shared: boolean, pool_size: number}> = {};
-      try { sharedPools = JSON.parse(recipe.shared_pools); } catch { /* empty */ }
+      // Parse quantity_configs, faker_rules, and rules
       let quantityConfigs: Record<string, {min: number, max: number}> = {};
       try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
       let fakerRules: Record<string, string> = {};
@@ -976,7 +959,6 @@ function App() {
       setRecipeSelectedEndpoints(selectedFlags);
       setRecipeName(recipe.name);
       setRecipeSeedCount(recipe.seed_count);
-      setRecipeSharedPools(sharedPools);
       setRecipeQuantityConfigs(quantityConfigs);
       setRecipeFakerRules(fakerRules);
       setRecipeCustomLists(customLists);
@@ -999,7 +981,6 @@ function App() {
     setRecipeSelectedEndpoints([]);
     setRecipeStep("paste");
     setEntityGraph(null);
-    setRecipeSharedPools({});
     setRecipeQuantityConfigs({});
     setRecipeFakerRules({});
     setRecipeCustomLists({});
@@ -1925,7 +1906,7 @@ function App() {
                       await handleFetchGraph();
                       return;
                     }
-                    if (Object.keys(recipeSharedPools()).length === 0 && Object.keys(recipeQuantityConfigs()).length === 0) {
+                    if (Object.keys(recipeQuantityConfigs()).length === 0) {
                       handleGoToConfig();
                       return;
                     }
@@ -1985,8 +1966,6 @@ function App() {
               {/* Step 3: Configure data generation */}
               <Show when={recipeStep() === "config"}>
                 <RecipeConfigStep
-                  recipeSharedPools={recipeSharedPools}
-                  setRecipeSharedPools={setRecipeSharedPools}
                   recipeQuantityConfigs={recipeQuantityConfigs}
                   setRecipeQuantityConfigs={setRecipeQuantityConfigs}
                   recipeFakerRules={recipeFakerRules}
@@ -4350,8 +4329,6 @@ function SchemasPage(props: {
 }
 
 function RecipeConfigStep(props: {
-  recipeSharedPools: Accessor<Record<string, { is_shared: boolean; pool_size: number }>>;
-  setRecipeSharedPools: Setter<Record<string, { is_shared: boolean; pool_size: number }>>;
   recipeQuantityConfigs: Accessor<Record<string, { min: number; max: number }>>;
   setRecipeQuantityConfigs: Setter<Record<string, { min: number; max: number }>>;
   recipeFakerRules: Accessor<Record<string, string>>;
@@ -4368,7 +4345,6 @@ function RecipeConfigStep(props: {
   configShowNonDefault: Accessor<boolean>;
   setConfigShowNonDefault: Setter<boolean>;
 }) {
-  const hasPools = () => Object.keys(props.recipeSharedPools()).length > 0;
   const hasConfigs = () => Object.keys(props.recipeQuantityConfigs()).length > 0;
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
 
@@ -4540,10 +4516,9 @@ function RecipeConfigStep(props: {
 
   const customListNames = createMemo((): string[] => Object.keys(props.recipeCustomLists()).sort());
 
-  // All table (definition) names with at least one rule/pool/config/constraint attached.
+  // All table (definition) names with at least one rule/config/constraint attached.
   const allDefinitions = createMemo((): string[] => {
     const set = new Set<string>();
-    for (const name of Object.keys(props.recipeSharedPools())) set.add(name);
     for (const key of Object.keys(props.recipeQuantityConfigs())) {
       const dot = key.indexOf(".");
       set.add(dot >= 0 ? key.slice(0, dot) : key);
@@ -4666,7 +4641,7 @@ function RecipeConfigStep(props: {
       .filter(vb => !rooted.has(vb.label));
   });
 
-  const hasAnything = () => hasPools() || hasConfigs() || hasRules() || props.recipeRules().length > 0 || virtualBuckets().length > 0;
+  const hasAnything = () => hasConfigs() || hasRules() || props.recipeRules().length > 0 || virtualBuckets().length > 0;
 
   // Endpoint chip filter — narrows table list to tables referenced by selected endpoints.
   // Empty set = no endpoint filter applied (all tables eligible).
@@ -4705,7 +4680,6 @@ function RecipeConfigStep(props: {
     const q = props.configSearch().toLowerCase();
     const showNonDefault = props.configShowNonDefault();
     const epFilter = configEndpointFilter();
-    const pools = props.recipeSharedPools();
     const arrays = arrayConfigsByDef();
     const fields = fieldRulesByDef();
     const constraints = constraintsByDef();
@@ -4725,12 +4699,10 @@ function RecipeConfigStep(props: {
         if (!eps.some(ep => epFilter.has(ep))) return false;
       }
       if (showNonDefault) {
-        const p = pools[def];
-        const poolChanged = !!p && (!p.is_shared || p.pool_size !== 10);
         const arrayChanged = (arrays[def] || []).some(i => i.config.min !== 1 || i.config.max !== 3);
         const fieldChanged = (fields[def] || []).some(i => i.strategy !== "auto");
         const hasConstraints = (constraints[def] || []).length > 0;
-        if (!poolChanged && !arrayChanged && !fieldChanged && !hasConstraints) return false;
+        if (!arrayChanged && !fieldChanged && !hasConstraints) return false;
       }
       return true;
     });
@@ -4785,7 +4757,7 @@ function RecipeConfigStep(props: {
         <div>
           <h3 class="text-lg font-semibold">Configure Data Generation</h3>
           <p class="text-sm text-gray-500">
-            {Object.keys(props.recipeSharedPools()).length} shared pools · {Object.keys(props.recipeQuantityConfigs()).length} array properties · {Object.keys(props.recipeFakerRules()).length} field rules · {props.recipeRules().length} constraint rules
+            {Object.keys(props.recipeQuantityConfigs()).length} array properties · {Object.keys(props.recipeFakerRules()).length} field rules · {props.recipeRules().length} constraint rules
           </p>
         </div>
         <Show when={hasAnything()}>
@@ -5041,25 +5013,6 @@ function RecipeConfigStep(props: {
       {/* Bulk controls — apply across all endpoints */}
       <Show when={hasAnything()}>
         <div class="flex flex-wrap items-center gap-4 mb-4 px-3 py-2 bg-gray-900/50 rounded-lg border border-gray-800/50">
-          <Show when={hasPools()}>
-            <div class="flex items-center gap-2">
-              <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">All pools</span>
-              <input
-                type="number" min="1" max="100" placeholder="n"
-                class="w-14 bg-[#070c17] border border-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-100 focus:outline-none focus:border-gray-700"
-                onChange={(e) => {
-                  const val = parseInt(e.target.value);
-                  if (!val || val < 1) return;
-                  const pools = { ...props.recipeSharedPools() };
-                  for (const key of Object.keys(pools)) {
-                    pools[key] = { ...pools[key], pool_size: val };
-                  }
-                  props.setRecipeSharedPools(pools);
-                  e.target.value = "";
-                }}
-              />
-            </div>
-          </Show>
           <Show when={hasConfigs()}>
             <div class="flex items-center gap-2">
               <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">All arrays</span>
@@ -5133,19 +5086,12 @@ function RecipeConfigStep(props: {
           {(defName) => {
             const q = () => props.configSearch().toLowerCase();
             const showNonDefault = () => props.configShowNonDefault();
-            const rawPool = () => props.recipeSharedPools()[defName];
             const rawArrays = () => arrayConfigsByDef()[defName] || [];
             const rawFields = () => fieldRulesByDef()[defName] || [];
             const endpoints = () => defToEndpoints()[defName] || [];
             const isNested = () => endpoints().length === 0;
             const defMatchesQuery = () => !q() || defName.toLowerCase().includes(q()) || endpoints().some(e => e.toLowerCase().includes(q()));
 
-            const visiblePool = () => {
-              const p = rawPool();
-              if (!p) return null;
-              if (showNonDefault() && p.is_shared && p.pool_size === 10) return null;
-              return p;
-            };
             const visibleArrays = () => rawArrays().filter(i => {
               if (showNonDefault() && i.config.min === 1 && i.config.max === 3) return false;
               if (q() && !defMatchesQuery() && !i.key.toLowerCase().includes(q())) return false;
@@ -5233,42 +5179,6 @@ function RecipeConfigStep(props: {
                       <span class="text-[10px] text-red-400 ml-1">1–100</span>
                     </Show>
                   </span>
-                  <Show when={visiblePool() !== null}>
-                    <span
-                      class="flex items-center gap-1 text-[10px] text-gray-400"
-                      title="Shared pool across endpoints"
-                      onClick={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => e.stopPropagation()}
-                    >
-                      <input
-                        data-testid="table-header-pool-shared"
-                        type="checkbox"
-                        checked={visiblePool()!.is_shared}
-                        onChange={(e) => {
-                          const pools = { ...props.recipeSharedPools() };
-                          pools[defName] = { ...pools[defName], is_shared: e.currentTarget.checked };
-                          props.setRecipeSharedPools(pools);
-                        }}
-                        class="accent-blue-500 rounded"
-                      />
-                      <span class="text-gray-500">shared</span>
-                      <input
-                        data-testid="table-header-pool-size"
-                        type="number"
-                        min={1}
-                        max={100}
-                        step={1}
-                        value={visiblePool()!.pool_size}
-                        onInput={(e) => {
-                          const pools = { ...props.recipeSharedPools() };
-                          pools[defName] = { ...pools[defName], pool_size: parseInt(e.currentTarget.value) || 10 };
-                          props.setRecipeSharedPools(pools);
-                        }}
-                        class="w-12 bg-[#070c17] border border-gray-800 rounded px-1 py-0.5 text-[11px] text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                      />
-                      <span class="text-gray-500">pool</span>
-                    </span>
-                  </Show>
                   <Show when={!isNested()}>
                     <span class="font-mono text-[10px] text-gray-500 truncate max-w-[45%]" title={endpoints().join(", ")}>
                       {endpoints().join(", ")}

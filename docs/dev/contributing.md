@@ -93,7 +93,7 @@ Constraint rules live in `src/rules.rs`. To add a new rule kind:
 3. Extend `validate_rules()` to reject invalid instances of the new kind (type mismatches, cycles, bad inputs).
 4. If field-level: handle it in `generate_for_field_rule()` and ensure `fake_value_for_field_layered()` consults the rule map first.
 5. If cross-field (like Compare): add an apply pass in `apply_compare_rules()` / `repair_left()` invoked after row generation.
-6. Thread the new variant through both the SQLite seed path (`seeder::seed_table`) and the composer path (`composer::generate_pools` / `compose_documents`).
+6. Thread the new variant through both the SQLite seed path (`seeder::seed_table`) and the composer path (`composer::compose_documents`).
 7. Add unit tests per variant + conflict/cycle/type-mismatch cases.
 8. Update the UI `RuleEditor` in `ui/src/index.tsx` so users can author the new kind.
 
