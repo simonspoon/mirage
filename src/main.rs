@@ -94,7 +94,7 @@ enum RecipesCommand {
         #[arg(long)]
         seed_count: Option<i64>,
         /// Optional JSON file containing any of
-        /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows
+        /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows / custom_lists
         #[arg(long)]
         config_file: Option<PathBuf>,
         #[arg(long, env = "MIRAGE_URL")]
@@ -118,7 +118,7 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
-    /// Manage a recipe's parsed config (shared pools, quantity configs, faker rules, rules, frozen rows)
+    /// Manage a recipe's parsed config (shared pools, quantity configs, faker rules, rules, frozen rows, custom lists)
     Config(ConfigArgs),
 }
 
@@ -134,7 +134,7 @@ enum ConfigCommand {
     ///
     /// The file must match the body accepted by
     /// `PUT /_api/admin/recipes/:id/config` (an object with any of
-    /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows).
+    /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows / custom_lists).
     /// The whole config is replaced; there are no partial-patch semantics.
     Apply {
         /// Recipe id
@@ -422,8 +422,9 @@ fn parse_json_or_exit(s: &str, ctx: &str) -> serde_json::Value {
 
 /// Take a recipe JSON value (as returned by the admin API) and expand the
 /// JSON-string config fields (`selected_endpoints`, `shared_pools`,
-/// `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`) into nested
-/// JSON values so downstream consumers do not see double-encoded strings.
+/// `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`, `custom_lists`)
+/// into nested JSON values so downstream consumers do not see double-encoded
+/// strings.
 fn parse_nested_config(recipe: &mut serde_json::Value) {
     const STRING_JSON_FIELDS: &[&str] = &[
         "selected_endpoints",
@@ -432,6 +433,7 @@ fn parse_nested_config(recipe: &mut serde_json::Value) {
         "faker_rules",
         "rules",
         "frozen_rows",
+        "custom_lists",
     ];
     let Some(obj) = recipe.as_object_mut() else {
         return;
@@ -613,6 +615,7 @@ async fn run_recipes(args: &RecipesArgs) {
                     "faker_rules",
                     "rules",
                     "frozen_rows",
+                    "custom_lists",
                 ];
                 for k in CONFIG_KEYS {
                     if let Some(v) = cfg_obj.get(*k) {

@@ -1119,6 +1119,7 @@ struct CreateRecipeRequest {
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
     frozen_rows: Option<serde_json::Value>,
+    custom_lists: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1132,6 +1133,7 @@ struct UpdateRecipeRequest {
     faker_rules: Option<serde_json::Value>,
     rules: Option<serde_json::Value>,
     frozen_rows: Option<serde_json::Value>,
+    custom_lists: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -1182,6 +1184,10 @@ async fn admin_create_recipe(
         .frozen_rows
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let custom_lists_str = body
+        .custom_lists
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules against the spec (resolve refs first so field lookups work)
     if let Some(ref rs) = rules_str
@@ -1207,6 +1213,7 @@ async fn admin_create_recipe(
             faker_rules_str.as_deref(),
             rules_str.as_deref(),
             frozen_rows_str.as_deref(),
+            custom_lists_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1329,6 +1336,7 @@ async fn admin_clone_recipe(
         Some(&recipe.faker_rules),
         Some(&recipe.rules),
         Some(&recipe.frozen_rows),
+        Some(&recipe.custom_lists),
     ) {
         Ok(new_recipe) => {
             (StatusCode::CREATED, Json(serde_json::json!(new_recipe))).into_response()
@@ -1395,6 +1403,11 @@ async fn admin_update_recipe(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|| "{}".to_string());
+    let custom_lists_str = body
+        .custom_lists
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
 
     // Validate rules with the same checks as create_recipe.
     if let Err(e) = validate_recipe_rules(&rules_str, &parsed_spec) {
@@ -1418,6 +1431,7 @@ async fn admin_update_recipe(
         &faker_rules_str,
         &rules_str,
         &frozen_rows_str,
+        &custom_lists_str,
     ) {
         Ok(true) => match crate::recipe::get_recipe(&conn, id) {
             Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
@@ -1455,6 +1469,8 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
             let frozen_rows: serde_json::Value =
                 serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
+            let custom_lists: serde_json::Value =
+                serde_json::from_str(&recipe.custom_lists).unwrap_or(serde_json::json!({}));
 
             let export = serde_json::json!({
                 "mirage_recipe": 2,
@@ -1467,6 +1483,7 @@ async fn admin_export_recipe(
                 "faker_rules": faker_rules,
                 "rules": rules,
                 "frozen_rows": frozen_rows,
+                "custom_lists": custom_lists,
             });
 
             let filename = format!(
@@ -1589,6 +1606,9 @@ async fn admin_import_recipe(
     let frozen_rows_str = body
         .get("frozen_rows")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let custom_lists_str = body
+        .get("custom_lists")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules from the imported recipe.
     if let Some(ref rs) = rules_str
@@ -1613,6 +1633,7 @@ async fn admin_import_recipe(
         faker_rules_str.as_deref(),
         rules_str.as_deref(),
         frozen_rows_str.as_deref(),
+        custom_lists_str.as_deref(),
     ) {
         Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
         Err(e) => (
@@ -2063,12 +2084,15 @@ async fn admin_get_recipe_config(
                 serde_json::from_str(&recipe.rules).unwrap_or(serde_json::json!([]));
             let frozen_rows: serde_json::Value =
                 serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
+            let custom_lists: serde_json::Value =
+                serde_json::from_str(&recipe.custom_lists).unwrap_or(serde_json::json!({}));
             Json(serde_json::json!({
                 "shared_pools": shared_pools,
                 "quantity_configs": quantity_configs,
                 "faker_rules": faker_rules,
                 "rules": rules,
                 "frozen_rows": frozen_rows,
+                "custom_lists": custom_lists,
             }))
             .into_response()
         }
@@ -2094,9 +2118,15 @@ struct UpdateRecipeConfigRequest {
     rules: serde_json::Value,
     #[serde(default = "default_frozen_rows")]
     frozen_rows: serde_json::Value,
+    #[serde(default = "default_custom_lists")]
+    custom_lists: serde_json::Value,
 }
 
 fn default_frozen_rows() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_custom_lists() -> serde_json::Value {
     serde_json::json!({})
 }
 
@@ -2120,6 +2150,11 @@ async fn admin_put_recipe_config(
         "{}".to_string()
     } else {
         serde_json::to_string(&body.frozen_rows).unwrap_or_else(|_| "{}".to_string())
+    };
+    let custom_lists_str = if body.custom_lists.is_null() {
+        "{}".to_string()
+    } else {
+        serde_json::to_string(&body.custom_lists).unwrap_or_else(|_| "{}".to_string())
     };
 
     // Validate rules against the recipe's spec.
@@ -2170,6 +2205,7 @@ async fn admin_put_recipe_config(
         &faker_rules_str,
         &rules_str,
         &frozen_rows_str,
+        &custom_lists_str,
     ) {
         Ok(true) => Json(serde_json::json!({
             "shared_pools": body.shared_pools,
@@ -2177,6 +2213,7 @@ async fn admin_put_recipe_config(
             "faker_rules": body.faker_rules,
             "rules": serde_json::from_str::<serde_json::Value>(&rules_str).unwrap_or(serde_json::json!([])),
             "frozen_rows": serde_json::from_str::<serde_json::Value>(&frozen_rows_str).unwrap_or(serde_json::json!({})),
+            "custom_lists": serde_json::from_str::<serde_json::Value>(&custom_lists_str).unwrap_or(serde_json::json!({})),
         }))
         .into_response(),
         Ok(false) => (
@@ -4510,6 +4547,336 @@ definitions:
         assert_eq!(pets[1]["name"], "Tundra");
     }
 
+    // -------------------------------------------------------------------
+    // Custom lists persistence tests (omhh)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_recipe_with_custom_lists() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Custom Lists Petstore",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"}
+            ],
+            "seed_count": 1,
+            "custom_lists": {
+                "Greetings": ["hi", "hey", "yo"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let lists: serde_json::Value =
+            serde_json::from_str(json["custom_lists"].as_str().unwrap()).unwrap();
+        let greetings = lists["Greetings"].as_array().unwrap();
+        assert_eq!(greetings.len(), 3);
+        assert_eq!(greetings[0], "hi");
+        assert_eq!(greetings[1], "hey");
+        assert_eq!(greetings[2], "yo");
+    }
+
+    #[tokio::test]
+    async fn test_custom_lists_crud_roundtrip() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Roundtrip Lists",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "custom_lists": {
+                "Greetings": ["hi", "hey"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // GET recipe should include custom_lists
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let lists: serde_json::Value =
+            serde_json::from_str(got["custom_lists"].as_str().unwrap()).unwrap();
+        assert_eq!(lists["Greetings"][0], "hi");
+
+        // GET config should include custom_lists
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let config: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(config["custom_lists"]["Greetings"][0], "hi");
+        assert_eq!(config["custom_lists"]["Greetings"][1], "hey");
+
+        // PUT config with updated custom_lists
+        let new_config = serde_json::json!({
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {},
+            "custom_lists": {
+                "Greetings": ["hola", "bonjour"],
+                "Farewells": ["bye", "ciao"]
+            }
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&new_config).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let updated: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(updated["custom_lists"]["Greetings"][0], "hola");
+        assert_eq!(updated["custom_lists"]["Farewells"][1], "ciao");
+
+        // GET config again to confirm persistence
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/config"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let final_config: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(final_config["custom_lists"]["Greetings"][0], "hola");
+        assert_eq!(final_config["custom_lists"]["Farewells"][0], "bye");
+    }
+
+    #[tokio::test]
+    async fn test_default_custom_lists_on_create() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Default Lists",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let lists: serde_json::Value =
+            serde_json::from_str(created["custom_lists"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            lists,
+            serde_json::json!({}),
+            "missing custom_lists should default to empty object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_recipe_includes_custom_lists() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Export Lists",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "custom_lists": {
+                "Moods": ["happy", "sad"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/export"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(export["mirage_recipe"], 2);
+        let lists = &export["custom_lists"];
+        assert!(lists.is_object(), "custom_lists should be an object");
+        let moods = lists["Moods"].as_array().unwrap();
+        assert_eq!(moods.len(), 2);
+        assert_eq!(moods[0], "happy");
+    }
+
+    #[tokio::test]
+    async fn test_import_recipe_v2_with_custom_lists() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let import_body = serde_json::json!({
+            "mirage_recipe": 2,
+            "name": "Imported Lists",
+            "spec_source": spec_yaml,
+            "selected_endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {},
+            "custom_lists": {
+                "Colors": ["red", "blue"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let lists: serde_json::Value =
+            serde_json::from_str(created["custom_lists"].as_str().unwrap()).unwrap();
+        let colors = lists["Colors"].as_array().unwrap();
+        assert_eq!(colors.len(), 2);
+        assert_eq!(colors[0], "red");
+        assert_eq!(colors[1], "blue");
+    }
+
+    #[tokio::test]
+    async fn test_import_recipe_no_custom_lists_defaults_empty() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        // v2 payload without custom_lists field — older exports predating omhh
+        let import_body = serde_json::json!({
+            "mirage_recipe": 2,
+            "name": "No Lists Import",
+            "spec_source": spec_yaml,
+            "selected_endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "shared_pools": {},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let lists: serde_json::Value =
+            serde_json::from_str(created["custom_lists"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            lists,
+            serde_json::json!({}),
+            "missing custom_lists field should default to empty object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip_custom_lists() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Roundtrip Lists Source",
+            "spec_source": spec_yaml,
+            "endpoints": [{"method": "get", "path": "/pet/{petId}"}],
+            "seed_count": 1,
+            "custom_lists": {
+                "Greetings": ["hi", "hey"],
+                "Farewells": ["bye"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Export
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}/export"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let original_lists = &export["custom_lists"];
+
+        // Import under different name
+        let mut import_body = export.clone();
+        import_body["name"] = serde_json::json!("Roundtrip Lists Imported");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/import")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&import_body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let imported: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let imported_lists: serde_json::Value =
+            serde_json::from_str(imported["custom_lists"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            *original_lists, imported_lists,
+            "custom_lists should survive export/import roundtrip"
+        );
+        assert_eq!(imported_lists["Greetings"][0], "hi");
+        assert_eq!(imported_lists["Farewells"][0], "bye");
+    }
+
     /// Build a router with a single manually-registered route for a given shape.
     fn setup_with_shape(method: &str, pattern: &str, shape: ResponseShape) -> Router {
         let conn = Connection::open_in_memory().unwrap();
@@ -4693,6 +5060,7 @@ definitions:
         assert_eq!(cloned["faker_rules"], created["faker_rules"]);
         assert_eq!(cloned["rules"], created["rules"]);
         assert_eq!(cloned["frozen_rows"], created["frozen_rows"]);
+        assert_eq!(cloned["custom_lists"], created["custom_lists"]);
     }
 
     #[tokio::test]
