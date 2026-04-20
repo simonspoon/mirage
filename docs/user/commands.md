@@ -8,6 +8,7 @@ Mirage is a Swagger 2.0 mock API server. It reads a spec, generates an in-memory
 
 ```
 mirage [OPTIONS] [SPEC]
+mirage inspect <SPEC>
 ```
 
 ### Arguments
@@ -51,6 +52,26 @@ When a spec file is provided at startup, mirage:
 3. Seeds each table with 10 fake rows.
 4. Registers all routes from the spec immediately — no wizard step required.
 
+### `mirage inspect <SPEC>`
+
+Parses a Swagger spec file and prints a diagnostic summary without starting the server. Useful for auditing a spec before loading it.
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `SPEC` | file path | Yes | Path to the Swagger 2.0 spec file. |
+
+The output lists each definition as one of:
+
+- `[TABLE] "Name" -- N columns` — a concrete definition that would be materialised as a SQLite table.
+- `[STUB] "Name" -- 1 column (likely allOf or empty)` — a definition with no useful columns (empty body or pure `allOf` wrapper).
+- `[SKIPPED — extension-only root] "Name"` — a base definition whose only usage is via `allOf`, never referenced directly from a response.
+
+Column names that collide with SQL reserved words are flagged with `WARNING:` lines. A trailing summary reports the stub and skipped counts.
+
+```bash
+mirage inspect petstore.yaml
+```
+
 ---
 
 ## Admin UI
@@ -82,6 +103,20 @@ Click **Start Mock Server** to post the selection to `/_api/admin/configure`. Th
 Once configured, the UI shows a table of all active endpoints (method and path). This includes any collection GET routes that were auto-registered by the server (see [Auto-registered collection routes](#auto-registered-collection-routes)).
 
 Click **Import New Spec** to return to Step 1. This clears the local UI state only — the server continues serving the previously configured routes until a new `/_api/admin/configure` call is made.
+
+### Recipe configure view
+
+The recipe configure view (opened via **Edit configuration** on any saved recipe) is the authoring surface for the non-endpoint recipe fields: shared pools, per-property quantity, faker strategies, and constraint rules. It is organised as one **table block** per endpoint group, each containing a unified **Properties** list.
+
+**Table block header.** Each block header names the underlying definition (or virtual root) and carries shared-pool controls inline — a toggle to enable pool sharing for this table and a numeric input for pool size. Filter chips on the view let you scope the list to a specific endpoint or table.
+
+**Properties list.** Every property of every response/body definition used by the selected endpoints appears as a single row, regardless of whether it is an array, scalar, or nested reference. Each row carries its controls inline:
+
+- **Faker control** — dropdown selecting the faker strategy for this property (or `default` to fall back to the `x-faker` / format / heuristic pipeline).
+- **Array quantity** — `min`/`max` numeric inputs, shown on every row; only take effect for array-typed properties, but are always visible to keep the row shape uniform.
+- **Constraint rule chips** — compact chips representing the `range`, `choice`, `const`, `pattern`, and `compare` rules attached to this property. Click a chip to edit; click the `+` chip to add a new rule. Rule validation runs on save (see [Constraint Rules](#constraint-rules)).
+
+Changes are persisted via `PUT /_api/admin/recipes/:id/config`. Clicking **Activate recipe** commits the saved config to the running server via `POST /_api/admin/recipes/:id/activate`, which drops and re-seeds the mock tables, re-applies any `frozen_rows`, and swaps the active route set.
 
 ---
 
@@ -254,6 +289,24 @@ After this call, `GET /pet`, `GET /pet/{petId}`, `POST /pet`, and `DELETE /pet/{
 
 When you select a path-parameter route such as `GET /pet/{petId}`, mirage automatically registers `GET /pet` (the collection endpoint) if it is not already in your selection. This ensures the collection is always browsable when individual items are. The auto-registered route appears in the response of `/_api/admin/endpoints` after configure.
 
+### Additional admin endpoints
+
+The admin API exposes a number of introspection and utility routes alongside the core `spec`/`endpoints`/`import`/`configure` flow. All are under `/_api/admin/` and are always reachable once the server is running.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/_api/admin/definitions` | Returns the raw Swagger `definitions` map from the currently loaded spec (`$ref` references preserved). Used by the admin UI to render schema details. |
+| GET | `/_api/admin/routes` | Returns every route currently registered in the router, including catch-alls and auto-registered collection routes. Supersets `/_api/admin/endpoints`, which only reports the spec-derived routes. |
+| GET | `/_api/admin/tables` | Returns the list of SQLite tables created from the current spec. |
+| GET | `/_api/admin/tables/{name}` | Returns all rows in a single table. 404 if the table does not exist. |
+| PUT | `/_api/admin/tables/{name}/{rowid}` | Replaces the contents of a single row, keyed by SQLite `rowid`. The request body is a JSON object of column values; unknown columns are ignored. |
+| GET | `/_api/admin/log` | Returns the in-memory request log — every admin API call and mock-traffic request with method, path, status, request body, and response body. Request/response bodies larger than 16 MB are replaced with a `<body too large ...>` sentinel. |
+| GET | `/_api/admin/graph` | Returns the entity-relationship graph derived from the currently active spec and route selection. See [Schemas graph](#schemas-graph) below. |
+| POST | `/_api/admin/graph` | Same as the GET form, but accepts a `{endpoints: [{method, path}, ...]}` body so the graph can be previewed for a proposed selection before it is activated. |
+| GET | `/_api/admin/recipes/{id}/export` | Returns a recipe as a standalone JSON document suitable for checking into version control or sharing between instances. |
+| POST | `/_api/admin/recipes/import` | Creates a new recipe from an exported-recipe JSON document. |
+| POST | `/_api/admin/recipes/{id}/clone` | Creates a copy of an existing recipe under a new id (and a new, unique name). |
+
 ---
 
 ## Recipes
@@ -267,8 +320,9 @@ A **recipe** is a saved configuration for a spec. It bundles:
 - **Quantity configs** — min/max collection sizes for array properties
 - **Faker rules** — per-field faker strategy overrides
 - **Constraint rules** — bounded ranges, choices, constants, patterns, and cross-field compares
+- **Frozen rows** — exact table rows that must be re-inserted on every activate
 
-Recipes are persisted in the embedded SQLite database and survive restarts. All recipe fields (except name, spec source, and seed count) are stored as JSON strings.
+Recipes are persisted to a `mirage.db` SQLite file in the working directory and survive restarts. All recipe fields (except name, spec source, and seed count) are stored as JSON strings.
 
 ### Recipe CRUD endpoints
 
@@ -279,8 +333,9 @@ Recipes are persisted in the embedded SQLite database and survive restarts. All 
 | GET | `/_api/admin/recipes/:id` | Get a single recipe |
 | PUT | `/_api/admin/recipes/:id` | Update all recipe fields |
 | DELETE | `/_api/admin/recipes/:id` | Delete a recipe |
-| GET | `/_api/admin/recipes/:id/config` | Get parsed config (pools/quantities/faker/rules) |
-| PUT | `/_api/admin/recipes/:id/config` | Update the parsed config |
+| GET | `/_api/admin/recipes/:id/config` | Get parsed config (pools/quantities/faker/rules/frozen_rows) |
+| PUT | `/_api/admin/recipes/:id/config` | Update the parsed config (accepts `frozen_rows` alongside the other config fields) |
+| POST | `/_api/admin/recipes/:id/clone` | Clone a recipe, returning the new record |
 | POST | `/_api/admin/recipes/:id/activate` | Apply this recipe and start serving traffic |
 | GET | `/_api/admin/recipes/:id/export` | Export a recipe as JSON for backup/transfer |
 | POST | `/_api/admin/recipes/import` | Import a previously exported recipe |
@@ -301,6 +356,7 @@ Creates a new recipe. Validates constraint rules at create time (see [Constraint
 | `quantity_configs` | string (JSON object) | No | `{"DefName.prop": {min, max}, ...}` (default `{}`) |
 | `faker_rules` | string (JSON object) | No | `{"DefName": {"prop": "strategy"}}` (default `{}`) |
 | `rules` | string (JSON array) | No | Constraint rules (default `[]`) |
+| `frozen_rows` | string (JSON object) | No | `{"TableName": [{...row}, ...]}` — pinned rows re-inserted on every activate (default `{}`) |
 
 ### Constraint Rules
 
@@ -358,6 +414,16 @@ curl -X POST http://localhost:3737/_api/admin/recipes \
 ```
 
 On activate, rules apply to BOTH the seeded SQLite rows (via the seeder) AND any composed JSON response documents (via the composer / shared entity pools).
+
+### Schemas graph
+
+`GET /_api/admin/graph` returns the entity-relationship graph of the currently active spec + selected endpoints. The admin UI renders this graph on the **Schemas** page. Three node categories are distinguished:
+
+- **Roots** — definitions that appear directly as the response (or body) type of at least one selected endpoint. Every selected operation contributes its response definition as a root, along with any `$ref`-typed body parameters.
+- **Shared entities** — definitions reachable from more than one root via transitive `$ref` traversal. They are surfaced so that shared-pool configuration can target them explicitly.
+- **Virtual roots** — endpoints whose response shape is not a named definition (primitive arrays, loose objects, etc.). They are tracked separately so the UI can still render them as graph nodes even though they are not backed by a definition.
+
+All three sets, plus the edge list, are returned in a single payload; the UI uses Dagre to lay out the graph.
 
 ---
 
