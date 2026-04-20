@@ -479,7 +479,7 @@ describe('computeTwoHopPartition', () => {
   it('empty defs + empty focal → empty partition', () => {
     const res = computeTwoHopPartition({}, new Set(), 2);
     expect(res.visible.size).toBe(0);
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
     expect(res.hopOf).toEqual({});
   });
 
@@ -490,17 +490,17 @@ describe('computeTwoHopPartition', () => {
     };
     const res = computeTwoHopPartition(defs, new Set(), 2);
     expect(res.visible.size).toBe(0);
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
   });
 
-  it('focal with no neighbours → only focal visible, no ring3', () => {
+  it('focal with no neighbours → only focal visible, no overflow ring', () => {
     const defs: Record<string, PartitionEntityDef> = {
       A: { properties: {} },
     };
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect([...res.visible]).toEqual(['A']);
     expect(res.hopOf).toEqual({ A: 0 });
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
   });
 
   it('1-hop + 2-hop chain A→B→C, maxHop=2 → all visible', () => {
@@ -512,10 +512,10 @@ describe('computeTwoHopPartition', () => {
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
     expect(res.hopOf).toEqual({ A: 0, B: 1, C: 2 });
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
   });
 
-  it('3-hop chain A→B→C→D → D in hiddenAtRing3, not in visible', () => {
+  it('3-hop chain A→B→C→D → D in hiddenRing, not in visible', () => {
     const defs: Record<string, PartitionEntityDef> = {
       A: { properties: { b: pRef('B') } },
       B: { properties: { c: pRef('C') } },
@@ -524,7 +524,7 @@ describe('computeTwoHopPartition', () => {
     };
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
-    expect(res.hiddenAtRing3).toEqual(new Set(['D']));
+    expect(res.hiddenRing).toEqual(new Set(['D']));
     expect(res.hopOf.D).toBe(3);
   });
 
@@ -550,7 +550,7 @@ describe('computeTwoHopPartition', () => {
     expect(res.hopOf.Parent).toBe(1);
   });
 
-  it('extends as ring3: 3-deep extends chain → 3rd hidden', () => {
+  it('extends as overflow ring: 3-deep extends chain → 3rd hidden', () => {
     const defs: Record<string, PartitionEntityDef> = {
       A: { properties: {}, extends: 'B' },
       B: { properties: {}, extends: 'C' },
@@ -559,7 +559,7 @@ describe('computeTwoHopPartition', () => {
     };
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect(res.visible).toEqual(new Set(['A', 'B', 'C']));
-    expect(res.hiddenAtRing3).toEqual(new Set(['D']));
+    expect(res.hiddenRing).toEqual(new Set(['D']));
   });
 
   it('items_ref treated identically to ref_name', () => {
@@ -582,7 +582,7 @@ describe('computeTwoHopPartition', () => {
     expect(Date.now() - t0).toBeLessThan(100);
     expect(res.visible).toEqual(new Set(['A', 'B']));
     expect(res.hopOf).toEqual({ A: 0, B: 1 });
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
   });
 
   it('self-ref A→A → no infinite loop, A hop 0, no other visible', () => {
@@ -642,7 +642,7 @@ describe('computeTwoHopPartition', () => {
     expect(res.hopOf.GHOST).toBe(1);
   });
 
-  it('disconnected island hidden NOT counted in ring3', () => {
+  it('disconnected island hidden NOT counted in overflow ring', () => {
     const defs: Record<string, PartitionEntityDef> = {
       A: { properties: { b: pRef('B') } },
       B: { properties: {} },
@@ -652,7 +652,7 @@ describe('computeTwoHopPartition', () => {
     };
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect(res.visible).toEqual(new Set(['A', 'B']));
-    expect(res.hiddenAtRing3.size).toBe(0);
+    expect(res.hiddenRing.size).toBe(0);
     expect(res.hopOf.X).toBeUndefined();
     expect(res.hopOf.Y).toBeUndefined();
   });
@@ -669,7 +669,7 @@ describe('computeTwoHopPartition', () => {
     const res = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect(res.hopOf.C).toBe(2);
     expect(res.visible.has('C')).toBe(true);
-    expect(res.hiddenAtRing3.has('C')).toBe(false);
+    expect(res.hiddenRing.has('C')).toBe(false);
   });
 
   it('determinism: repeated runs yield identical visible+hopOf', () => {
@@ -684,7 +684,7 @@ describe('computeTwoHopPartition', () => {
     const r2 = computeTwoHopPartition(defs, new Set(['A']), 2);
     expect([...r1.visible].sort()).toEqual([...r2.visible].sort());
     expect(r1.hopOf).toEqual(r2.hopOf);
-    expect([...r1.hiddenAtRing3].sort()).toEqual([...r2.hiddenAtRing3].sort());
+    expect([...r1.hiddenRing].sort()).toEqual([...r2.hiddenRing].sort());
   });
 });
 

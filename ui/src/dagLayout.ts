@@ -308,7 +308,7 @@ export interface TwoHopPartition {
   /** Min-hop distance from the focal set; only entries for visible nodes. */
   hopOf: Record<string, number>;
   /** Nodes at exactly hop === maxHop + 1 (the immediate overflow ring). */
-  hiddenAtRing3: Set<string>;
+  hiddenRing: Set<string>;
 }
 
 // Extract outgoing refs for one def: extends (if present) + every property's
@@ -400,10 +400,10 @@ export function computeTwoHopPartition(
 ): TwoHopPartition {
   const hopOf: Record<string, number> = {};
   const visible = new Set<string>();
-  const hiddenAtRing3 = new Set<string>();
+  const hiddenRing = new Set<string>();
 
   if (focalSet.size === 0) {
-    return { visible, hopOf, hiddenAtRing3 };
+    return { visible, hopOf, hiddenRing };
   }
 
   const inbound = buildInboundAdj(defs);
@@ -433,7 +433,7 @@ export function computeTwoHopPartition(
           next.add(nb);
         } else {
           // hop === maxHop + 1 — immediate overflow ring
-          hiddenAtRing3.add(nb);
+          hiddenRing.add(nb);
         }
       }
     }
@@ -441,7 +441,7 @@ export function computeTwoHopPartition(
     if (frontier.size === 0) break;
   }
 
-  return { visible, hopOf, hiddenAtRing3 };
+  return { visible, hopOf, hiddenRing };
 }
 
 /**
