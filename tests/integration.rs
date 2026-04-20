@@ -77,6 +77,58 @@ impl MirageServer {
         panic!("mirage server did not start within 5 seconds");
     }
 
+    /// Stop the server but preserve its workdir (and therefore `mirage.db`)
+    /// so a subsequent `start_in_existing_dir` call exercises restart-survival.
+    /// Consumes `self`; the returned workdir is owned by the caller and will
+    /// NOT be auto-cleaned by Drop.
+    #[allow(dead_code)]
+    fn stop_preserve_dir(mut self) -> PathBuf {
+        let dir = self.workdir.take().expect("workdir required to preserve");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        dir
+    }
+
+    /// Relaunch mirage against an existing workdir (carrying forward its
+    /// `mirage.db`). Picks a fresh port so tests do not race on the old one.
+    #[allow(dead_code)]
+    fn start_in_existing_dir(
+        workdir: PathBuf,
+        spec_rel_path: &str,
+        probe_path: &str,
+    ) -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let spec_abs = manifest_dir.join(spec_rel_path);
+
+        let child = Command::new(env!("CARGO_BIN_EXE_mirage"))
+            .current_dir(&workdir)
+            .args([spec_abs.to_str().unwrap(), "--port", &port.to_string()])
+            .spawn()
+            .expect("failed to restart mirage");
+
+        let server = Self {
+            child,
+            port,
+            workdir: Some(workdir),
+        };
+        let client = reqwest::blocking::Client::new();
+        let base = format!("http://127.0.0.1:{}", port);
+        for _ in 0..50 {
+            if client.get(format!("{}{}", base, probe_path)).send().is_ok() {
+                return server;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        drop(server);
+        panic!("mirage restarted server did not come up within 5 seconds");
+    }
+
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
@@ -1837,4 +1889,379 @@ fn test_recipes_cli_config_apply_honours_mirage_url_env() {
     );
 
     std::fs::remove_dir_all(&scratch).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Recipe custom_lists persistence (task afje).
+//
+// Four tests, one per acceptance criterion on the parent story "custom lists
+// persist with the recipe across restarts":
+//   1. restart-survival: GET config yields identical payload after DB round-trip
+//   2. export / clone / import round-trip: CLI flows preserve custom_lists
+//   3. fresh-server activation seeding: every seeded value comes from list
+//   4. delete cleanup: DELETE A returns 404 on subsequent GET; B is untouched
+//
+// Plumbing owned by siblings omhh (custom_lists column + CRUD + config API +
+// export/import/clone) and wwql (seed-time custom-list resolution via
+// FakerStrategy::Custom). afje adds only integration-test coverage.
+// ---------------------------------------------------------------------------
+
+/// Build a POST /_api/admin/recipes body that exercises custom_lists. Uses
+/// the petstore fixture so activation can seed the /pet collection and
+/// Pet.name (string) is a valid target for the custom-list faker rule.
+fn recipe_body_with_custom_lists(
+    name: &str,
+    custom_lists: serde_json::Value,
+    faker_rules: serde_json::Value,
+    seed_count: i64,
+) -> serde_json::Value {
+    let spec_source = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+    serde_json::json!({
+        "name": name,
+        "spec_source": spec_source,
+        "endpoints": [
+            { "method": "get", "path": "/pet/{petId}" },
+        ],
+        "seed_count": seed_count,
+        "shared_pools": {},
+        "quantity_configs": {},
+        "faker_rules": faker_rules,
+        "rules": [],
+        "frozen_rows": {},
+        "custom_lists": custom_lists,
+    })
+}
+
+/// AC1: recipe round-trips through an actual server restart (DB reopen).
+/// custom_lists and faker_rules come back identical post-restart.
+#[test]
+fn test_recipe_custom_lists_persist_restart() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let client = reqwest::blocking::Client::new();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let lists = serde_json::json!({ "Greetings": ["hi", "hey", "howdy"] });
+    let faker_rules = serde_json::json!({ "Pet.name": "Greetings" });
+    let body = recipe_body_with_custom_lists(
+        &format!("persist-restart-{nanos}"),
+        lists.clone(),
+        faker_rules.clone(),
+        5,
+    );
+
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create recipe should return 201");
+    let created: serde_json::Value = resp.json().unwrap();
+    let id = created["id"].as_i64().expect("numeric id");
+
+    // Baseline read of the config endpoint, pre-restart.
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let pre: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        pre["custom_lists"], lists,
+        "pre-restart custom_lists should match what was written"
+    );
+    assert_eq!(
+        pre["faker_rules"], faker_rules,
+        "pre-restart faker_rules should match what was written"
+    );
+
+    // Actual restart: kill the server but keep the workdir so mirage.db survives.
+    let workdir = server.stop_preserve_dir();
+    let server =
+        MirageServer::start_in_existing_dir(workdir, "tests/fixtures/petstore.yaml", "/pet");
+
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET config after restart must still find the recipe"
+    );
+    let post: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        post["custom_lists"], lists,
+        "custom_lists must survive server restart"
+    );
+    assert_eq!(
+        post["faker_rules"], faker_rules,
+        "faker_rules must survive server restart"
+    );
+}
+
+/// AC2: export file includes custom_lists, clone copies them, and import into
+/// a fresh server reproduces the original list map.
+#[test]
+fn test_recipe_custom_lists_persist_export_clone() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let client = reqwest::blocking::Client::new();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let lists = serde_json::json!({ "Greetings": ["hi", "hey", "howdy"] });
+    let faker_rules = serde_json::json!({ "Pet.name": "Greetings" });
+    let body = recipe_body_with_custom_lists(
+        &format!("persist-export-{nanos}"),
+        lists.clone(),
+        faker_rules.clone(),
+        5,
+    );
+
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    // --- Export to file and assert the JSON carries custom_lists verbatim.
+    let scratch = scratch_dir("custom-lists-export");
+    let exported_path = scratch.join("recipe.json");
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "export",
+            &id.to_string(),
+            "--file",
+            exported_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "recipes export should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let contents = std::fs::read_to_string(&exported_path).expect("exported file exists");
+    let exported: serde_json::Value =
+        serde_json::from_str(&contents).expect("exported file should be JSON");
+    assert_eq!(
+        exported["custom_lists"], lists,
+        "exported JSON must include custom_lists verbatim"
+    );
+
+    // --- Clone: new recipe gets the same custom_lists.
+    let out = mirage_cli(&server, &["clone", &id.to_string()]);
+    assert!(
+        out.status.success(),
+        "recipes clone should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cloned: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("clone stdout should be JSON");
+    let cloned_id = cloned["id"].as_i64().expect("clone has numeric id");
+    assert_ne!(cloned_id, id, "clone must get a fresh id");
+
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{cloned_id}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cloned_cfg: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        cloned_cfg["custom_lists"], lists,
+        "clone must preserve custom_lists"
+    );
+    assert_eq!(
+        cloned_cfg["faker_rules"], faker_rules,
+        "clone must preserve faker_rules"
+    );
+
+    // --- Import into a SECOND, fresh server. New DB, new custom_lists row.
+    let server2 = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let out = mirage_cli(
+        &server2,
+        &["import", "--file", exported_path.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "recipes import on fresh server should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let imported: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("import stdout should be JSON");
+    let imported_id = imported["id"].as_i64().expect("imported recipe has id");
+
+    let resp = client
+        .get(server2.url(&format!("/_api/admin/recipes/{imported_id}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let imported_cfg: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        imported_cfg["custom_lists"], lists,
+        "imported recipe on fresh server must carry custom_lists"
+    );
+    assert_eq!(
+        imported_cfg["faker_rules"], faker_rules,
+        "imported recipe on fresh server must carry faker_rules"
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+/// AC3: activation on a fresh server seeds the collection using the custom
+/// list. Every seeded pet.name value must appear in the list's values.
+#[test]
+fn test_recipe_custom_lists_persist_activate_seed() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let client = reqwest::blocking::Client::new();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let allowed = ["hi", "hey", "howdy"];
+    let lists = serde_json::json!({ "Greetings": allowed });
+    let faker_rules = serde_json::json!({ "Pet.name": "Greetings" });
+    // seed_count=20 gives sampling headroom but keeps the test fast.
+    let body = recipe_body_with_custom_lists(
+        &format!("persist-activate-{nanos}"),
+        lists.clone(),
+        faker_rules.clone(),
+        20,
+    );
+
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    let resp = client
+        .post(server.url(&format!("/_api/admin/recipes/{id}/activate")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "activate should return 200");
+
+    let resp = client.get(server.url("/pet")).send().unwrap();
+    assert_eq!(resp.status(), 200, "GET /pet should return 200 post-activate");
+    let body: serde_json::Value = resp.json().unwrap();
+    let arr = body
+        .as_array()
+        .expect("/pet response should be a JSON array");
+    assert!(!arr.is_empty(), "/pet should have at least one row");
+
+    let allowed_set: std::collections::HashSet<&str> = allowed.iter().copied().collect();
+    for (idx, pet) in arr.iter().enumerate() {
+        let name = pet["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("row {idx}: pet.name must be a string, got {pet}"));
+        assert!(
+            allowed_set.contains(name),
+            "row {idx}: pet.name {name:?} must be drawn from custom list Greetings={allowed:?}, got {pet}"
+        );
+    }
+}
+
+/// AC4: deleting recipe A returns 404 on subsequent GET, and recipe B's
+/// custom_lists remain intact (no cross-recipe leak).
+#[test]
+fn test_recipe_custom_lists_persist_delete_no_leak() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let client = reqwest::blocking::Client::new();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let lists_a = serde_json::json!({ "ListA": ["a1", "a2"] });
+    let body_a = recipe_body_with_custom_lists(
+        &format!("persist-delete-a-{nanos}"),
+        lists_a.clone(),
+        serde_json::json!({}),
+        5,
+    );
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body_a)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created_a: serde_json::Value = resp.json().unwrap();
+    let id_a = created_a["id"].as_i64().unwrap();
+
+    let lists_b = serde_json::json!({ "ListB": ["b1", "b2", "b3"] });
+    let body_b = recipe_body_with_custom_lists(
+        &format!("persist-delete-b-{nanos}"),
+        lists_b.clone(),
+        serde_json::json!({}),
+        5,
+    );
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body_b)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created_b: serde_json::Value = resp.json().unwrap();
+    let id_b = created_b["id"].as_i64().unwrap();
+    assert_ne!(id_a, id_b, "two recipes must have distinct ids");
+
+    // Delete A.
+    let resp = client
+        .delete(server.url(&format!("/_api/admin/recipes/{id_a}")))
+        .send()
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "DELETE recipe A must return 2xx, got {}",
+        resp.status()
+    );
+
+    // Subsequent GET for A must be 404.
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id_a}")))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "GET on deleted recipe A must be 404, got {}",
+        resp.status()
+    );
+
+    // Config endpoint for A also 404.
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id_a}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "GET config on deleted recipe A must be 404"
+    );
+
+    // Recipe B untouched — custom_lists still surface ListB exactly.
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id_b}/config")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cfg_b: serde_json::Value = resp.json().unwrap();
+    assert_eq!(
+        cfg_b["custom_lists"], lists_b,
+        "recipe B custom_lists must be unchanged after A is deleted"
+    );
 }
