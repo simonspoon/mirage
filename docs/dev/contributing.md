@@ -97,6 +97,20 @@ Constraint rules live in `src/rules.rs`. To add a new rule kind:
 7. Add unit tests per variant + conflict/cycle/type-mismatch cases.
 8. Update the UI `RuleEditor` in `ui/src/index.tsx` so users can author the new kind.
 
+## CLI Subcommands
+
+The `mirage` binary has two entry paths:
+
+- **Default (serve)**: `mirage <spec>` boots the mock server on the configured port.
+- **Inspect**: `mirage inspect <spec>` parses the spec and prints diagnostic info (definitions, roots, extension-only roots, virtual roots) without starting a server. Useful for debugging classification and ref-resolution issues.
+
+CLI parsing lives in `src/main.rs`:
+
+- The `Commands` enum (around line 29) declares subcommands via `clap`'s `#[derive(Subcommand)]`.
+- `run_inspect` (around line 190) implements the inspect path.
+
+When adding a new flag or option, update both the default serve path and `run_inspect` where the flag is relevant — they share parser and entity-graph setup but diverge after that.
+
 ## Project Structure
 
 ```
@@ -116,5 +130,9 @@ tests/
     petstore.yaml  Reference spec for all tests
 ui/
   src/             SolidJS + Tailwind source
+    dagreLayout.ts   Live schemas-graph layout engine (Dagre-backed, used by render path)
+    dagLayout.ts     Legacy barycenter-sweep layout; retained for unit-test coverage only
   dist/            Built assets (embedded by rust-embed)
 ```
+
+`ui/src/dagreLayout.ts` exports `computeDagrePositions`, called unconditionally from the schemas-graph render in `ui/src/index.tsx`. `ui/src/dagLayout.ts` is no longer wired into rendering — it stays in the tree so the pure barycenter logic can be unit-tested without pulling in Dagre. See the file header in `ui/src/dagLayout.ts` for details.
