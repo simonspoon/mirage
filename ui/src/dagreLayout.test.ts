@@ -247,6 +247,60 @@ describe("computeDagrePositions", () => {
     expect(cyB).toBeCloseTo(cyC, 5);
   });
 
+  it("exposes per-edge polyline points keyed by GraphEdge.id", () => {
+    // A→B and A→C both with explicit ids; output edges map holds both.
+    const defs = { A: def(["b", "c"]), B: def(), C: def() };
+    const edges: GraphEdge[] = [
+      { id: "A::b::B", source: "A", target: "B" },
+      { id: "A::c::C", source: "A", target: "C" },
+    ];
+    const r = computeDagrePositions(
+      ["A", "B", "C"],
+      edges,
+      defs,
+      NO_STUBS,
+      BAND_GAP,
+    );
+    expect(r.edges).toBeDefined();
+    const emap = r.edges!;
+    // Both ids present, each with >=2 points, all finite.
+    expect(emap["A::b::B"]).toBeDefined();
+    expect(emap["A::c::C"]).toBeDefined();
+    expect(emap["A::b::B"].points.length).toBeGreaterThanOrEqual(2);
+    expect(emap["A::c::C"].points.length).toBeGreaterThanOrEqual(2);
+    for (const k of Object.keys(emap)) {
+      for (const p of emap[k].points) {
+        expect(Number.isFinite(p.x)).toBe(true);
+        expect(Number.isFinite(p.y)).toBe(true);
+      }
+    }
+  });
+
+  it("duplicate GraphEdge.id values do not collide — both preserved", () => {
+    // Two separate edges A→B sharing the same caller id (pathological but
+    // possible if caller constructs ids naively). Both must appear in edges
+    // map with distinct keys (second gets #N suffix).
+    const defs = { A: def(["x", "y"]), B: def() };
+    const edges: GraphEdge[] = [
+      { id: "dup", source: "A", target: "B" },
+      { id: "dup", source: "A", target: "B" },
+    ];
+    const r = computeDagrePositions(["A", "B"], edges, defs, NO_STUBS, BAND_GAP);
+    expect(r.edges).toBeDefined();
+    const keys = Object.keys(r.edges!).sort();
+    expect(keys.length).toBe(2);
+    // Both keys retain the caller-supplied prefix.
+    for (const k of keys) expect(k.startsWith("dup")).toBe(true);
+  });
+
+  it("edges without id get synthetic keys, still populated", () => {
+    const defs = { A: def(["b"]), B: def() };
+    const edges: GraphEdge[] = [{ source: "A", target: "B" }];
+    const r = computeDagrePositions(["A", "B"], edges, defs, NO_STUBS, BAND_GAP);
+    expect(r.edges).toBeDefined();
+    expect(Object.keys(r.edges!).length).toBe(1);
+  });
+
   it("box height matches HEADER + min(rowCt, 10)*ROW_HEIGHT (10-row cap)", () => {
     // 20 props → cap at 10 rows.
     const manyProps = Array.from({ length: 20 }, (_, i) => `p${i}`);

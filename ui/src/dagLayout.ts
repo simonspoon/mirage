@@ -28,6 +28,15 @@ export const STUB_WIDTH = 260;
 export interface GraphEdge {
   source: string;
   target: string;
+  /**
+   * Optional stable identifier. When supplied (and unique), dagre-backed
+   * layouts key their per-edge point arrays by this id so callers can
+   * look up path geometry without reconstructing tuples. When omitted,
+   * computeDagrePositions falls back to an internal counter name and
+   * the returned edges map is opaque. Legacy computeDagPositions ignores
+   * this field entirely.
+   */
+  id?: string;
 }
 
 export interface EntityDef {
@@ -52,6 +61,16 @@ export interface DagPositions {
    * Undefined for legacy DAG layout.
    */
   rankCenterY?: Record<number, number>;
+  /**
+   * Per-edge polyline points as computed by the layout engine
+   * (dagre-backed layouts only). Keyed by GraphEdge.id when supplied,
+   * else by an internal synthetic name. Points are in the same
+   * coordinate space as `positions` (top-left-origin, shared with the
+   * SVG canvas). At minimum two points: first near the source
+   * connection, last near the target. Consumers should treat missing
+   * entries as "no geometry" and fall back to hard-coded offsets.
+   */
+  edges?: Record<string, { points: { x: number; y: number }[] }>;
 }
 
 export interface DagLayoutOpts {

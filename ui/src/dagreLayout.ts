@@ -70,11 +70,25 @@ export function computeDagrePositions(
 
   // Use a per-edge unique name so multigraph keeps parallel edges distinct
   // (e.g. two properties on the same source both refing the same target).
+  // Prefer caller-supplied GraphEdge.id (stable, meaningful key for point
+  // lookup downstream) with a de-dup counter suffix if the same id appears
+  // more than once; fall back to a synthetic name when id is omitted.
   let edgeIdx = 0;
+  const usedNames = new Set<string>();
+  const edgeNameOf = new Map<GraphEdge, string>();
   for (const e of edges) {
     if (!listSet.has(e.source) || !listSet.has(e.target)) continue;
     if (e.source === e.target) continue; // dagre rejects self-loops in layout
-    g.setEdge(e.source, e.target, {}, `e${edgeIdx++}`);
+    let name = e.id ?? `e${edgeIdx++}`;
+    if (usedNames.has(name)) {
+      // Preserve uniqueness without losing the caller-provided id prefix.
+      let k = 1;
+      while (usedNames.has(`${name}#${k}`)) k++;
+      name = `${name}#${k}`;
+    }
+    usedNames.add(name);
+    edgeNameOf.set(e, name);
+    g.setEdge(e.source, e.target, {}, name);
   }
 
   dagre.layout(g);
@@ -103,9 +117,31 @@ export function computeDagrePositions(
     }
   }
 
+  // Collect dagre's computed polyline per edge. dagre.edge({v,w,name}).points
+  // is an array of absolute-coord {x,y} (same coord basis as node.x/node.y,
+  // which is the global SVG canvas frame — node top-left conversion above
+  // does NOT shift the coord system, so edge points need no adjustment).
+  // First and last points sit near source/target connection; intermediates
+  // are bend points introduced by dagre's edge router. We rely on this to
+  // anchor edge labels (midpoint + cardinality) against true layout geometry
+  // rather than hard-coded pixel offsets that drift on back-routed or
+  // detour edges.
+  const edgesOut: Record<string, { points: { x: number; y: number }[] }> = {};
+  for (const [inputEdge, name] of edgeNameOf) {
+    const eObj = g.edge({ v: inputEdge.source, w: inputEdge.target, name });
+    if (!eObj || !Array.isArray(eObj.points)) continue;
+    const pts = eObj.points
+      .filter((p: { x?: unknown; y?: unknown }) =>
+        Number.isFinite(p.x) && Number.isFinite(p.y),
+      )
+      .map((p: { x: number; y: number }) => ({ x: p.x, y: p.y }));
+    if (pts.length === 0) continue;
+    edgesOut[name] = { points: pts };
+  }
+
   const graph = g.graph();
   const width = Math.max(1, (graph.width ?? 0) + PAD);
   const height = Math.max(400, (graph.height ?? 0) + PAD);
 
-  return { positions, width, height, ranks, rankCenterY };
+  return { positions, width, height, ranks, rankCenterY, edges: edgesOut };
 }

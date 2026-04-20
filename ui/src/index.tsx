@@ -3725,6 +3725,55 @@ function SchemasPage(props: {
                                   return pos ? pos.x : 0;
                                 };
 
+                                // Dagre-computed polyline for this edge (when layout exposed it).
+                                // Same coordinate frame as entityPositions (top-left origin shared
+                                // with the SVG canvas). Used to anchor edge labels to actual
+                                // layout geometry rather than hard-coded offsets that drift on
+                                // back-routed or detour edges.
+                                const dagrePoints = (): { x: number; y: number }[] | undefined => {
+                                  const emap = dagLayout().edges;
+                                  if (!emap) return undefined;
+                                  const entry = emap[edge.id];
+                                  if (!entry || entry.points.length < 2) return undefined;
+                                  return entry.points;
+                                };
+
+                                // Arc-length midpoint of a polyline. Falls back to the middle
+                                // vertex when total length is zero (degenerate). Robust against
+                                // any point count >=2.
+                                const polylineMidpoint = (
+                                  pts: { x: number; y: number }[],
+                                ): { x: number; y: number } => {
+                                  let total = 0;
+                                  const lens: number[] = [];
+                                  for (let i = 1; i < pts.length; i++) {
+                                    const len = Math.hypot(
+                                      pts[i].x - pts[i - 1].x,
+                                      pts[i].y - pts[i - 1].y,
+                                    );
+                                    lens.push(len);
+                                    total += len;
+                                  }
+                                  if (total === 0) {
+                                    return pts[Math.floor(pts.length / 2)];
+                                  }
+                                  const half = total / 2;
+                                  let acc = 0;
+                                  for (let i = 0; i < lens.length; i++) {
+                                    if (acc + lens[i] >= half) {
+                                      const t = lens[i] === 0 ? 0 : (half - acc) / lens[i];
+                                      const a = pts[i];
+                                      const b = pts[i + 1];
+                                      return {
+                                        x: a.x + (b.x - a.x) * t,
+                                        y: a.y + (b.y - a.y) * t,
+                                      };
+                                    }
+                                    acc += lens[i];
+                                  }
+                                  return pts[pts.length - 1];
+                                };
+
                                 // Elbow connector: orthogonal routing that avoids box obstructions
                                 // Returns the SVG path plus the midpoint of the longest horizontal segment
                                 // (robust against backward/detour 5-segment elbows where simple average fails).
@@ -3864,8 +3913,49 @@ function SchemasPage(props: {
 
                                 const routeInfo = createMemo(route);
                                 const d = () => routeInfo().d;
-                                const labelX = () => routeInfo().labelX;
-                                const labelY = () => routeInfo().labelY;
+                                // Midpoint field-name label: prefer dagre's polyline midpoint
+                                // when layout exposed per-edge geometry; fall back to the manual
+                                // router's longest-segment midpoint (still correct for
+                                // straight-forward edges, wrong for back-routed/detour paths).
+                                const labelX = () => {
+                                  const pts = dagrePoints();
+                                  if (pts) return polylineMidpoint(pts).x;
+                                  return routeInfo().labelX;
+                                };
+                                const labelY = () => {
+                                  const pts = dagrePoints();
+                                  if (pts) return polylineMidpoint(pts).y;
+                                  return routeInfo().labelY;
+                                };
+
+                                // Cardinality label anchors. Preferred: first/last dagre point
+                                // (tracks actual layout connection). Fallback: legacy
+                                // sx+6/sy-6 and tx-14/ty-6 hard-coded offsets. Y clamped to
+                                // source/target rect bbox so a back-routed or detour edge
+                                // can never fling the glyph into empty space.
+                                const clampY = (rawY: number, entityName: string): number => {
+                                  const rect = boxRects()[entityName];
+                                  if (!rect) return rawY;
+                                  return Math.max(rect.y, Math.min(rect.y + rect.h, rawY));
+                                };
+                                const srcCardX = () => {
+                                  const pts = dagrePoints();
+                                  return (pts ? pts[0].x : sx()) + 6;
+                                };
+                                const srcCardY = () => {
+                                  const pts = dagrePoints();
+                                  const raw = (pts ? pts[0].y : sy()) - 6;
+                                  return clampY(raw, edge.source);
+                                };
+                                const tgtCardX = () => {
+                                  const pts = dagrePoints();
+                                  return (pts ? pts[pts.length - 1].x : tx()) - 14;
+                                };
+                                const tgtCardY = () => {
+                                  const pts = dagrePoints();
+                                  const raw = (pts ? pts[pts.length - 1].y : ty()) - 6;
+                                  return clampY(raw, edge.target);
+                                };
 
                                 const isHovered = () => hoveredEdgeId() === edge.id;
                                 const hasPositions = () => sourcePos() && targetPos();
@@ -3942,16 +4032,16 @@ function SchemasPage(props: {
                                       />
                                       {/* Cardinality label near source */}
                                       <text
-                                        x={sx() + 6}
-                                        y={sy() - 6}
+                                        x={srcCardX()}
+                                        y={srcCardY()}
                                         fill={isHovered() ? "#93c5fd" : "#6b7280"}
                                         font-size="10"
                                         font-family="ui-monospace, monospace"
                                       >1</text>
                                       {/* Cardinality label near target */}
                                       <text
-                                        x={tx() - 14}
-                                        y={ty() - 6}
+                                        x={tgtCardX()}
+                                        y={tgtCardY()}
                                         fill={isHovered() ? "#93c5fd" : "#6b7280"}
                                         font-size="10"
                                         font-family="ui-monospace, monospace"
