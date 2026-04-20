@@ -4754,7 +4754,6 @@ function RecipeConfigStep(props: {
 
             const countParts = () => {
               const parts: string[] = [];
-              if (visiblePool()) parts.push("1 pool");
               if (visibleProps().length > 0) parts.push(`${visibleProps().length} properties`);
               if (scopedConstraints().length > 0) parts.push(`${scopedConstraints().length} constraints`);
               return parts.join(" · ");
@@ -4805,6 +4804,42 @@ function RecipeConfigStep(props: {
                       <span class="text-[10px] text-red-400 ml-1">1–100</span>
                     </Show>
                   </span>
+                  <Show when={visiblePool() !== null}>
+                    <span
+                      class="flex items-center gap-1 text-[10px] text-gray-400"
+                      title="Shared pool across endpoints"
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => e.stopPropagation()}
+                    >
+                      <input
+                        data-testid="table-header-pool-shared"
+                        type="checkbox"
+                        checked={visiblePool()!.is_shared}
+                        onChange={(e) => {
+                          const pools = { ...props.recipeSharedPools() };
+                          pools[defName] = { ...pools[defName], is_shared: e.currentTarget.checked };
+                          props.setRecipeSharedPools(pools);
+                        }}
+                        class="accent-blue-500 rounded"
+                      />
+                      <span class="text-gray-500">shared</span>
+                      <input
+                        data-testid="table-header-pool-size"
+                        type="number"
+                        min={1}
+                        max={100}
+                        step={1}
+                        value={visiblePool()!.pool_size}
+                        onInput={(e) => {
+                          const pools = { ...props.recipeSharedPools() };
+                          pools[defName] = { ...pools[defName], pool_size: parseInt(e.currentTarget.value) || 10 };
+                          props.setRecipeSharedPools(pools);
+                        }}
+                        class="w-12 bg-[#070c17] border border-gray-800 rounded px-1 py-0.5 text-[11px] text-gray-100 text-center focus:outline-none focus:border-gray-700"
+                      />
+                      <span class="text-gray-500">pool</span>
+                    </span>
+                  </Show>
                   <Show when={!isNested()}>
                     <span class="font-mono text-[10px] text-gray-500 truncate max-w-[45%]" title={endpoints().join(", ")}>
                       {endpoints().join(", ")}
@@ -4818,33 +4853,6 @@ function RecipeConfigStep(props: {
 
                 <Show when={expandedGroups().has(tableKey())}>
                   <div class="px-2 py-2 space-y-2">
-
-                    {/* Shared Pool */}
-                    <Show when={visiblePool() !== null}>
-                      <div>
-                        <div class="px-2 py-1 text-[10px] text-gray-500 font-medium uppercase tracking-wider">Shared Pool</div>
-                        <div class="flex items-center gap-3 px-3 py-2 bg-gray-800/50 rounded-md ml-2">
-                          <input type="checkbox" checked={visiblePool()!.is_shared}
-                            class="accent-blue-500 rounded"
-                            onChange={(e) => {
-                              const pools = { ...props.recipeSharedPools() };
-                              pools[defName] = { ...pools[defName], is_shared: e.target.checked };
-                              props.setRecipeSharedPools(pools);
-                            }} />
-                          <span class="text-xs text-gray-500 flex-1">
-                            {visiblePool()!.is_shared ? "Shared across endpoints" : "Unique per endpoint"}
-                          </span>
-                          <input type="number" min="1" max="100" value={visiblePool()!.pool_size}
-                            class="w-16 bg-[#070c17] border border-gray-800 rounded-md px-2 py-1 text-sm text-gray-100 text-center focus:outline-none focus:border-gray-700"
-                            onInput={(e) => {
-                              const pools = { ...props.recipeSharedPools() };
-                              pools[defName] = { ...pools[defName], pool_size: parseInt(e.target.value) || 10 };
-                              props.setRecipeSharedPools(pools);
-                            }} />
-                          <span class="text-xs text-gray-600 w-14">instances</span>
-                        </div>
-                      </div>
-                    </Show>
 
                     {/* Properties — unified scalar + array enumeration, one row per prop */}
                     <Show when={visibleProps().length > 0}>
