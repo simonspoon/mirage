@@ -9,7 +9,7 @@ cargo build --release
 # binary: ./target/release/mirage
 ```
 
-## Two Ways to Use
+## Three Ways to Use
 
 ### CLI Mode
 
@@ -38,7 +38,15 @@ Open `http://localhost:3737/_admin/` and:
 3. Configure shared entity pools, faker strategies, and constraint rules
 4. Name and save as a **recipe**, then **Activate** — the server drops tables, reseeds with your config, and starts serving
 
-Recipes are stored in the embedded database and survive restarts. See [Commands and API > Recipes](commands.md#recipes) for the full recipe API, including the **constraint rules** system for bounded ranges, choices, constants, regex patterns, and cross-field compares.
+Recipes persist to a `mirage.db` SQLite file in the working directory (separate from the in-memory database that holds mock data), so they survive restarts because the file is on disk. See [Commands and API > Recipes](commands.md#recipes) for the full recipe API, including the **constraint rules** system for bounded ranges, choices, constants, regex patterns, and cross-field compares.
+
+### Inspect Mode
+
+Parse a Swagger spec and print a diagnostic summary (definitions, path count, table/stub/skipped classifications, reserved-word warnings) without starting the server. Useful for auditing a spec before loading it.
+
+```bash
+mirage inspect path/to/swagger.json
+```
 
 ## Port
 
@@ -73,3 +81,4 @@ curl -X DELETE http://localhost:3737/pet/1
 | CLI mode | `mirage swagger.json` |
 | Custom port | `mirage swagger.json -p 8080` |
 | Admin UI mode | `mirage` then open `http://localhost:3737/_admin/` |
+| Inspect spec | `mirage inspect swagger.json` |
