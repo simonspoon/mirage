@@ -13,10 +13,6 @@ import {
 } from "./dagLayout";
 import { computeDagrePositions } from "./dagreLayout";
 
-// Layout engine for the Schemas graph. "dag" = legacy band layout,
-// "dagre" = dagre-backed ER-ish layout (prototype).
-export type GraphEngine = "dag" | "dagre";
-
 export type EdgeStyle = { stroke: string; dasharray: string | undefined };
 export const EDGE_STYLE = {
   extends: { stroke: "#a78bfa", dasharray: "4,3" },
@@ -3077,22 +3073,14 @@ function SchemasPage(props: {
                     const focusMembership = createMemo(() => new Set(focusSet()));
                     const expandedSet = createMemo(() => props.graphExpanded());
 
-                    // Engine toggle declared before any memo that reads it —
-                    // createMemo runs eagerly to register deps, so referencing
-                    // graphEngine() in maxHop below would hit a TDZ error if
-                    // the signal were declared further down the IIFE.
-                    const [graphEngine, setGraphEngine] = createSignal<GraphEngine>("dag");
-
                     // Visible-set partition: focals + nodes within MAX_HOP hops;
                     // nodes at hop = MAX_HOP + 1 (immediate overflow ring)
                     // hidden behind per-band count badges. BFS helper lives in
                     // dagLayout.ts for pure unit coverage (vitest env is 'node').
                     //
-                    // Engine-aware hop budget:
-                    //   dag  → 2 (legacy behaviour, fills wide bands)
-                    //   dagre → 1 (focal + direct neighbours only — keeps the
-                    //               ER-style picture small and readable)
-                    const maxHop = createMemo(() => (graphEngine() === "dagre" ? 1 : 2));
+                    // Hop budget = 1 (focal + direct neighbours only) — keeps
+                    // the dagre ER-style picture small and readable.
+                    const maxHop = createMemo(() => 1);
                     const twoHopPartition = createMemo(() =>
                       computeTwoHopPartition(
                         props.definitions(),
@@ -3232,33 +3220,19 @@ function SchemasPage(props: {
                       return edgeList;
                     });
 
-                    // Compute layout: positions + SVG dimensions. Engine
-                    // toggle picks between legacy band DAG and dagre-backed
-                    // ER layout. Both return the same DagPositions shape so
-                    // the orthogonal edge router and fit-to-viewport stay
-                    // engine-agnostic.
-                    const dagLayout = createMemo(() => {
-                      const engine = graphEngine();
-                      if (engine === "dagre") {
-                        return computeDagrePositions(
-                          visibleList(),
-                          graphEdges(),
-                          props.definitions(),
-                          stubSet(),
-                          bandGap,
-                          { widthOf },
-                        );
-                      }
-                      return computeDagPositions(
+                    // Compute layout: positions + SVG dimensions. Dagre-backed
+                    // ER-style layout — DagPositions shape keeps the orthogonal
+                    // edge router and fit-to-viewport engine-agnostic.
+                    const dagLayout = createMemo(() =>
+                      computeDagrePositions(
                         visibleList(),
                         graphEdges(),
                         props.definitions(),
                         stubSet(),
-                        boxSpacing,
                         bandGap,
                         { widthOf },
-                      );
-                    });
+                      ),
+                    );
 
                     const entityPositions = createMemo(() => dagLayout().positions);
                     const svgWidth = () => dagLayout().width;
@@ -3634,17 +3608,6 @@ function SchemasPage(props: {
                             </span>
                           </div>
                           <div class="flex items-center gap-1">
-                            {/* Engine toggle: DAG (legacy bands) vs Dagre (ER-ish). */}
-                            <div class="flex items-center rounded border border-gray-700/50 overflow-hidden">
-                              <button
-                                class={`px-2 py-1 text-[10px] ${graphEngine() === "dag" ? "bg-blue-600/80 text-white" : "bg-gray-800/80 hover:bg-gray-700/80 text-gray-300"}`}
-                                onClick={() => setGraphEngine("dag")}
-                              >DAG</button>
-                              <button
-                                class={`px-2 py-1 text-[10px] ${graphEngine() === "dagre" ? "bg-blue-600/80 text-white" : "bg-gray-800/80 hover:bg-gray-700/80 text-gray-300"}`}
-                                onClick={() => setGraphEngine("dagre")}
-                              >Dagre</button>
-                            </div>
                             <button
                               class="px-2 py-1 text-[10px] bg-gray-800/80 hover:bg-gray-700/80 text-gray-300 rounded border border-gray-700/50"
                               onClick={() => props.setGraphExpanded(new Set(immediateNeighbors()))}
