@@ -4448,18 +4448,18 @@ function RecipeConfigStep(props: {
     });
   });
 
-  // Collapsed state for endpoint and entity groups
-  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  // Expanded-set semantics: empty = all collapsed (default). Blocks collapsed on load.
+  const [expandedGroups, setExpandedGroups] = createSignal<Set<string>>(new Set());
   const toggleGroup = (key: string) => {
-    const s = new Set(collapsedGroups());
+    const s = new Set(expandedGroups());
     if (s.has(key)) s.delete(key); else s.add(key);
-    setCollapsedGroups(s);
+    setExpandedGroups(s);
   };
 
-  // Reset collapse state when entityGraph changes
+  // Reset to all-collapsed when entityGraph changes (new recipe loaded)
   createEffect(() => {
     props.entityGraph();
-    setCollapsedGroups(new Set<string>());
+    setExpandedGroups(new Set<string>());
   });
 
   return (
@@ -4623,7 +4623,7 @@ function RecipeConfigStep(props: {
                   class="w-full flex items-center gap-2 px-3 py-2 bg-blue-900/20 hover:bg-blue-900/30 text-sm text-blue-300 transition-colors"
                   onClick={() => toggleGroup(tableKey())}
                 >
-                  <span class={`text-[10px] text-blue-400 transition-transform ${collapsedGroups().has(tableKey()) ? "" : "rotate-90"}`}>&#9654;</span>
+                  <span class={`text-[10px] text-blue-400 transition-transform ${expandedGroups().has(tableKey()) ? "rotate-90" : ""}`}>&#9654;</span>
                   <span class="font-medium text-blue-200">{defName}</span>
                   <span
                     class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800/60 text-gray-400 font-normal"
@@ -4642,7 +4642,7 @@ function RecipeConfigStep(props: {
                   <span class="text-xs text-gray-600 ml-auto">{countParts()}</span>
                 </button>
 
-                <Show when={!collapsedGroups().has(tableKey())}>
+                <Show when={expandedGroups().has(tableKey())}>
                   <div class="px-2 py-2 space-y-2">
 
                     {/* Shared Pool */}
