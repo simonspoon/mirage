@@ -1213,6 +1213,47 @@ fn test_recipes_cli_clone() {
 }
 
 #[test]
+fn test_recipes_cli_activate() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Activate Me");
+    let id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(&server, &["activate", &id.to_string()]);
+    assert!(
+        out.status.success(),
+        "recipes activate should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let confirm: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON confirmation");
+    assert_eq!(confirm["id"].as_i64(), Some(id));
+    assert_eq!(confirm["name"], "Activate Me");
+    assert_eq!(confirm["status"], "activated");
+    assert!(
+        confirm["endpoints"].is_array(),
+        "endpoints should be a JSON array, got: {}",
+        confirm
+    );
+}
+
+#[test]
+fn test_recipes_cli_activate_404() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let out = mirage_cli(&server, &["activate", "999999"]);
+    assert!(
+        !out.status.success(),
+        "activate on missing id should exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err.get("error").is_some(),
+        "stderr should be {{\"error\": ...}} but was: {stderr}"
+    );
+}
+
+#[test]
 fn test_recipes_cli_honours_mirage_url_env() {
     let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
     post_recipe(&server, "EnvRecipe");

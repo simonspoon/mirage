@@ -72,6 +72,13 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
+    /// Activate a recipe (applies its spec, endpoints, seeds, rules)
+    Activate {
+        /// Recipe id
+        id: i64,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
 }
 
 /// SQL reserved words that may cause issues as column names.
@@ -438,6 +445,53 @@ async fn run_recipes(args: &RecipesArgs) {
                 .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
             parse_nested_config(&mut recipe);
             println!("{recipe}");
+        }
+        RecipesCommand::Activate { id, url } => {
+            let base = resolve_base_url(url);
+            // Fetch recipe first: validates existence (404 surfaces here) and
+            // lets us echo the name in the activation confirmation.
+            let get_resp = client
+                .get(format!("{base}/_api/admin/recipes/{id}"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let get_resp = ensure_success(get_resp).await;
+            let recipe: serde_json::Value = get_resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            let name = recipe
+                .get("name")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            // Activate.
+            let act_resp = client
+                .post(format!("{base}/_api/admin/recipes/{id}/activate"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let act_resp = ensure_success(act_resp).await;
+            let act_body: serde_json::Value = act_resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+
+            let status = act_body
+                .get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let endpoints = act_body
+                .get("endpoints")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
+            let payload = serde_json::json!({
+                "id": id,
+                "name": name,
+                "status": status,
+                "endpoints": endpoints,
+            });
+            println!("{payload}");
         }
     }
 }
