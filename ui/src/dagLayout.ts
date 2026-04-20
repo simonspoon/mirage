@@ -37,6 +37,19 @@ export interface GraphEdge {
    * this field entirely.
    */
   id?: string;
+  /**
+   * Optional semantic edge kind. When "extends", dagre-backed layouts
+   * invert the edge internally (child → parent becomes parent → child at
+   * the graph level) so the extends parent ranks ABOVE the extending
+   * child under rankdir=TB — matching UML "parent above" convention.
+   * The exposed edges map still keys by the caller-supplied id and the
+   * returned polyline points are re-oriented so pts[0] = semantic source
+   * (child) side, pts[last] = semantic target (parent) side; cardinality/
+   * label code therefore needs no per-kind branching. Property-ref
+   * ("ref"|"items") edges are laid out source → target as usual. Legacy
+   * computeDagPositions ignores this field entirely.
+   */
+  refKind?: "extends" | "ref" | "items";
 }
 
 export interface EntityDef {

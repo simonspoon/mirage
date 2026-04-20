@@ -230,8 +230,8 @@ describe("computeDagrePositions", () => {
     expect(Object.keys(rankCenterY).sort()).toEqual(
       [String(rankA), String(rankB)].sort(),
     );
-    // All rank-1 nodes share the same centerY — rank bucket invariant.
-    expect(rankCenterY[rankB]).toBeCloseTo(rankCenterY[rankB], 5);
+    // Ranks A and B occupy distinct vertical bands — different centerY.
+    expect(rankCenterY[rankA]).not.toBeCloseTo(rankCenterY[rankB], 5);
     // Verify the invariant via positions+heights: center y of each rank-1
     // node = positions[n].y + height/2. Pick B (tall) and C (short) and
     // assert their center y matches rankCenterY[rankB].
@@ -309,5 +309,267 @@ describe("computeDagrePositions", () => {
     // height ≥ HEADER + 10*ROW_HEIGHT plus margins.
     const minCellH = HEADER_HEIGHT + 10 * ROW_HEIGHT;
     expect(r.height).toBeGreaterThanOrEqual(minCellH);
+  });
+
+  // ── refKind === "extends" inversion ─────────────────────────────────────
+  // Dagre-layer inversion places the extends parent ABOVE the extending
+  // child under rankdir=TB (matches UML parent-above convention) while
+  // keeping the caller-facing edge source/target / id semantics intact.
+  describe("refKind='extends' inversion", () => {
+    it("extends edge: parent ranks ABOVE child under rankdir=TB", () => {
+      // Child → Parent extends edge. After inversion, parent (BaseAudit)
+      // ranks lower (numerically smaller rank = higher on screen under TB)
+      // than the extending child (ComposedEntity).
+      const defs = {
+        ComposedEntity: def([], "BaseAudit"),
+        BaseAudit: def(["created_at"]),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::extends::BaseAudit",
+          source: "ComposedEntity",
+          target: "BaseAudit",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "BaseAudit"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      expect(r.ranks).toBeDefined();
+      const ranks = r.ranks!;
+      // parent rank < child rank (parent visually above child)
+      expect(ranks.BaseAudit).toBeLessThan(ranks.ComposedEntity);
+      // Positional y also confirms: smaller y = higher on screen.
+      expect(r.positions.BaseAudit.y).toBeLessThan(r.positions.ComposedEntity.y);
+    });
+
+    it("property-ref edge: target ranks BELOW source (unchanged)", () => {
+      // Non-extends property reference. Standard dagre direction: source
+      // ranks above target.
+      const defs = {
+        ComposedEntity: def(["owner"]),
+        Owner: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::owner::Owner",
+          source: "ComposedEntity",
+          target: "Owner",
+          refKind: "ref",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "Owner"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      const ranks = r.ranks!;
+      expect(ranks.Owner).toBeGreaterThan(ranks.ComposedEntity);
+      expect(r.positions.Owner.y).toBeGreaterThan(r.positions.ComposedEntity.y);
+    });
+
+    it("extends edge points: pts[0] (child side) below pts[last] (parent side)", () => {
+      // Post-reversal invariant: first point = semantic source (child) end,
+      // last point = semantic target (parent) end. Under TB with parent
+      // above child, pts[0].y > pts[last].y.
+      const defs = {
+        ComposedEntity: def([], "BaseAudit"),
+        BaseAudit: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::extends::BaseAudit",
+          source: "ComposedEntity",
+          target: "BaseAudit",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "BaseAudit"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      expect(r.edges).toBeDefined();
+      const pts = r.edges!["ComposedEntity::extends::BaseAudit"].points;
+      expect(pts.length).toBeGreaterThanOrEqual(2);
+      expect(pts[0].y).toBeGreaterThan(pts[pts.length - 1].y);
+    });
+
+    it("property-ref edge points: pts[0] (source side) above pts[last] (target side)", () => {
+      const defs = {
+        ComposedEntity: def(["owner"]),
+        Owner: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::owner::Owner",
+          source: "ComposedEntity",
+          target: "Owner",
+          refKind: "ref",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "Owner"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      const pts = r.edges!["ComposedEntity::owner::Owner"].points;
+      expect(pts.length).toBeGreaterThanOrEqual(2);
+      expect(pts[0].y).toBeLessThan(pts[pts.length - 1].y);
+    });
+
+    it("mixed focal: extends parent above, property target below focal", () => {
+      // ComposedEntity extends BaseAudit AND has property owner → Owner.
+      // Expected ranks: BaseAudit < ComposedEntity < Owner.
+      const defs = {
+        ComposedEntity: def(["owner"], "BaseAudit"),
+        BaseAudit: def(["created_at"]),
+        Owner: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::extends::BaseAudit",
+          source: "ComposedEntity",
+          target: "BaseAudit",
+          refKind: "extends",
+        },
+        {
+          id: "ComposedEntity::owner::Owner",
+          source: "ComposedEntity",
+          target: "Owner",
+          refKind: "ref",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "BaseAudit", "Owner"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      const ranks = r.ranks!;
+      expect(ranks.BaseAudit).toBeLessThan(ranks.ComposedEntity);
+      expect(ranks.Owner).toBeGreaterThan(ranks.ComposedEntity);
+      // BaseAudit and Owner MUST end up on different ranks — otherwise
+      // they read as siblings (the exact bug this task fixes).
+      expect(ranks.BaseAudit).not.toBe(ranks.Owner);
+    });
+
+    it("multi-level extends chain: strict rank ordering parent-above", () => {
+      // GrandChild extends Child; Child extends Parent. Expect rank
+      // ordering Parent < Child < GrandChild.
+      const defs = {
+        GrandChild: def([], "Child"),
+        Child: def([], "Parent"),
+        Parent: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "GrandChild::extends::Child",
+          source: "GrandChild",
+          target: "Child",
+          refKind: "extends",
+        },
+        {
+          id: "Child::extends::Parent",
+          source: "Child",
+          target: "Parent",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["GrandChild", "Child", "Parent"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      const ranks = r.ranks!;
+      expect(ranks.Parent).toBeLessThan(ranks.Child);
+      expect(ranks.Child).toBeLessThan(ranks.GrandChild);
+    });
+
+    it("missing parent from visible list: no crash, child positioned", () => {
+      // extends target not in the list — dagreLayout should skip the edge
+      // and still return a valid layout (does NOT invent the missing node).
+      const defs = {
+        ComposedEntity: def([], "BaseAudit"),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::extends::BaseAudit",
+          source: "ComposedEntity",
+          target: "BaseAudit",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      expect(r.positions.ComposedEntity).toBeDefined();
+      expect(Number.isFinite(r.positions.ComposedEntity.x)).toBe(true);
+      expect(Number.isFinite(r.positions.ComposedEntity.y)).toBe(true);
+      expect(r.positions.BaseAudit).toBeUndefined();
+    });
+
+    it("edge.id preserved as map key after inversion", () => {
+      // Inversion is a graph-layer implementation detail: the returned
+      // edges map must still key by the original caller-supplied id
+      // (child::extends::parent), not by the inverted tuple.
+      const defs = {
+        ComposedEntity: def([], "BaseAudit"),
+        BaseAudit: def(),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "ComposedEntity::extends::BaseAudit",
+          source: "ComposedEntity",
+          target: "BaseAudit",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(
+        ["ComposedEntity", "BaseAudit"],
+        edges,
+        defs,
+        NO_STUBS,
+        BAND_GAP,
+      );
+      expect(Object.keys(r.edges!)).toEqual(["ComposedEntity::extends::BaseAudit"]);
+    });
+
+    it("isolated node with extends to missing parent: unaffected positioning", () => {
+      // Only the isolated node is in the list — its position must still be
+      // finite and default (PAD-offset like any other single-node layout).
+      const defs = {
+        Solo: def([], "Missing"),
+      };
+      const edges: GraphEdge[] = [
+        {
+          id: "Solo::extends::Missing",
+          source: "Solo",
+          target: "Missing",
+          refKind: "extends",
+        },
+      ];
+      const r = computeDagrePositions(["Solo"], edges, defs, NO_STUBS, BAND_GAP);
+      expect(r.positions.Solo).toBeDefined();
+      expect(r.positions.Solo.x).toBeGreaterThanOrEqual(0);
+      expect(r.positions.Solo.y).toBeGreaterThanOrEqual(0);
+    });
   });
 });

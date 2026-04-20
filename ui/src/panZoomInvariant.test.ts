@@ -211,12 +211,12 @@ describe('panZoomInvariant — ui/src/index.tsx source scan', () => {
   // edge callback. Covers the full visible-path / hit-area / label JSX that
   // carries onMouseEnter/Leave and native <title> tooltips.
   it('no forbidden pan/zoom tokens in edge-JSX region', () => {
-    // Start: edge route memo (unique, top of edge callback render body).
+    // Start: edge routeInfo declaration (unique, top of edge callback render body).
     // End:   entity-box <For> which immediately follows the edge </For>.
     //        Two occurrences of this tag exist in the file (schemas graph +
     //        outer); the one directly after `routeInfo` closes the edge
     //        block, so we take the first match AFTER start.
-    const startMark = 'const routeInfo = createMemo(route);';
+    const startMark = 'const routeInfo =';
     const start = uniqueIndex(stripped, startMark);
     const entityBoxFor = '<For each={visibleList()}>';
     const end = stripped.indexOf(entityBoxFor, start + startMark.length);

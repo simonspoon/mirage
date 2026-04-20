@@ -3935,8 +3935,37 @@ function SchemasPage(props: {
                                   );
                                 };
 
-                                const routeInfo = createMemo(route);
-                                const d = () => routeInfo().d;
+                                const routeInfo =
+                                  edge.refKind === "extends"
+                                    ? undefined
+                                    : createMemo(route);
+                                // Build an SVG path `d` directly from a dagre polyline:
+                                // M pts[0] L pts[1] L … L pts[last]. Used for extends
+                                // edges where the H-V-H elbow router would produce a
+                                // backward loop on a vertical TB edge (source/target
+                                // share a column).
+                                const polylinePath = (
+                                  pts: { x: number; y: number }[],
+                                ): string => {
+                                  let s = `M ${pts[0].x} ${pts[0].y}`;
+                                  for (let i = 1; i < pts.length; i++) {
+                                    s += ` L ${pts[i].x} ${pts[i].y}`;
+                                  }
+                                  return s;
+                                };
+                                const d = () => {
+                                  if (edge.refKind === "extends") {
+                                    const pts = dagrePoints();
+                                    if (pts) return polylinePath(pts);
+                                    // Polyline unavailable (unlikely — dagre always
+                                    // emits points for kept edges). Fall back to a
+                                    // simple vertical-then-horizontal path upward
+                                    // from source row to parent header.
+                                    const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
+                                    return `M ${_sx} ${_sy} V ${_ty} H ${_tx}`;
+                                  }
+                                  return routeInfo?.().d ?? "";
+                                };
                                 // Midpoint field-name label: prefer dagre's polyline midpoint
                                 // when layout exposed per-edge geometry; fall back to the manual
                                 // router's longest-segment midpoint (still correct for
@@ -3944,12 +3973,12 @@ function SchemasPage(props: {
                                 const labelX = () => {
                                   const pts = dagrePoints();
                                   if (pts) return polylineMidpoint(pts).x;
-                                  return routeInfo().labelX;
+                                  return routeInfo?.().labelX ?? 0;
                                 };
                                 const labelY = () => {
                                   const pts = dagrePoints();
                                   if (pts) return polylineMidpoint(pts).y;
-                                  return routeInfo().labelY;
+                                  return routeInfo?.().labelY ?? 0;
                                 };
 
                                 // Cardinality label anchors. Preferred: first/last dagre point
@@ -4071,9 +4100,25 @@ function SchemasPage(props: {
                                         font-family="ui-monospace, monospace"
                                         text-anchor="end"
                                       >{edge.cardinality === "1:N" ? "N" : "1"}</text>
-                                      {/* Arrow marker at target end */}
+                                      {/* Arrow marker at target end.
+                                          Property-ref edges: rightward triangle (source is
+                                          on left, target on right). Extends edges: upward
+                                          triangle so arrow points from child UP to parent
+                                          (TB layout with parent above child). Tip anchored
+                                          on dagre polyline endpoint when available to hug
+                                          the real connection point, else on target coord. */}
                                       <polygon
-                                        points={`${tx()},${ty()} ${tx() - 6},${ty() - 3} ${tx() - 6},${ty() + 3}`}
+                                        points={(() => {
+                                          const pts = dagrePoints();
+                                          if (edge.refKind === "extends") {
+                                            const endX = pts ? pts[pts.length - 1].x : tx();
+                                            const endY = pts ? pts[pts.length - 1].y : ty();
+                                            return `${endX},${endY} ${endX - 3},${endY + 6} ${endX + 3},${endY + 6}`;
+                                          }
+                                          const ax = tx();
+                                          const ay = ty();
+                                          return `${ax},${ay} ${ax - 6},${ay - 3} ${ax - 6},${ay + 3}`;
+                                        })()}
                                         fill={isHovered() ? "#60a5fa" : style.stroke}
                                       />
                                       {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover).

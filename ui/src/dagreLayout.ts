@@ -73,9 +73,18 @@ export function computeDagrePositions(
   // Prefer caller-supplied GraphEdge.id (stable, meaningful key for point
   // lookup downstream) with a de-dup counter suffix if the same id appears
   // more than once; fall back to a synthetic name when id is omitted.
+  //
+  // refKind === "extends" inversion: at the dagre graph level we set the
+  // edge as target → source (parent → child) so dagre's rank assignment
+  // places the extends parent ABOVE the extending child under rankdir=TB.
+  // The caller-supplied id (keyed on child::extends::parent) is preserved
+  // verbatim; the retrieval loop below uses matching {v,w} so points come
+  // back, and re-orients the polyline so pts[0] stays near the semantic
+  // source (child) and pts[last] near the semantic target (parent).
   let edgeIdx = 0;
   const usedNames = new Set<string>();
   const edgeNameOf = new Map<GraphEdge, string>();
+  const invertedEdges = new Set<GraphEdge>();
   for (const e of edges) {
     if (!listSet.has(e.source) || !listSet.has(e.target)) continue;
     if (e.source === e.target) continue; // dagre rejects self-loops in layout
@@ -88,7 +97,12 @@ export function computeDagrePositions(
     }
     usedNames.add(name);
     edgeNameOf.set(e, name);
-    g.setEdge(e.source, e.target, {}, name);
+    if (e.refKind === "extends") {
+      invertedEdges.add(e);
+      g.setEdge(e.target, e.source, {}, name);
+    } else {
+      g.setEdge(e.source, e.target, {}, name);
+    }
   }
 
   dagre.layout(g);
@@ -128,7 +142,13 @@ export function computeDagrePositions(
   // detour edges.
   const edgesOut: Record<string, { points: { x: number; y: number }[] }> = {};
   for (const [inputEdge, name] of edgeNameOf) {
-    const eObj = g.edge({ v: inputEdge.source, w: inputEdge.target, name });
+    const inverted = invertedEdges.has(inputEdge);
+    // Inverted (extends) edges were registered as target → source at
+    // graph level, so the retrieval {v,w} must match that registration
+    // or g.edge() returns undefined and the polyline is lost.
+    const v = inverted ? inputEdge.target : inputEdge.source;
+    const w = inverted ? inputEdge.source : inputEdge.target;
+    const eObj = g.edge({ v, w, name });
     if (!eObj || !Array.isArray(eObj.points)) continue;
     const pts = eObj.points
       .filter((p: { x?: unknown; y?: unknown }) =>
@@ -136,7 +156,13 @@ export function computeDagrePositions(
       )
       .map((p: { x: number; y: number }) => ({ x: p.x, y: p.y }));
     if (pts.length === 0) continue;
-    edgesOut[name] = { points: pts };
+    // For inverted (extends) edges, dagre's polyline runs parent → child
+    // (pts[0] near parent, pts[last] near child). Reverse so downstream
+    // consumers can treat pts[0] as always near the semantic source
+    // (child side for extends) and pts[last] as the semantic target
+    // (parent side for extends) — keeps cardinality-label and arrow-
+    // marker code uniform across edge kinds.
+    edgesOut[name] = { points: inverted ? pts.slice().reverse() : pts };
   }
 
   const graph = g.graph();
