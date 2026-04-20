@@ -56,11 +56,7 @@ impl MirageServer {
 
         let child = Command::new(env!("CARGO_BIN_EXE_mirage"))
             .current_dir(&workdir)
-            .args([
-                spec_abs.to_str().unwrap(),
-                "--port",
-                &port.to_string(),
-            ])
+            .args([spec_abs.to_str().unwrap(), "--port", &port.to_string()])
             .spawn()
             .expect("failed to start mirage");
 
@@ -1204,7 +1200,11 @@ fn test_recipes_cli_clone() {
     assert!(out.status.success(), "recipes clone should exit 0");
     let cloned: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
-    assert_ne!(cloned["id"].as_i64(), Some(src_id), "clone must get fresh id");
+    assert_ne!(
+        cloned["id"].as_i64(),
+        Some(src_id),
+        "clone must get fresh id"
+    );
     assert_eq!(cloned["name"], "Clone Source (copy)");
     // Config fields expanded.
     assert!(cloned["selected_endpoints"].is_array());
@@ -1292,4 +1292,371 @@ fn test_recipes_cli_http_failure_bad_url() {
     let err: serde_json::Value =
         serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
     assert!(err.get("error").is_some());
+}
+
+/// Allocate a per-test scratch directory (distinct from MirageServer.workdir
+/// so test inputs are not cleaned up when the server drops).
+fn scratch_dir(tag: &str) -> PathBuf {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = std::env::temp_dir().join(format!("mirage-cli-{tag}-{port}"));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+const MINI_SPEC: &str = "swagger: \"2.0\"\ninfo:\n  title: t\n  version: \"1\"\npaths: {}\n";
+
+#[test]
+fn test_recipes_cli_create() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("create");
+
+    let spec_path = scratch.join("spec.yaml");
+    std::fs::write(&spec_path, MINI_SPEC).unwrap();
+
+    let endpoints_path = scratch.join("endpoints.json");
+    std::fs::write(
+        &endpoints_path,
+        r#"[{"method":"GET","path":"/foo"},{"method":"POST","path":"/bar"},{"method":"DELETE","path":"/baz"}]"#,
+    )
+    .unwrap();
+
+    let config_path = scratch.join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+            "shared_pools": {"color": ["red","blue"]},
+            "quantity_configs": {},
+            "faker_rules": {},
+            "rules": [],
+            "frozen_rows": {}
+        }"#,
+    )
+    .unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "create",
+            "--name",
+            "Created From CLI",
+            "--spec-file",
+            spec_path.to_str().unwrap(),
+            "--endpoints-file",
+            endpoints_path.to_str().unwrap(),
+            "--seed-count",
+            "7",
+            "--config-file",
+            config_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "recipes create should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert!(recipe["id"].as_i64().is_some(), "response has id");
+    assert_eq!(recipe["name"], "Created From CLI");
+    assert_eq!(recipe["seed_count"], 7);
+    assert_eq!(recipe["spec_source"], MINI_SPEC);
+    // selected_endpoints is stored as a JSON string by the server; the raw
+    // create response mirrors that shape (siblings show/clone expand; create
+    // does not per design).
+    let endpoints_str = recipe["selected_endpoints"]
+        .as_str()
+        .expect("selected_endpoints is JSON string in raw create response");
+    let endpoints_parsed: Vec<serde_json::Value> =
+        serde_json::from_str(endpoints_str).expect("selected_endpoints parses");
+    assert_eq!(endpoints_parsed.len(), 3);
+    assert_eq!(endpoints_parsed[0]["method"], "GET");
+    assert_eq!(endpoints_parsed[0]["path"], "/foo");
+    // Shared pools round-tripped.
+    let pools_str = recipe["shared_pools"]
+        .as_str()
+        .expect("shared_pools string");
+    assert!(pools_str.contains("color"));
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_create_without_config_or_seed() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("create-min");
+
+    let spec_path = scratch.join("spec.yaml");
+    std::fs::write(&spec_path, MINI_SPEC).unwrap();
+    let endpoints_path = scratch.join("endpoints.json");
+    std::fs::write(&endpoints_path, r#"[{"method":"GET","path":"/x"}]"#).unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "create",
+            "--name",
+            "Minimal",
+            "--spec-file",
+            spec_path.to_str().unwrap(),
+            "--endpoints-file",
+            endpoints_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "recipes create (minimal) should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert_eq!(recipe["name"], "Minimal");
+    // Server default seed_count = 10.
+    assert_eq!(recipe["seed_count"], 10);
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_create_bad_endpoints_file() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("create-bad");
+
+    let spec_path = scratch.join("spec.yaml");
+    std::fs::write(&spec_path, MINI_SPEC).unwrap();
+    let endpoints_path = scratch.join("endpoints.json");
+    // Not an array — a plain object.
+    std::fs::write(&endpoints_path, r#"{"method":"GET","path":"/foo"}"#).unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "create",
+            "--name",
+            "Bad",
+            "--spec-file",
+            spec_path.to_str().unwrap(),
+            "--endpoints-file",
+            endpoints_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "bad endpoints file must cause non-zero exit"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err["error"].as_str().unwrap().contains("array"),
+        "error message should mention array shape: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_create_missing_spec_file() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("create-missing");
+
+    let endpoints_path = scratch.join("endpoints.json");
+    std::fs::write(&endpoints_path, r#"[{"method":"GET","path":"/x"}]"#).unwrap();
+    let missing = scratch.join("nope.yaml");
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "create",
+            "--name",
+            "Missing",
+            "--spec-file",
+            missing.to_str().unwrap(),
+            "--endpoints-file",
+            endpoints_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "missing spec file must exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err["error"].as_str().unwrap().contains("failed to read"),
+        "error should mention read failure: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_export_stdout() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Export Me");
+    let id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(&server, &["export", &id.to_string()]);
+    assert!(
+        out.status.success(),
+        "recipes export should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let exported: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be JSON");
+    assert_eq!(exported["mirage_recipe"], 2);
+    assert_eq!(exported["name"], "Export Me");
+    assert!(
+        exported["spec_source"].is_string(),
+        "spec_source should be a string"
+    );
+    assert!(
+        exported["selected_endpoints"].is_array(),
+        "selected_endpoints should be expanded (not JSON string)"
+    );
+    assert!(exported["shared_pools"].is_object());
+    assert!(exported["rules"].is_array());
+}
+
+#[test]
+fn test_recipes_cli_export_to_file() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Export To File");
+    let id = created["id"].as_i64().unwrap();
+    let scratch = scratch_dir("export-file");
+    let out_path = scratch.join("exported.json");
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "export",
+            &id.to_string(),
+            "--file",
+            out_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "recipes export --file should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stdout should be empty when --file is given.
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty when --file is used; got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let contents = std::fs::read_to_string(&out_path).expect("exported file exists");
+    let exported: serde_json::Value =
+        serde_json::from_str(&contents).expect("file contents should be JSON");
+    assert_eq!(exported["mirage_recipe"], 2);
+    assert_eq!(exported["name"], "Export To File");
+    assert!(exported["spec_source"].is_string());
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_export_404() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let out = mirage_cli(&server, &["export", "999999"]);
+    assert!(
+        !out.status.success(),
+        "export on missing id should exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
+}
+
+#[test]
+fn test_recipes_cli_import_roundtrip() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Round Trip");
+    let src_id = created["id"].as_i64().unwrap();
+    let scratch = scratch_dir("import");
+
+    // Export via CLI to file.
+    let exported_path = scratch.join("recipe.json");
+    let out = mirage_cli(
+        &server,
+        &[
+            "export",
+            &src_id.to_string(),
+            "--file",
+            exported_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "export step of round trip must succeed"
+    );
+
+    // Import the exported file back.
+    let out = mirage_cli(
+        &server,
+        &["import", "--file", exported_path.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "recipes import should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let imported: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert!(
+        imported["id"].as_i64().is_some(),
+        "imported recipe has an id"
+    );
+    assert_ne!(
+        imported["id"].as_i64(),
+        Some(src_id),
+        "imported recipe gets a fresh id"
+    );
+    assert_eq!(imported["name"], "Round Trip");
+    assert_eq!(imported["seed_count"], 5);
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn test_recipes_cli_import_bad_file() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let scratch = scratch_dir("import-bad");
+
+    // File that is not valid JSON at all.
+    let bad = scratch.join("bad.json");
+    std::fs::write(&bad, "this is not json").unwrap();
+
+    let out = mirage_cli(&server, &["import", "--file", bad.to_str().unwrap()]);
+    assert!(!out.status.success(), "bad JSON must exit non-zero");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err["error"].as_str().unwrap().contains("invalid JSON"),
+        "error should mention invalid JSON: {stderr}"
+    );
+
+    // File that is JSON but missing the mirage_recipe marker — server rejects.
+    let wrong = scratch.join("wrong.json");
+    std::fs::write(&wrong, r#"{"name":"no marker"}"#).unwrap();
+    let out = mirage_cli(&server, &["import", "--file", wrong.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "missing mirage_recipe marker must exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
+
+    std::fs::remove_dir_all(&scratch).ok();
 }

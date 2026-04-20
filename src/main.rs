@@ -79,6 +79,45 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
+    /// Create a new recipe from a spec file, endpoints file, and optional config
+    Create {
+        /// Recipe name
+        #[arg(long)]
+        name: String,
+        /// Path to the Swagger spec file (becomes spec_source)
+        #[arg(long)]
+        spec_file: PathBuf,
+        /// Path to a JSON file containing `[{"method":"...","path":"..."}, ...]`
+        #[arg(long)]
+        endpoints_file: PathBuf,
+        /// Seed count (rows generated per table)
+        #[arg(long)]
+        seed_count: Option<i64>,
+        /// Optional JSON file containing any of
+        /// shared_pools / quantity_configs / faker_rules / rules / frozen_rows
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
+    /// Import a recipe from an exported-recipe JSON file
+    Import {
+        /// Path to an exported-recipe JSON file (produced by `recipes export`)
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
+    /// Export a recipe to a JSON file or stdout
+    Export {
+        /// Recipe id
+        id: i64,
+        /// Optional path to write the exported JSON to (default: stdout)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
 }
 
 /// SQL reserved words that may cause issues as column names.
@@ -340,6 +379,20 @@ async fn ensure_success(resp: reqwest::Response) -> reqwest::Response {
     emit_err_and_exit(msg);
 }
 
+/// Read a file to a String, or emit `{"error":"..."}` to stderr and exit 1.
+fn read_file_or_exit(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| emit_err_and_exit(format!("failed to read {}: {e}", path.display())))
+}
+
+/// Parse a JSON string into a `serde_json::Value`, or emit `{"error":"..."}`
+/// to stderr and exit 1. `ctx` is a short label used in the error message
+/// (e.g. the flag name or file purpose).
+fn parse_json_or_exit(s: &str, ctx: &str) -> serde_json::Value {
+    serde_json::from_str(s)
+        .unwrap_or_else(|e| emit_err_and_exit(format!("invalid JSON in {ctx}: {e}")))
+}
+
 /// Take a recipe JSON value (as returned by the admin API) and expand the
 /// JSON-string config fields (`selected_endpoints`, `shared_pools`,
 /// `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`) into nested
@@ -492,6 +545,107 @@ async fn run_recipes(args: &RecipesArgs) {
                 "endpoints": endpoints,
             });
             println!("{payload}");
+        }
+        RecipesCommand::Create {
+            name,
+            spec_file,
+            endpoints_file,
+            seed_count,
+            config_file,
+            url,
+        } => {
+            let base = resolve_base_url(url);
+
+            let spec_source = read_file_or_exit(spec_file);
+            let endpoints_raw = read_file_or_exit(endpoints_file);
+            let endpoints = parse_json_or_exit(&endpoints_raw, "--endpoints-file");
+            if !endpoints.is_array() {
+                emit_err_and_exit(
+                    "--endpoints-file must contain a JSON array of {method, path} objects",
+                );
+            }
+
+            let mut body = serde_json::json!({
+                "name": name,
+                "spec_source": spec_source,
+                "endpoints": endpoints,
+            });
+            let body_obj = body.as_object_mut().expect("body is an object");
+            if let Some(n) = seed_count {
+                body_obj.insert("seed_count".to_string(), serde_json::json!(n));
+            }
+            if let Some(cfg_path) = config_file {
+                let cfg_raw = read_file_or_exit(cfg_path);
+                let cfg = parse_json_or_exit(&cfg_raw, "--config-file");
+                let cfg_obj = cfg.as_object().unwrap_or_else(|| {
+                    emit_err_and_exit("--config-file must contain a JSON object")
+                });
+                const CONFIG_KEYS: &[&str] = &[
+                    "shared_pools",
+                    "quantity_configs",
+                    "faker_rules",
+                    "rules",
+                    "frozen_rows",
+                ];
+                for k in CONFIG_KEYS {
+                    if let Some(v) = cfg_obj.get(*k) {
+                        body_obj.insert((*k).to_string(), v.clone());
+                    }
+                }
+            }
+
+            let resp = client
+                .post(format!("{base}/_api/admin/recipes"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let recipe: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            println!("{recipe}");
+        }
+        RecipesCommand::Import { file, url } => {
+            let base = resolve_base_url(url);
+            let raw = read_file_or_exit(file);
+            let body = parse_json_or_exit(&raw, "--file");
+            let resp = client
+                .post(format!("{base}/_api/admin/recipes/import"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let recipe: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            println!("{recipe}");
+        }
+        RecipesCommand::Export { id, file, url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .get(format!("{base}/_api/admin/recipes/{id}/export"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            match file {
+                Some(path) => {
+                    std::fs::write(path, &body).unwrap_or_else(|e| {
+                        emit_err_and_exit(format!("failed to write {}: {e}", path.display()))
+                    });
+                }
+                None => {
+                    println!("{body}");
+                }
+            }
         }
     }
 }
