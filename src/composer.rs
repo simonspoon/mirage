@@ -27,8 +27,16 @@ pub type DocumentStore = HashMap<String, Vec<serde_json::Value>>;
 /// `conn` lets nested `$ref` properties sample from the referenced def's
 /// already-seeded SQLite table (see task yhgg / baqf — implicit pool via
 /// backing table).
+///
+/// `on_def_composed` fires once per def, IN TOPO ORDER, right after its docs
+/// are generated and before the next (topologically-later) def composes. The
+/// callback receives `(def_name, &docs)` and returns a `rusqlite::Error` on
+/// failure. Caller uses this hook to stream-insert composed rows into SQLite
+/// so later defs' nested `$ref` samples draw from the just-composed rows of
+/// earlier defs (multi-hop pool identity — task thoh under parent baqf).
+/// Pass `|_,_| Ok(())` to skip streaming.
 #[allow(clippy::too_many_arguments)]
-pub fn compose_documents(
+pub fn compose_documents<F>(
     spec: &SwaggerSpec,
     raw_spec: &SwaggerSpec,
     _graph: &EntityGraph,
@@ -37,10 +45,14 @@ pub fn compose_documents(
     faker_rules: &FakerRules,
     recipe_rules: &[Rule],
     conn: &rusqlite::Connection,
-) -> DocumentStore {
+    mut on_def_composed: F,
+) -> Result<DocumentStore, rusqlite::Error>
+where
+    F: FnMut(&str, &[serde_json::Value]) -> Result<(), rusqlite::Error>,
+{
     let defs = match &spec.definitions {
         Some(d) => d,
-        None => return DocumentStore::new(),
+        None => return Ok(DocumentStore::new()),
     };
 
     let raw_defs = raw_spec.definitions.as_ref();
@@ -119,10 +131,11 @@ pub fn compose_documents(
             }
             docs.push(doc);
         }
+        on_def_composed(&def_name, &docs)?;
         store.insert(def_name, docs);
     }
 
-    store
+    Ok(store)
 }
 
 /// Reorder `endpoints` so those whose primary response-def is topologically
@@ -492,7 +505,9 @@ mod tests {
             &FakerRules::new(),
             &[],
             &conn,
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
 
         assert!(docs.contains_key("Pet"), "should have Pet documents");
         assert_eq!(

@@ -1947,9 +1947,12 @@ async fn admin_activate_recipe(
             });
     }
 
-    let composed = {
+    // Stream-compose + insert per def in topo order, then re-apply frozen rows.
+    // Per-def streaming lets later defs' nested $ref samples read the just-
+    // composed rows of earlier defs from SQLite (task thoh, parent baqf).
+    {
         let conn = state.db.lock().unwrap();
-        crate::composer::compose_documents(
+        let compose_result = crate::composer::compose_documents(
             &spec,
             &raw_spec,
             &entity_graph,
@@ -1958,13 +1961,13 @@ async fn admin_activate_recipe(
             &faker_rules,
             &recipe_rules,
             &conn,
-        )
-    };
-
-    // Write composed documents to SQLite, then re-apply frozen rows
-    {
-        let conn = state.db.lock().unwrap();
-        if let Err(e) = seeder::insert_composed_rows(&conn, &composed) {
+            |def_name, docs| {
+                let mut single = HashMap::new();
+                single.insert(def_name.to_string(), docs.to_vec());
+                seeder::insert_composed_rows(&conn, &single)
+            },
+        );
+        if let Err(e) = compose_result {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to insert composed rows: {e}")})),

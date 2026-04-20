@@ -786,7 +786,7 @@ async fn main() {
                 path: path.to_string(),
             })
             .collect();
-        let composed = {
+        {
             let conn = db.lock().unwrap();
             composer::compose_documents(
                 &spec,
@@ -797,9 +797,14 @@ async fn main() {
                 &no_faker_rules,
                 &no_recipe_rules,
                 &conn,
+                |def_name, docs| {
+                    let mut single = std::collections::HashMap::new();
+                    single.insert(def_name.to_string(), docs.to_vec());
+                    seeder::insert_composed_rows(&conn, &single)
+                },
             )
-        };
-        seeder::insert_composed_rows(&db.lock().unwrap(), &composed).unwrap();
+            .unwrap();
+        }
     }
 
     let log: server::RequestLog = Arc::new(Mutex::new(Vec::new()));

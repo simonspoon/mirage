@@ -620,19 +620,15 @@ fn test_implicit_pool_nested_ref() {
 /// extension, composed.owner.address ⊆ Address table, already covered by the
 /// one-hop test).
 ///
-/// Currently `#[ignore]`: the activation path in `src/main.rs` (~line 789)
-/// and `src/server.rs::admin_activate_recipe` (~line 1967) composes ALL
-/// endpoint docs into an in-memory `DocumentStore` and then bulk-inserts via
-/// `seeder::insert_composed_rows`. That means ComposedEntity's `owner`
-/// property is sampled from the SEEDER-populated Owner table, and the Owner
-/// table is later replaced by /owners' composed rows. Final Owner table ≠
-/// the Owner rows composed.owner actually sampled from → this assertion
-/// fails. Fix requires streaming insert per-def in topo order (new sibling
-/// task `thoh` under parent `baqf`).
-///
-/// Un-ignore once `thoh` lands.
+/// Guaranteed by streaming per-def compose+insert in the activation path:
+/// `composer::compose_documents` fires an `on_def_composed` callback after
+/// each def composes, and both call sites (`src/main.rs` default-activation
+/// and `src/server.rs::admin_activate_recipe`) pass a closure that calls
+/// `seeder::insert_composed_rows` for that single def. Result: when
+/// `ComposedEntity` composes, the `Owner` table already holds the composed
+/// Owner rows, so nested `$ref` sampling draws from them (task thoh under
+/// parent baqf).
 #[test]
-#[ignore = "pending streaming insert per-def in activation path (limbo task thoh, parent baqf)"]
 fn test_implicit_pool_two_hop_composed_owner() {
     use std::collections::HashSet;
 
