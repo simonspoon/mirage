@@ -4328,13 +4328,12 @@ function RecipeConfigStep(props: {
   const hasRules = () => Object.keys(props.recipeFakerRules()).length > 0;
 
   const BUILTIN_FAKER_STRATEGIES = ["auto", "word", "name", "email", "phone", "url", "sentence", "paragraph", "uuid", "date", "integer", "float", "boolean"];
-  // Derived faker strategy list: custom list names prepended so they shadow built-ins on collision.
-  // Set-dedupe preserves first occurrence, so a custom list named "email" keeps the custom entry.
-  const fakerStrategies = createMemo((): string[] => {
-    const set = new Set<string>();
-    for (const name of Object.keys(props.recipeCustomLists())) set.add(name);
-    for (const s of BUILTIN_FAKER_STRATEGIES) set.add(s);
-    return [...set];
+  // Built-in strategies with any name shadowed by a custom list filtered out. Rendered as
+  // the default group in every faker-strategy <select>; custom list names render under a
+  // separate <optgroup label="Custom lists"> so users see user-defined entries distinctly.
+  const builtinFakerStrategies = createMemo((): string[] => {
+    const customKeys = new Set(Object.keys(props.recipeCustomLists()));
+    return BUILTIN_FAKER_STRATEGIES.filter(s => !customKeys.has(s));
   });
 
   // Custom-lists panel state.
@@ -4905,9 +4904,16 @@ function RecipeConfigStep(props: {
                 }}
               >
                 <option value="">--</option>
-                <For each={fakerStrategies()}>
+                <For each={builtinFakerStrategies()}>
                   {(s) => <option value={s}>{s}</option>}
                 </For>
+                <Show when={customListNames().length > 0}>
+                  <optgroup label="Custom lists">
+                    <For each={customListNames()}>
+                      {(s) => <option value={s}>{s}</option>}
+                    </For>
+                  </optgroup>
+                </Show>
               </select>
             </div>
           </Show>
@@ -5146,9 +5152,16 @@ function RecipeConfigStep(props: {
                                           props.setRecipeFakerRules(rules);
                                         }}
                                       >
-                                        <For each={fakerStrategies()}>
+                                        <For each={builtinFakerStrategies()}>
                                           {(s) => <option value={s}>{s}</option>}
                                         </For>
+                                        <Show when={customListNames().length > 0}>
+                                          <optgroup label="Custom lists">
+                                            <For each={customListNames()}>
+                                              {(s) => <option value={s}>{s}</option>}
+                                            </For>
+                                          </optgroup>
+                                        </Show>
                                       </select>
                                     </Show>
                                   </div>
