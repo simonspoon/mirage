@@ -79,7 +79,15 @@ export function computeDagrePositions(
 
   dagre.layout(g);
 
+  // dagre populates node.rank (int, 0-based after normalizeRanks) and node.y
+  // (center y). Under default rankalign="center" every node in the same rank
+  // shares the same center y — that y is the rank centerline, the reliable
+  // anchor for rank-level chrome (overflow badges, etc.). If a future call
+  // passes rankalign="top"|"bottom" the rankCenterY map stops being a single
+  // shared y per rank; revisit this block if we ever flip rankalign.
   const positions: Record<string, { x: number; y: number }> = {};
+  const ranks: Record<string, number> = {};
+  const rankCenterY: Record<number, number> = {};
   for (const name of list) {
     const node = g.node(name);
     if (!node) continue;
@@ -87,11 +95,17 @@ export function computeDagrePositions(
       x: node.x - node.width / 2,
       y: node.y - node.height / 2,
     };
+    if (typeof node.rank === "number") {
+      ranks[name] = node.rank;
+      // Same rank → same node.y under rankalign=center, so blind overwrite
+      // is safe. First-writer-wins also acceptable; pick blind for brevity.
+      rankCenterY[node.rank] = node.y;
+    }
   }
 
   const graph = g.graph();
   const width = Math.max(1, (graph.width ?? 0) + PAD);
   const height = Math.max(400, (graph.height ?? 0) + PAD);
 
-  return { positions, width, height };
+  return { positions, width, height, ranks, rankCenterY };
 }

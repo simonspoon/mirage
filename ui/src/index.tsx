@@ -3298,24 +3298,39 @@ function SchemasPage(props: {
                       computeFullGraphDepths(props.definitions(), focusMembership()),
                     );
 
-                    // Hidden names bucketed by band Y coordinate (key =
-                    // positions[parent].y for the visible parent that first
-                    // reaches each hidden). Lifted out of <For> to avoid
-                    // rebuilding Map/Set per row (simaris 019d930b-01e0).
+                    // Hidden names bucketed by dagre RANK (not by parent
+                    // top-y). With dagre TB + heterogeneous node heights,
+                    // siblings on the same rank have different top-y values
+                    // (rankalign=center aligns CENTERS, so a tall box and a
+                    // short box on the same rank span different y ranges).
+                    // Keying by top-y fragments the bucket and mis-places
+                    // rightX/badgeY. Rank is the invariant.
                     //
-                    // Schema of return: Map<bandY, { names: string[], rightX: number }>
-                    // where rightX = max(x + widthOf(v)) across visible nodes
-                    // v whose y === bandY. Only bands with >=1 hidden appear.
+                    // Lifted out of <For> to avoid rebuilding Map/Set per row
+                    // (simaris 019d930b-01e0).
+                    //
+                    // Schema: Map<rank, { names: string[], rightX: number, centerY: number }>
+                    //   rightX  = max(x + widthOf(v)) across visible v with ranks[v] === rank
+                    //   centerY = rank's centerline y (shared across nodes in rank)
+                    //
+                    // Falls back safely when ranks is undefined (legacy DAG):
+                    // ranks lookup returns undefined → unresolved path picks
+                    // up the name via hopOf → and also skips the rank-rightX
+                    // loop harmlessly (leaves rightX at 0, which is still a
+                    // valid — if ugly — left-edge anchor).
                     const hiddenBandInfo = createMemo(() => {
                       const { hiddenRing } = twoHopPartition();
-                      const out = new Map<number, { names: string[]; rightX: number }>();
+                      const out = new Map<number, { names: string[]; rightX: number; centerY: number }>();
                       if (hiddenRing.size === 0) return out;
                       const defs = props.definitions();
-                      const positions = dagLayout().positions;
+                      const layout = dagLayout();
+                      const positions = layout.positions;
+                      const ranks = layout.ranks ?? {};
+                      const rankCenterYMap = layout.rankCenterY ?? {};
                       const depths = fullDepths();
 
                       // Build outgoing ref adjacency over full defs graph (once per memo run).
-                      // Used to find a visible "parent" (in dagLayout band sense)
+                      // Used to find a visible "parent" (in dagLayout rank sense)
                       // for each hidden name.
                       const outRefs = (name: string): string[] => {
                         const def = defs[name];
@@ -3330,11 +3345,11 @@ function SchemasPage(props: {
                       };
 
                       // For each hidden h: find any visible node v that shares
-                      // an edge with h. Use v's layout y as the band key.
+                      // an edge with h. Use v's dagre rank as the bucket key.
                       // min-hop invariant → at least one such v exists (its
-                      // hopOf is hopOf(h) - 1). Fallback: if none found, use
-                      // fullDepth-based band bucket via bucketHiddenByBand as
-                      // safety net (shouldn't normally fire).
+                      // hopOf is hopOf(h) - 1). Fallback: if none found or v
+                      // has no rank (legacy DAG), use fullDepth-based band
+                      // bucket via bucketHiddenByBand as safety net.
                       const visibleSet = new Set(visibleList());
                       const unresolved = new Set<string>();
                       for (const h of hiddenRing) {
@@ -3352,60 +3367,68 @@ function SchemasPage(props: {
                             if (parent) break;
                           }
                         }
-                        if (!parent || !positions[parent]) {
+                        if (!parent || !positions[parent] || ranks[parent] === undefined) {
                           unresolved.add(h);
                           continue;
                         }
-                        const bandY = positions[parent].y;
-                        let entry = out.get(bandY);
+                        const rank = ranks[parent];
+                        let entry = out.get(rank);
                         if (!entry) {
-                          entry = { names: [], rightX: 0 };
-                          out.set(bandY, entry);
+                          const centerY = rankCenterYMap[rank]
+                            ?? (positions[parent].y + HEADER_HEIGHT / 2);
+                          entry = { names: [], rightX: 0, centerY };
+                          out.set(rank, entry);
                         }
                         entry.names.push(h);
                       }
 
                       // Safety net for unresolved hidden (should be empty in
-                      // practice): bucket via full-graph depth, then map to
-                      // any visible node at that depth's layout y.
+                      // practice under dagre): bucket via full-graph depth,
+                      // then pick a visible node at that hopOf and use its
+                      // rank.
                       if (unresolved.size > 0) {
                         const byBand = bucketHiddenByBand(unresolved, depths);
-                        // Choose a representative visible node per fullDepth-1
-                        // band from positions; pick the node with the
-                        // matching hopOf depth if available.
                         const { hopOf } = twoHopPartition();
                         for (const [bandStr, names] of Object.entries(byBand)) {
                           const targetHop = Number(bandStr);
-                          let bandY: number | undefined;
+                          let rank: number | undefined;
+                          let fallbackCenterY: number | undefined;
                           for (const v of visibleSet) {
-                            if (hopOf[v] === targetHop && positions[v]) {
-                              bandY = positions[v].y;
+                            if (hopOf[v] === targetHop && ranks[v] !== undefined) {
+                              rank = ranks[v];
                               break;
                             }
+                            if (hopOf[v] === targetHop && positions[v] && fallbackCenterY === undefined) {
+                              fallbackCenterY = positions[v].y + HEADER_HEIGHT / 2;
+                            }
                           }
-                          if (bandY === undefined) continue;
-                          let entry = out.get(bandY);
+                          if (rank === undefined) continue;
+                          let entry = out.get(rank);
                           if (!entry) {
-                            entry = { names: [], rightX: 0 };
-                            out.set(bandY, entry);
+                            const centerY = rankCenterYMap[rank] ?? fallbackCenterY ?? 0;
+                            entry = { names: [], rightX: 0, centerY };
+                            out.set(rank, entry);
                           }
                           for (const n of names) entry.names.push(n);
                         }
                       }
 
-                      // Compute rightX per band: max(x + widthOf(v)) across
-                      // all visible v with matching y. Widths vary; iterate
-                      // and pick max (NOT last in list — simaris 019d9e7e).
+                      // rightX per rank: max(x + widthOf(v)) across all
+                      // visible v with ranks[v] === rank. Widths vary;
+                      // iterate + pick max (NOT last in list — simaris
+                      // 019d9e7e).
                       for (const v of visibleSet) {
                         const p = positions[v];
                         if (!p) continue;
-                        const entry = out.get(p.y);
+                        const rank = ranks[v];
+                        if (rank === undefined) continue;
+                        const entry = out.get(rank);
                         if (!entry) continue;
                         const right = p.x + widthOf(v);
                         if (right > entry.rightX) entry.rightX = right;
                       }
 
-                      // Alphabetically sort names per band (locale-aware).
+                      // Alphabetically sort names per rank (locale-aware).
                       for (const entry of out.values()) {
                         entry.names.sort((a, b) => a.localeCompare(b));
                       }
@@ -3413,8 +3436,9 @@ function SchemasPage(props: {
                       return out;
                     });
 
-                    // Bands (y-coords) that have >=1 hidden — drives badge
-                    // render. Sorted ascending so render/DOM order is stable.
+                    // Ranks that have >=1 hidden — drives badge render.
+                    // Sorted ascending (root rank first under TB) so DOM
+                    // order tracks top-to-bottom visual order.
                     const bandsWithHidden = createMemo(() =>
                       [...hiddenBandInfo().keys()].sort((a, b) => a - b),
                     );
@@ -4070,18 +4094,22 @@ function SchemasPage(props: {
                               Drag-vs-click guard mirrors stub click (L3100). */}
                           <g data-hidden-overflow>
                             <For each={bandsWithHidden()}>
-                              {(bandY) => {
-                                const entry = () => hiddenBandInfo().get(bandY);
+                              {(rank) => {
+                                const entry = () => hiddenBandInfo().get(rank);
                                 const count = () => entry()?.names.length ?? 0;
                                 const badgeX = () => (entry()?.rightX ?? 0) + 20; // GAP past rightmost visible
-                                const badgeY = () => bandY + HEADER_HEIGHT / 2 - 10;
+                                // Badge vertically centered on rank centerline
+                                // (rankCenterY from dagre). 10 = half badge
+                                // height (20). All nodes in rank share
+                                // centerY under rankalign=center.
+                                const badgeY = () => (entry()?.centerY ?? 0) - 10;
                                 const label = () => `+${count()}`;
                                 const badgeWidth = () => Math.max(32, label().length * 8 + 12);
-                                const isOpen = () => openBadgeBand() === bandY;
+                                const isOpen = () => openBadgeBand() === rank;
                                 return (
                                   <g
                                     data-hidden-band-badge={count()}
-                                    data-band-y={bandY}
+                                    data-band-rank={rank}
                                   >
                                     <rect
                                       x={badgeX()}
@@ -4097,7 +4125,7 @@ function SchemasPage(props: {
                                       onClick={(e) => {
                                         if (dragOccurred) return;
                                         e.stopPropagation();
-                                        setOpenBadgeBand(isOpen() ? null : bandY);
+                                        setOpenBadgeBand(isOpen() ? null : rank);
                                       }}
                                     >
                                       <title>{`${count()} hidden schema${count() === 1 ? "" : "s"} in this band`}</title>

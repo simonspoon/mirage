@@ -193,6 +193,60 @@ describe("computeDagrePositions", () => {
     expect(r.positions.A.y).toBeCloseTo(PAD, 5);
   });
 
+  it("exposes per-node ranks + rank centerline y (same rank → same centerY)", () => {
+    // Two-rank fan-out: A at rank 0; B, C, D all at rank 1. Heterogeneous
+    // heights on rank 1 (B tall, C short, D short) — under rankalign=center
+    // every rank-1 node shares the same center y.
+    const defs = {
+      A: def(["b", "c", "d"]),                              // rank 0 root
+      B: def(["p1", "p2", "p3", "p4", "p5", "p6"]),        // tall
+      C: def(),                                             // short
+      D: def(),                                             // short
+    };
+    const edges: GraphEdge[] = [
+      { source: "A", target: "B" },
+      { source: "A", target: "C" },
+      { source: "A", target: "D" },
+    ];
+    const r = computeDagrePositions(
+      ["A", "B", "C", "D"],
+      edges,
+      defs,
+      NO_STUBS,
+      BAND_GAP,
+    );
+    expect(r.ranks).toBeDefined();
+    expect(r.rankCenterY).toBeDefined();
+    const ranks = r.ranks!;
+    const rankCenterY = r.rankCenterY!;
+    // A on one rank, B/C/D on the other — dagre picks either 0/1 per its
+    // own source→target convention. Assert cardinality instead.
+    const rankA = ranks.A;
+    const rankB = ranks.B;
+    expect(rankA).not.toBe(rankB);
+    expect(ranks.C).toBe(rankB);
+    expect(ranks.D).toBe(rankB);
+    // centerY map has one entry per occupied rank.
+    expect(Object.keys(rankCenterY).sort()).toEqual(
+      [String(rankA), String(rankB)].sort(),
+    );
+    // All rank-1 nodes share the same centerY — rank bucket invariant.
+    expect(rankCenterY[rankB]).toBeCloseTo(rankCenterY[rankB], 5);
+    // Verify the invariant via positions+heights: center y of each rank-1
+    // node = positions[n].y + height/2. Pick B (tall) and C (short) and
+    // assert their center y matches rankCenterY[rankB].
+    const heightOf = (n: string) => {
+      const d = defs[n as keyof typeof defs];
+      const rowCt = Object.keys(d.properties).length + (d.extends ? 1 : 0) || 1;
+      return HEADER_HEIGHT + Math.min(rowCt, 10) * ROW_HEIGHT;
+    };
+    const cyB = r.positions.B.y + heightOf("B") / 2;
+    const cyC = r.positions.C.y + heightOf("C") / 2;
+    expect(cyB).toBeCloseTo(rankCenterY[rankB], 5);
+    expect(cyC).toBeCloseTo(rankCenterY[rankB], 5);
+    expect(cyB).toBeCloseTo(cyC, 5);
+  });
+
   it("box height matches HEADER + min(rowCt, 10)*ROW_HEIGHT (10-row cap)", () => {
     // 20 props → cap at 10 rows.
     const manyProps = Array.from({ length: 20 }, (_, i) => `p${i}`);

@@ -39,6 +39,19 @@ export interface DagPositions {
   positions: Record<string, { x: number; y: number }>;
   width: number;
   height: number;
+  /**
+   * Per-node rank (dagre layouts only). Undefined for legacy DAG layout.
+   * Consumers that bucket by rank (e.g. overflow-badge per rank) should
+   * fall back safely via (ranks ?? {}).
+   */
+  ranks?: Record<string, number>;
+  /**
+   * Y coordinate of each rank's centerline (dagre with rankalign=center,
+   * the dagre default). Every node in the same rank shares this center
+   * y — reliable anchor for rank-level chrome (badges, separators).
+   * Undefined for legacy DAG layout.
+   */
+  rankCenterY?: Record<number, number>;
 }
 
 export interface DagLayoutOpts {
