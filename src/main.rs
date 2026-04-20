@@ -33,6 +33,45 @@ enum Commands {
         /// Path to the Swagger spec file
         spec: String,
     },
+    /// Manage recipes on a running mirage server
+    Recipes(RecipesArgs),
+}
+
+#[derive(clap::Args)]
+struct RecipesArgs {
+    #[command(subcommand)]
+    verb: RecipesCommand,
+}
+
+#[derive(Subcommand)]
+enum RecipesCommand {
+    /// List recipes as a JSON array of summaries
+    List {
+        /// Admin server URL (default: http://localhost:3737, env: MIRAGE_URL)
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
+    /// Show a single recipe (nested config fields parsed)
+    Show {
+        /// Recipe id
+        id: i64,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
+    /// Delete a recipe by id
+    Delete {
+        /// Recipe id
+        id: i64,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
+    /// Clone a recipe by id
+    Clone {
+        /// Recipe id
+        id: i64,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
 }
 
 /// SQL reserved words that may cause issues as column names.
@@ -256,6 +295,153 @@ fn run_inspect(spec_path: &str) {
     println!("  Skipped (extension-only roots): {skipped_count}");
 }
 
+const DEFAULT_MIRAGE_URL: &str = "http://localhost:3737";
+
+fn resolve_base_url(flag: &Option<String>) -> String {
+    flag.as_deref().unwrap_or(DEFAULT_MIRAGE_URL).to_string()
+}
+
+/// Print `{"error": <msg>}` to stderr and exit 1.
+fn emit_err_and_exit(msg: impl Into<String>) -> ! {
+    let payload = serde_json::json!({ "error": msg.into() });
+    eprintln!("{payload}");
+    std::process::exit(1);
+}
+
+/// If a response is non-2xx, exit 1 after printing a JSON error object. When
+/// the body parses as `{"error": "..."}`, forward the server's message. When
+/// it does not, synthesise a generic "HTTP <status>: <body>" message.
+async fn ensure_success(resp: reqwest::Response) -> reqwest::Response {
+    if resp.status().is_success() {
+        return resp;
+    }
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(v) => match v.get("error").and_then(|e| e.as_str()) {
+            Some(s) => s.to_string(),
+            None => format!("HTTP {}: {}", status.as_u16(), body_text),
+        },
+        Err(_) => {
+            if body_text.is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                format!("HTTP {}: {}", status.as_u16(), body_text)
+            }
+        }
+    };
+    emit_err_and_exit(msg);
+}
+
+/// Take a recipe JSON value (as returned by the admin API) and expand the
+/// JSON-string config fields (`selected_endpoints`, `shared_pools`,
+/// `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`) into nested
+/// JSON values so downstream consumers do not see double-encoded strings.
+fn parse_nested_config(recipe: &mut serde_json::Value) {
+    const STRING_JSON_FIELDS: &[&str] = &[
+        "selected_endpoints",
+        "shared_pools",
+        "quantity_configs",
+        "faker_rules",
+        "rules",
+        "frozen_rows",
+    ];
+    let Some(obj) = recipe.as_object_mut() else {
+        return;
+    };
+    for field in STRING_JSON_FIELDS {
+        let Some(v) = obj.get_mut(*field) else {
+            continue;
+        };
+        let Some(s) = v.as_str() else {
+            continue;
+        };
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            *v = parsed;
+        }
+    }
+}
+
+async fn run_recipes(args: &RecipesArgs) {
+    let client = reqwest::Client::new();
+    match &args.verb {
+        RecipesCommand::List { url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .get(format!("{base}/_api/admin/recipes"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let recipes: Vec<serde_json::Value> = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            let summaries: Vec<serde_json::Value> = recipes
+                .iter()
+                .map(|r| {
+                    let endpoint_count = r
+                        .get("selected_endpoints")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "id": r.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "name": r.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "seed_count": r.get("seed_count").cloned().unwrap_or(serde_json::Value::Null),
+                        "endpoint_count": endpoint_count,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::Value::Array(summaries));
+        }
+        RecipesCommand::Show { id, url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .get(format!("{base}/_api/admin/recipes/{id}"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let mut recipe: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            parse_nested_config(&mut recipe);
+            println!("{recipe}");
+        }
+        RecipesCommand::Delete { id, url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .delete(format!("{base}/_api/admin/recipes/{id}"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            // Drain body (server returns 204 NO_CONTENT with no body).
+            let _ = resp.bytes().await;
+            let payload = serde_json::json!({ "id": id, "deleted": true });
+            println!("{payload}");
+        }
+        RecipesCommand::Clone { id, url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .post(format!("{base}/_api/admin/recipes/{id}/clone"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let mut recipe: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            parse_nested_config(&mut recipe);
+            println!("{recipe}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -263,6 +449,12 @@ async fn main() {
     // Handle inspect subcommand
     if let Some(Commands::Inspect { spec }) = &cli.command {
         run_inspect(spec);
+        return;
+    }
+
+    // Handle recipes subcommand
+    if let Some(Commands::Recipes(args)) = &cli.command {
+        run_recipes(args).await;
         return;
     }
 

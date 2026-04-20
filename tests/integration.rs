@@ -1,9 +1,11 @@
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 
 struct MirageServer {
     child: Child,
     port: u16,
+    workdir: Option<PathBuf>,
 }
 
 impl MirageServer {
@@ -19,7 +21,54 @@ impl MirageServer {
             .spawn()
             .expect("failed to start mirage");
 
-        let server = Self { child, port };
+        let server = Self {
+            child,
+            port,
+            workdir: None,
+        };
+        let client = reqwest::blocking::Client::new();
+        let base = format!("http://127.0.0.1:{}", port);
+        for _ in 0..50 {
+            if client.get(format!("{}{}", base, probe_path)).send().is_ok() {
+                return server;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        drop(server);
+        panic!("mirage server did not start within 5 seconds");
+    }
+
+    /// Start mirage in an isolated working directory so its `mirage.db`
+    /// recipe store cannot collide with parallel tests. `spec_path` is
+    /// resolved relative to CARGO_MANIFEST_DIR (so it stays valid after
+    /// chdir into the tempdir).
+    fn start_isolated(spec_rel_path: &str, probe_path: &str) -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let spec_abs = manifest_dir.join(spec_rel_path);
+        let workdir = std::env::temp_dir().join(format!("mirage-test-{port}"));
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+
+        let child = Command::new(env!("CARGO_BIN_EXE_mirage"))
+            .current_dir(&workdir)
+            .args([
+                spec_abs.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+            ])
+            .spawn()
+            .expect("failed to start mirage");
+
+        let server = Self {
+            child,
+            port,
+            workdir: Some(workdir),
+        };
         let client = reqwest::blocking::Client::new();
         let base = format!("http://127.0.0.1:{}", port);
         for _ in 0..50 {
@@ -35,12 +84,19 @@ impl MirageServer {
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
+
+    fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
 }
 
 impl Drop for MirageServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(dir) = &self.workdir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -984,4 +1040,215 @@ fn test_response_shape_b_wrapped_array_regression() {
         "Shape B regression: /catalog must NOT appear in graph.virtual_roots — \
          wrapped-array must resolve to a named element def. Got virtual_paths: {virtual_paths:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `mirage recipes` CLI (HTTP client against the admin API)
+// ---------------------------------------------------------------------------
+
+/// Minimal valid recipe body for admin POST /_api/admin/recipes.
+fn recipe_seed_body(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "spec_source": "swagger: \"2.0\"\ninfo:\n  title: t\n  version: \"1\"\npaths: {}\n",
+        "endpoints": [
+            { "method": "GET", "path": "/foo" },
+            { "method": "POST", "path": "/bar" }
+        ],
+        "seed_count": 5,
+        "shared_pools": {},
+        "quantity_configs": {},
+        "faker_rules": {},
+        "rules": [],
+        "frozen_rows": {}
+    })
+}
+
+fn post_recipe(server: &MirageServer, name: &str) -> serde_json::Value {
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&recipe_seed_body(name))
+        .send()
+        .expect("POST /_api/admin/recipes failed");
+    assert_eq!(resp.status(), 201, "create recipe should return 201");
+    resp.json().expect("create recipe response should be JSON")
+}
+
+fn mirage_cli(server: &MirageServer, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .arg("recipes")
+        .args(args)
+        .arg("--url")
+        .arg(server.base())
+        .output()
+        .expect("failed to invoke mirage binary")
+}
+
+#[test]
+fn test_recipes_cli_list() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let a = post_recipe(&server, "Recipe A");
+    let b = post_recipe(&server, "Recipe B");
+
+    let out = mirage_cli(&server, &["list"]);
+    assert!(
+        out.status.success(),
+        "recipes list should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let summaries: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).expect("stdout should be JSON array");
+    assert!(summaries.len() >= 2);
+
+    let find = |id: i64| {
+        summaries
+            .iter()
+            .find(|s| s["id"].as_i64() == Some(id))
+            .cloned()
+    };
+    let sa = find(a["id"].as_i64().unwrap()).expect("recipe A summary");
+    assert_eq!(sa["name"], "Recipe A");
+    assert_eq!(sa["seed_count"], 5);
+    assert_eq!(sa["endpoint_count"], 2);
+    // Summary must NOT include the full config fields.
+    assert!(sa.get("spec_source").is_none());
+    assert!(sa.get("shared_pools").is_none());
+
+    let sb = find(b["id"].as_i64().unwrap()).expect("recipe B summary");
+    assert_eq!(sb["name"], "Recipe B");
+}
+
+#[test]
+fn test_recipes_cli_show() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Show Me");
+    let id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(&server, &["show", &id.to_string()]);
+    assert!(out.status.success(), "recipes show should exit 0");
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert_eq!(recipe["id"].as_i64(), Some(id));
+    assert_eq!(recipe["name"], "Show Me");
+    // Config fields expanded, not JSON strings.
+    assert!(
+        recipe["selected_endpoints"].is_array(),
+        "selected_endpoints should be parsed into an array"
+    );
+    assert_eq!(recipe["selected_endpoints"].as_array().unwrap().len(), 2);
+    assert!(
+        recipe["shared_pools"].is_object(),
+        "shared_pools should be parsed into an object"
+    );
+    assert!(recipe["quantity_configs"].is_object());
+    assert!(recipe["faker_rules"].is_object());
+    assert!(recipe["rules"].is_array());
+    assert!(recipe["frozen_rows"].is_object());
+}
+
+#[test]
+fn test_recipes_cli_show_404() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let out = mirage_cli(&server, &["show", "999999"]);
+    assert!(
+        !out.status.success(),
+        "recipes show on missing id should exit non-zero"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        err.get("error").is_some(),
+        "stderr should be {{\"error\": ...}} but was: {stderr}"
+    );
+}
+
+#[test]
+fn test_recipes_cli_delete() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Delete Me");
+    let id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(&server, &["delete", &id.to_string()]);
+    assert!(out.status.success(), "recipes delete should exit 0");
+    let confirm: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON confirmation");
+    assert_eq!(confirm["id"].as_i64(), Some(id));
+    assert_eq!(confirm["deleted"], true);
+
+    // Server no longer has it.
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id}")))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Second delete should now fail.
+    let out2 = mirage_cli(&server, &["delete", &id.to_string()]);
+    assert!(
+        !out2.status.success(),
+        "second delete should exit non-zero (404)"
+    );
+}
+
+#[test]
+fn test_recipes_cli_clone() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_recipe(&server, "Clone Source");
+    let src_id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(&server, &["clone", &src_id.to_string()]);
+    assert!(out.status.success(), "recipes clone should exit 0");
+    let cloned: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert_ne!(cloned["id"].as_i64(), Some(src_id), "clone must get fresh id");
+    assert_eq!(cloned["name"], "Clone Source (copy)");
+    // Config fields expanded.
+    assert!(cloned["selected_endpoints"].is_array());
+    assert_eq!(cloned["selected_endpoints"].as_array().unwrap().len(), 2);
+    assert!(cloned["shared_pools"].is_object());
+}
+
+#[test]
+fn test_recipes_cli_honours_mirage_url_env() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    post_recipe(&server, "EnvRecipe");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .env("MIRAGE_URL", server.base())
+        .args(["recipes", "list"])
+        .output()
+        .expect("failed to invoke mirage binary");
+    assert!(
+        out.status.success(),
+        "MIRAGE_URL env var must be honoured. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let summaries: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+    assert!(summaries.iter().any(|s| s["name"] == "EnvRecipe"));
+}
+
+#[test]
+fn test_recipes_cli_http_failure_bad_url() {
+    // Find a guaranteed-closed port by binding and dropping the listener.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = listener.local_addr().unwrap().port();
+        drop(listener);
+        p
+    };
+    let bogus = format!("http://127.0.0.1:{port}");
+    let out = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .args(["recipes", "list", "--url", &bogus])
+        .output()
+        .expect("failed to invoke mirage binary");
+    assert!(!out.status.success(), "unreachable host must exit non-zero");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
 }
