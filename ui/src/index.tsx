@@ -4341,38 +4341,18 @@ function RecipeConfigStep(props: {
   const [newListName, setNewListName] = createSignal("");
   const [newListValuesText, setNewListValuesText] = createSignal("");
   const [customListsError, setCustomListsError] = createSignal("");
-  // Raw buffers per-list for textarea two-way sync without destroying in-progress typing.
-  const [listBuffers, setListBuffers] = createSignal<Record<string, string>>({});
+  // Per-row edit mode state. editingListName tracks which list key is in edit mode
+  // (null = none). Drafts live here; not committed to recipeCustomLists until Save.
+  const [editingListName, setEditingListName] = createSignal<string | null>(null);
+  const [editNameDraft, setEditNameDraft] = createSignal("");
+  const [editValuesDraft, setEditValuesDraft] = createSignal("");
+  const [editError, setEditError] = createSignal("");
+  // Per-row delete confirm state. Non-null when a row's delete is pending user confirm
+  // because the list is referenced by one or more faker rules.
+  const [pendingDeleteListName, setPendingDeleteListName] = createSignal<string | null>(null);
 
   const parseValuesBlob = (text: string): string[] =>
     text.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
-
-  const getListBuffer = (name: string): string => {
-    const b = listBuffers()[name];
-    if (b !== undefined) return b;
-    return (props.recipeCustomLists()[name] || []).join("\n");
-  };
-  const setListBufferFor = (name: string, text: string) => {
-    setListBuffers({ ...listBuffers(), [name]: text });
-  };
-  const commitListBuffer = (name: string) => {
-    const b = listBuffers()[name];
-    if (b === undefined) return;
-    const values = parseValuesBlob(b);
-    if (values.length === 0) {
-      // Empty after parse — revert buffer to last-saved value; do not silently delete the list.
-      const buf = { ...listBuffers() };
-      delete buf[name];
-      setListBuffers(buf);
-      setCustomListsError(`list "${name}" cannot be empty — reverted`);
-      return;
-    }
-    props.setRecipeCustomLists({ ...props.recipeCustomLists(), [name]: values });
-    const buf = { ...listBuffers() };
-    delete buf[name];
-    setListBuffers(buf);
-    setCustomListsError("");
-  };
 
   const handleAddList = () => {
     const name = newListName().trim();
@@ -4396,15 +4376,117 @@ function RecipeConfigStep(props: {
     setCustomListsError("");
   };
 
-  const handleDeleteList = (name: string) => {
-    const next = { ...props.recipeCustomLists() };
-    delete next[name];
-    props.setRecipeCustomLists(next);
-    const buf = { ...listBuffers() };
-    delete buf[name];
-    setListBuffers(buf);
+  // Field keys whose faker rule references the given custom list name. Sorted for stable
+  // display in the delete-confirm dialog.
+  const referencingFieldsFor = (listName: string): string[] =>
+    Object.entries(props.recipeFakerRules())
+      .filter(([, v]) => v === listName)
+      .map(([k]) => k)
+      .sort();
+
+  const startEdit = (name: string) => {
+    // Exit any pending delete confirm when entering edit mode.
+    setPendingDeleteListName(null);
+    setEditingListName(name);
+    setEditNameDraft(name);
+    setEditValuesDraft((props.recipeCustomLists()[name] || []).join("\n"));
+    setEditError("");
+  };
+
+  const cancelEdit = () => {
+    setEditingListName(null);
+    setEditNameDraft("");
+    setEditValuesDraft("");
+    setEditError("");
+  };
+
+  const saveEdit = (oldName: string) => {
+    const newName = editNameDraft().trim();
+    if (!newName) {
+      setEditError("name required");
+      return;
+    }
+    const values = parseValuesBlob(editValuesDraft());
+    if (values.length === 0) {
+      setEditError("list cannot be empty");
+      return;
+    }
+    const existing = props.recipeCustomLists();
+    // Clash check: only a different-named existing custom list counts as a clash.
+    // Built-in faker strategies are shadowed intentionally (parent convention) and
+    // self-referential save (newName === oldName) is a values-only update.
+    if (newName !== oldName && Object.prototype.hasOwnProperty.call(existing, newName)) {
+      setEditError("list name already used");
+      return;
+    }
+    batch(() => {
+      if (newName === oldName) {
+        // Values-only update: preserve key order by assigning in place.
+        props.setRecipeCustomLists({ ...existing, [oldName]: values });
+      } else {
+        // Rename: rebuild map preserving insertion order; swap key at the same slot.
+        const nextLists: Record<string, string[]> = {};
+        for (const [k, v] of Object.entries(existing)) {
+          if (k === oldName) nextLists[newName] = values;
+          else nextLists[k] = v;
+        }
+        props.setRecipeCustomLists(nextLists);
+        // Rewrite every faker_rules entry whose value === oldName → newName.
+        // Single setter, batched with the lists update so subscribers see a consistent
+        // slice (no intermediate "oldName gone, rules still reference oldName" state).
+        const rules = props.recipeFakerRules();
+        const nextRules: Record<string, string> = { ...rules };
+        let changed = false;
+        for (const [k, v] of Object.entries(nextRules)) {
+          if (v === oldName) {
+            nextRules[k] = newName;
+            changed = true;
+          }
+        }
+        if (changed) props.setRecipeFakerRules(nextRules);
+      }
+    });
+    setEditingListName(null);
+    setEditNameDraft("");
+    setEditValuesDraft("");
+    setEditError("");
     setCustomListsError("");
   };
+
+  const performDelete = (name: string) => {
+    batch(() => {
+      const nextLists = { ...props.recipeCustomLists() };
+      delete nextLists[name];
+      props.setRecipeCustomLists(nextLists);
+      // Scrub any faker_rules entry whose value === name. Field rows then fall back to
+      // type-based seeding (no rule → fake_value_for_field_with_rule type heuristic).
+      const rules = props.recipeFakerRules();
+      const nextRules: Record<string, string> = {};
+      let changed = false;
+      for (const [k, v] of Object.entries(rules)) {
+        if (v === name) changed = true;
+        else nextRules[k] = v;
+      }
+      if (changed) props.setRecipeFakerRules(nextRules);
+    });
+    setPendingDeleteListName(null);
+    setCustomListsError("");
+  };
+
+  const requestDelete = (name: string) => {
+    // Clicking Delete exits edit mode so the two modes never overlap on the same row.
+    if (editingListName() === name) cancelEdit();
+    const refs = referencingFieldsFor(name);
+    if (refs.length === 0) {
+      // No referencing faker rules → delete immediately; no confirm needed.
+      performDelete(name);
+    } else {
+      setPendingDeleteListName(name);
+    }
+  };
+
+  const confirmDelete = (name: string) => performDelete(name);
+  const cancelDelete = () => setPendingDeleteListName(null);
 
   const handlePasteBlob = () => {
     const parsed = parseValuesBlob(newListValuesText());
@@ -4714,29 +4796,109 @@ function RecipeConfigStep(props: {
                 <For each={customListNames()}>
                   {(name) => (
                     <div data-testid="custom-list-row" class="rounded border border-gray-800/60 bg-[#0a101d] p-2">
-                      <div class="flex items-center justify-between mb-1">
-                        <span data-testid="custom-list-name" class="font-mono text-xs text-purple-200">{name}</span>
-                        <button
-                          type="button"
-                          data-testid="custom-list-delete"
-                          class="text-[10px] text-red-400 hover:text-red-300 px-2 py-0.5 border border-red-900/50 rounded"
-                          onClick={() => handleDeleteList(name)}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                      <textarea
-                        data-testid="custom-list-values"
-                        class="w-full bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs font-mono text-gray-100 focus:outline-none focus:border-gray-700"
-                        rows={Math.min(8, Math.max(2, (props.recipeCustomLists()[name] || []).length))}
-                        placeholder="one value per line"
-                        value={getListBuffer(name)}
-                        onInput={(e) => setListBufferFor(name, e.currentTarget.value)}
-                        onBlur={() => commitListBuffer(name)}
-                      />
-                      <p class="text-[10px] text-gray-600 mt-0.5">
-                        {(props.recipeCustomLists()[name] || []).length} values · edits commit on blur
-                      </p>
+                      <Show
+                        when={editingListName() === name}
+                        fallback={
+                          <>
+                            <div class="flex items-center justify-between mb-1">
+                              <span data-testid="custom-list-name" class="font-mono text-xs text-purple-200">{name}</span>
+                              <div class="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  data-testid="custom-list-edit"
+                                  class="text-[10px] text-purple-300 hover:text-purple-200 px-2 py-0.5 border border-purple-900/50 rounded"
+                                  onClick={() => startEdit(name)}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid="custom-list-delete"
+                                  class="text-[10px] text-red-400 hover:text-red-300 px-2 py-0.5 border border-red-900/50 rounded"
+                                  onClick={() => requestDelete(name)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                            <p data-testid="custom-list-values-preview" class="text-[10px] font-mono text-gray-400 break-words">
+                              {(props.recipeCustomLists()[name] || []).join(", ")}
+                            </p>
+                            <p class="text-[10px] text-gray-600 mt-0.5">
+                              {(props.recipeCustomLists()[name] || []).length} values
+                            </p>
+                            <Show when={pendingDeleteListName() === name}>
+                              <div data-testid="custom-list-delete-confirm" class="mt-2 p-2 rounded border border-red-900/50 bg-red-900/10 space-y-1.5">
+                                <p class="text-[11px] text-red-300">
+                                  Delete list "{name}"? These fields reference it and will lose their faker rule (falls back to type-based seeding):
+                                </p>
+                                <ul class="text-[10px] text-red-200 font-mono pl-4 list-disc space-y-0.5">
+                                  <For each={referencingFieldsFor(name)}>
+                                    {(key) => <li data-testid="custom-list-delete-ref">{key}</li>}
+                                  </For>
+                                </ul>
+                                <div class="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    data-testid="custom-list-delete-confirm-yes"
+                                    class="text-[10px] text-white bg-red-700 hover:bg-red-600 px-2 py-0.5 rounded"
+                                    onClick={() => confirmDelete(name)}
+                                  >
+                                    Confirm delete
+                                  </button>
+                                  <button
+                                    type="button"
+                                    data-testid="custom-list-delete-confirm-no"
+                                    class="text-[10px] text-gray-300 hover:text-white px-2 py-0.5 border border-gray-700 rounded"
+                                    onClick={cancelDelete}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            </Show>
+                          </>
+                        }
+                      >
+                        <div data-testid="custom-list-edit-form" class="space-y-1.5">
+                          <div class="flex items-center gap-2">
+                            <input
+                              type="text"
+                              data-testid="custom-list-edit-name"
+                              value={editNameDraft()}
+                              onInput={(e) => setEditNameDraft(e.currentTarget.value)}
+                              class="flex-1 bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs font-mono text-gray-100 focus:outline-none focus:border-gray-700"
+                            />
+                            <button
+                              type="button"
+                              data-testid="custom-list-edit-save"
+                              class="text-[10px] text-white bg-purple-700 hover:bg-purple-600 px-3 py-1 rounded"
+                              onClick={() => saveEdit(name)}
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="custom-list-edit-cancel"
+                              class="text-[10px] text-gray-300 hover:text-white px-2 py-1 border border-gray-700 rounded"
+                              onClick={cancelEdit}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                          <textarea
+                            data-testid="custom-list-edit-values"
+                            class="w-full bg-[#070c17] border border-gray-800 rounded px-2 py-1 text-xs font-mono text-gray-100 focus:outline-none focus:border-gray-700"
+                            rows={Math.min(8, Math.max(2, (editValuesDraft().match(/\n/g)?.length ?? 0) + 1))}
+                            placeholder="one value per line, or comma-separated"
+                            value={editValuesDraft()}
+                            onInput={(e) => setEditValuesDraft(e.currentTarget.value)}
+                          />
+                          <Show when={editError() !== ""}>
+                            <p data-testid="custom-list-edit-error" class="text-[11px] text-red-400">{editError()}</p>
+                          </Show>
+                        </div>
+                      </Show>
                     </div>
                   )}
                 </For>
