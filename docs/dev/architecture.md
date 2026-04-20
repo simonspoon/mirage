@@ -8,29 +8,51 @@ Mirage is a Swagger 2.0 mock API server. It parses a spec, generates SQLite tabl
 Swagger 2.0 spec (JSON/YAML)
     |
     v
-parser.rs       Parse spec, resolve $ref pointers
+parser.rs          Parse spec, resolve $ref pointers
     |
     v
-schema.rs       Generate CREATE TABLE DDL from definitions
+schema.rs          Generate CREATE TABLE DDL from definitions, run
+                   CREATE TABLE against in-memory SQLite
     |
     v
-                 +--------- rules.rs ------------+
-                 | validate constraint rules     |
-                 +-------------------------------+
+                    +--------- rules.rs ------------+
+                    | validate constraint rules     |
+                    +-------------------------------+
     |
     v
-seeder.rs       Generate fake rows with rule overrides + compare-repair,
-                INSERT into SQLite tables
-composer.rs     Parallel path: build shared entity pools and compose JSON
-                response documents; same rule application as seeder
+seeder.rs          Seed rows (field-level rule pre-pass + compare-repair),
+                   INSERT into SQLite tables. Primes tables before the
+                   composer pass overwrites them.
     |
     v
-server.rs       Dynamic route matching, CRUD handlers, admin API,
-                recipe persistence
+composer.rs        Build shared entity pools, compose response documents
+                   for each endpoint; same rule machinery as the seeder.
+                   Produces an in-memory DocumentStore of composed rows.
+    |
+    v
+seeder::insert_composed_rows
+                   Truncate each composed table and INSERT the composed
+                   rows. After this pass, SQLite is the single source of
+                   truth for every active endpoint.
+    |
+    v
+frozen-rows re-apply pass (admin_activate_recipe only)
+                   Re-INSERT recipe.frozen_rows over the composed rows
+                   so user-pinned values survive recomposition.
+    |
+    v
+server.rs          Dynamic route matching, CRUD handlers, admin API,
+                   recipe persistence. All reads go to SQLite.
     |
     v
 HTTP responses (JSON)
 ```
+
+On boot (`main.rs`) the same pipeline runs once with default configs
+(no recipe rules, no frozen rows). Recipe activation
+(`admin_activate_recipe` in `server.rs`) runs it again with the recipe's
+faker rules, constraint rules, pool config, quantity configs, and
+frozen rows.
 
 ## Modules
 
@@ -48,7 +70,20 @@ Generates fake data for each table (the **SQLite row path**). Uses field name he
 
 ### `composer.rs`
 
-Document-based generator (the **JSON response path**) used when a recipe configures shared entity pools or when responses need full structured documents (not flat table rows). Builds `DocumentStore` maps of shared pool entities, composes documents for each endpoint response via `compose_documents`, and applies the same constraint rules as the seeder (field-level pre-pass + compare-repair post-pass).
+Document-based generator that produces the canonical row set for every
+active endpoint. `generate_pools` builds shared entity pools; then
+`compose_documents` assembles a full structured response document for
+each endpoint and returns a `DocumentStore` (the in-memory intermediate
+type — `HashMap<String, Vec<serde_json::Value>>` keyed by table name).
+The same constraint-rule machinery as the seeder is applied (field-level
+pre-pass + compare-repair post-pass).
+
+The composer does not serve responses directly. The caller
+(`server.rs:admin_activate_recipe` and `main.rs` boot) hands the
+`DocumentStore` to `seeder::insert_composed_rows`, which truncates the
+target tables and INSERTs the composed rows. **SQLite is the single
+source of truth at request-time** — every read path, admin or mock,
+queries SQLite.
 
 ### `rules.rs`
 
@@ -63,11 +98,37 @@ The same rule machinery is used by both `seeder::seed_table` (SQLite rows) and `
 
 ### `recipe.rs`
 
-SQLite-backed recipe persistence. A recipe bundles everything a user configures for a spec: selected endpoints, seed count, shared pool sizes, quantity configs, faker rules, and constraint rules. Stored as JSON-string columns in a `recipes` table. Idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`-style migrations so existing databases pick up new columns (including `rules TEXT NOT NULL DEFAULT '[]'`) without a schema reset. CRUD helpers: `create_recipe`, `list_recipes`, `get_recipe`, `update_recipe`, `update_recipe_config`, `delete_recipe`.
+SQLite-backed recipe persistence. A recipe bundles everything a user
+configures for a spec: selected endpoints, seed count, shared pool
+sizes, quantity configs, faker rules, constraint rules, and
+**frozen rows** (user-pinned rows replayed after recomposition).
+Stored as JSON-string columns in a `recipes` table. Idempotent
+`ALTER TABLE ... ADD COLUMN`-style migrations so existing databases
+pick up new columns (`shared_pools`, `quantity_configs`, `faker_rules`,
+`rules TEXT NOT NULL DEFAULT '[]'`, `frozen_rows TEXT NOT NULL DEFAULT '{}'`)
+without a schema reset. `FrozenRows` is
+`HashMap<String, Vec<serde_json::Value>>` keyed by table name. CRUD
+helpers: `create_recipe`, `list_recipes`, `get_recipe`, `update_recipe`,
+`update_recipe_config`, `delete_recipe`, plus `find_unique_clone_name`
+used by the clone endpoint.
 
 ### `entity_graph.rs`
 
-Builds a graph of a spec's definitions for the admin UI's visualization. Nodes are definition names; edges are `$ref` relationships; roots are the definitions that appear directly in endpoint responses; shared entities are definitions referenced by more than one parent. Also surfaces scalar property metadata (name, type, format) for faker-rule authoring and array property metadata for shared-pool configuration.
+Builds a graph of a spec's definitions for the admin UI's visualization.
+Nodes are definition names; edges are `$ref` relationships; roots are
+the definitions that appear directly in endpoint responses; shared
+entities are definitions referenced by more than one parent. Also
+surfaces scalar property metadata (name, type, format) for faker-rule
+authoring and array property metadata for shared-pool configuration.
+
+**Virtual roots** — endpoints whose primary response shape is *not* a
+named definition (primitive values, primitive arrays, freeform
+objects, empty responses) get no definition node but are still tracked
+on `EntityGraph.virtual_roots` as `VirtualRoot { endpoint, shape }` so
+the admin UI can surface them. Virtual roots are distinct from
+extension-only roots (definitions that only appear as `allOf` bases
+and are never used as a root directly). Construction lives at
+`src/entity_graph.rs:37` (field), `:203` (init), `:275` (emit).
 
 ### `server.rs`
 
@@ -127,7 +188,8 @@ pub struct AppState {
 
 ## Admin UI
 
-The SolidJS frontend is built to `ui/dist/` and embedded into the binary via `rust-embed`:
+The SolidJS frontend is built to `ui/dist/` and embedded into the
+binary via `rust-embed`:
 
 ```rust
 #[derive(Embed)]
@@ -135,11 +197,26 @@ The SolidJS frontend is built to `ui/dist/` and embedded into the binary via `ru
 struct AdminAssets;
 ```
 
-Served at `/_admin/`. The UI is a three-step wizard:
+Served at `/_admin/`. The UI is a multi-page single-page app with a
+left sidebar for navigation:
 
-1. **Idle** — paste a Swagger 2.0 spec (JSON or YAML)
-2. **Selecting** — choose which endpoints to activate, set seed count
-3. **Running** — shows active endpoints table
+- **Dashboard** — import a Swagger 2.0 spec (JSON or YAML), view spec
+  info, browse seeded tables, inspect the request log.
+- **Schemas** — entity-graph visualization of the current spec.
+  Definition nodes, `$ref` edges, response/body roots, shared entities,
+  scalar and array property metadata, and virtual roots (endpoints
+  whose responses are not a named definition). Layout is rendered by
+  `computeDagrePositions` in `ui/src/dagreLayout.ts` and called
+  unconditionally from `ui/src/index.tsx`; **Dagre is the sole layout
+  engine**. The legacy custom layout in `ui/src/dagLayout.ts` is
+  retained only for unit-test coverage of helpers and shared types —
+  it is never invoked from the render path.
+- **Recipes** — list, create, rename, clone, delete, import, export,
+  and activate recipes.
+- **Recipe configure wizard** — per-recipe editor. A unified Properties
+  table per endpoint/table block exposes inline controls for each
+  property row (faker rule, array quantity, constraint-rule chips).
+  Shared-pool controls live inline in the table-block header.
 
 Admin API endpoints:
 
@@ -151,6 +228,7 @@ Admin API endpoints:
 | GET | `/_api/admin/routes` | All routes (active + inactive) from the current spec |
 | GET | `/_api/admin/tables` | List seeded SQLite tables |
 | GET | `/_api/admin/tables/:name` | Rows for a single seeded table |
+| PUT | `/_api/admin/tables/:name/:rowid` | Update a single row in a seeded table |
 | GET | `/_api/admin/log` | Recent request log entries |
 | POST | `/_api/admin/import` | Parse and store a spec |
 | POST | `/_api/admin/configure` | Create tables, seed data, activate routes |
@@ -165,4 +243,5 @@ Admin API endpoints:
 | PUT | `/_api/admin/recipes/:id/config` | Update pools/quantities/faker rules/constraint rules |
 | POST | `/_api/admin/recipes/:id/activate` | Apply a recipe and start serving |
 | GET | `/_api/admin/recipes/:id/export` | Export a recipe as JSON |
+| POST | `/_api/admin/recipes/:id/clone` | Clone a recipe |
 | POST | `/_api/admin/recipes/import` | Import a previously exported recipe |
