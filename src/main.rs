@@ -741,14 +741,27 @@ async fn main() {
         let response_defs: HashSet<String> =
             response_defs.difference(&ext_only_roots).cloned().collect();
 
+        // Compute topo order BEFORE resolve_refs — topo_sort_defs reads raw
+        // $ref paths, which resolve_refs clears.
+        let topo_order = parser::topo_sort_defs(&response_defs, raw_spec.definitions.as_ref());
+
         spec.resolve_refs();
 
-        // Create tables only for response_defs, seed only response_defs
+        // Create tables only for response_defs, seed only response_defs.
+        // Seed in topological order so referenced def tables land before parents.
         {
             let conn = db.lock().unwrap();
             schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None).unwrap();
-            seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
-                .unwrap();
+            seeder::seed_tables_filtered(
+                &conn,
+                &spec,
+                10,
+                Some(&response_defs),
+                None,
+                None,
+                Some(&topo_order),
+            )
+            .unwrap();
         }
 
         // Populate registry

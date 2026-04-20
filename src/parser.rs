@@ -419,6 +419,119 @@ pub fn extension_only_roots(spec: &SwaggerSpec) -> HashSet<String> {
         .collect()
 }
 
+/// Topologically sort response definitions so leaf defs (no nested $ref to
+/// other response_defs) come first. Used to order seeding + composition so
+/// referenced def tables populate before referencing parents.
+///
+/// Graph: edge `A -> B` means def A embeds def B directly (via property, item,
+/// allOf, or additionalProperties $ref). Only edges targeting members of
+/// `response_defs` are kept (external or input-only refs are ignored).
+///
+/// Cycles: broken deterministically. When no indegree-0 node remains and nodes
+/// persist, the alphabetically-smallest remaining node is forced next and an
+/// `eprintln!` warning names the cycle members.
+///
+/// Output covers every member of `response_defs` present in `raw_defs`. Members
+/// of `response_defs` missing from `raw_defs` are appended at the end in
+/// alphabetical order (defensive — caller may not have a raw schema for every
+/// filter entry).
+pub fn topo_sort_defs(
+    response_defs: &HashSet<String>,
+    raw_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Vec<String> {
+    // Partition: present-in-raw vs missing-from-raw
+    let (present, missing): (Vec<String>, Vec<String>) = {
+        let mut p = Vec::new();
+        let mut m = Vec::new();
+        for name in response_defs {
+            match raw_defs.and_then(|d| d.get(name)) {
+                Some(_) => p.push(name.clone()),
+                None => m.push(name.clone()),
+            }
+        }
+        (p, m)
+    };
+
+    // Build direct-ref dep graph for present defs, restricted to response_defs.
+    // deps[A] = set of defs A embeds directly (after filtering to response_defs
+    // and removing self-edges).
+    let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
+    for name in &present {
+        deps.insert(name.clone(), HashSet::new());
+    }
+    if let Some(raw) = raw_defs {
+        for name in &present {
+            let schema = match raw.get(name) {
+                Some(s) => s,
+                None => continue,
+            };
+            let mut direct: HashSet<String> = HashSet::new();
+            collect_schema_refs(schema, &mut direct, None);
+            let entry = deps.get_mut(name).expect("initialized above");
+            for target in direct {
+                if target == *name {
+                    continue;
+                }
+                if !response_defs.contains(&target) {
+                    continue;
+                }
+                entry.insert(target);
+            }
+        }
+    }
+
+    // dep_count[X] = number of outstanding deps X waits on (leaves == 0).
+    let mut dep_count: HashMap<String, usize> =
+        deps.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+
+    // Kahn's: emit nodes with dep_count 0 alphabetically; cycle fallback picks
+    // alphabetically-smallest remaining node.
+    let mut result: Vec<String> = Vec::with_capacity(present.len());
+    let mut remaining: HashSet<String> = present.iter().cloned().collect();
+
+    while !remaining.is_empty() {
+        let mut zeroes: Vec<String> = remaining
+            .iter()
+            .filter(|n| dep_count.get(*n).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect();
+        zeroes.sort();
+
+        let pick = if let Some(first) = zeroes.first() {
+            first.clone()
+        } else {
+            let mut rem_sorted: Vec<String> = remaining.iter().cloned().collect();
+            rem_sorted.sort();
+            eprintln!(
+                "[topo_sort_defs] cycle detected among response_defs — breaking alphabetically; members: {:?}",
+                rem_sorted
+            );
+            rem_sorted[0].clone()
+        };
+
+        // Decrement dep_count for every def that depends on pick.
+        let dependents: Vec<String> = deps
+            .iter()
+            .filter(|(src, tgts)| **src != pick && tgts.contains(&pick))
+            .map(|(src, _)| src.clone())
+            .collect();
+        for dep in dependents {
+            if let Some(d) = dep_count.get_mut(&dep) {
+                *d = d.saturating_sub(1);
+            }
+        }
+        remaining.remove(&pick);
+        result.push(pick);
+    }
+
+    // Append missing-from-raw members alphabetically for safety net.
+    let mut missing_sorted = missing;
+    missing_sorted.sort();
+    result.extend(missing_sorted);
+
+    result
+}
+
 /// Collect refs from a definition's sub-schemas (properties, items,
 /// additional_properties) and from allOf members' sub-schemas, but skip
 /// the allOf members' own `$ref` (those are extension-base refs, not
@@ -1039,8 +1152,16 @@ mod tests {
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::schema::create_tables_filtered(&conn, &spec, Some(&response_defs), None).unwrap();
-        crate::seeder::seed_tables_filtered(&conn, &spec, 10, Some(&response_defs), None, None)
-            .unwrap();
+        crate::seeder::seed_tables_filtered(
+            &conn,
+            &spec,
+            10,
+            Some(&response_defs),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Pet table should exist and be seeded
         let pet_count: i64 = conn
@@ -1428,6 +1549,186 @@ mod tests {
         assert_eq!(
             primary_response_def(&op, Some(&defs)),
             Some("CatalogItem".to_string())
+        );
+    }
+
+    // --- Group 8: topo_sort_defs ---
+
+    fn empty_schema() -> SchemaObject {
+        SchemaObject {
+            schema_type: None,
+            format: None,
+            properties: None,
+            items: None,
+            required: None,
+            ref_path: None,
+            enum_values: None,
+            description: None,
+            additional_properties: None,
+            all_of: None,
+            x_faker: None,
+        }
+    }
+
+    fn mk_schema_ref(target: &str) -> SchemaObject {
+        let mut s = empty_schema();
+        s.ref_path = Some(format!("#/definitions/{target}"));
+        s
+    }
+
+    fn mk_object_with_props(props: Vec<(&str, SchemaObject)>) -> SchemaObject {
+        let mut s = empty_schema();
+        s.schema_type = Some("object".to_string());
+        let mut map: HashMap<String, SchemaObject> = HashMap::new();
+        for (k, v) in props {
+            map.insert(k.to_string(), v);
+        }
+        s.properties = Some(map);
+        s
+    }
+
+    fn mk_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_topo_sort_defs_linear_owner_address() {
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert(
+            "Owner".to_string(),
+            mk_object_with_props(vec![("address", mk_schema_ref("Address"))]),
+        );
+        raw.insert("Address".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["Owner", "Address"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec!["Address".to_string(), "Owner".to_string()],
+            "Address leaf must precede Owner parent"
+        );
+    }
+
+    #[test]
+    fn test_topo_sort_defs_no_refs_alphabetical() {
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert("Charlie".to_string(), mk_object_with_props(vec![]));
+        raw.insert("Alpha".to_string(), mk_object_with_props(vec![]));
+        raw.insert("Bravo".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["Charlie", "Alpha", "Bravo"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec![
+                "Alpha".to_string(),
+                "Bravo".to_string(),
+                "Charlie".to_string()
+            ],
+            "no-refs defs emit alphabetically for determinism"
+        );
+    }
+
+    #[test]
+    fn test_topo_sort_defs_depth_three_chain() {
+        // A -> B -> C, expect [C, B, A] (leaf first)
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert(
+            "A".to_string(),
+            mk_object_with_props(vec![("b", mk_schema_ref("B"))]),
+        );
+        raw.insert(
+            "B".to_string(),
+            mk_object_with_props(vec![("c", mk_schema_ref("C"))]),
+        );
+        raw.insert("C".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["A", "B", "C"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec!["C".to_string(), "B".to_string(), "A".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_topo_sort_defs_cycle_broken_deterministically() {
+        // A -> B, B -> A cycle
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert(
+            "A".to_string(),
+            mk_object_with_props(vec![("b", mk_schema_ref("B"))]),
+        );
+        raw.insert(
+            "B".to_string(),
+            mk_object_with_props(vec![("a", mk_schema_ref("A"))]),
+        );
+
+        let response_defs = mk_set(&["A", "B"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(order.len(), 2);
+        // Cycle pick is alphabetically smallest first ("A"), then "B".
+        assert_eq!(order, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn test_topo_sort_defs_ignores_refs_outside_response_defs() {
+        // Owner -> ExternalType, but ExternalType not in response_defs.
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert(
+            "Owner".to_string(),
+            mk_object_with_props(vec![("ext", mk_schema_ref("ExternalType"))]),
+        );
+        raw.insert("ExternalType".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["Owner"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec!["Owner".to_string()],
+            "external refs outside response_defs do not create edges"
+        );
+    }
+
+    #[test]
+    fn test_topo_sort_defs_array_items_ref() {
+        // Container has items: $ref Item
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        let mut container = empty_schema();
+        container.schema_type = Some("array".to_string());
+        container.items = Some(Box::new(mk_schema_ref("Item")));
+        raw.insert("Container".to_string(), container);
+        raw.insert("Item".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["Container", "Item"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec!["Item".to_string(), "Container".to_string()],
+            "items $ref counted as direct dep"
+        );
+    }
+
+    #[test]
+    fn test_topo_sort_defs_missing_raw_appended_alphabetically() {
+        // response_defs contains Ghost not present in raw_defs.
+        let mut raw: HashMap<String, SchemaObject> = HashMap::new();
+        raw.insert(
+            "Owner".to_string(),
+            mk_object_with_props(vec![("address", mk_schema_ref("Address"))]),
+        );
+        raw.insert("Address".to_string(), mk_object_with_props(vec![]));
+
+        let response_defs = mk_set(&["Owner", "Address", "Ghost"]);
+        let order = topo_sort_defs(&response_defs, Some(&raw));
+        assert_eq!(
+            order,
+            vec![
+                "Address".to_string(),
+                "Owner".to_string(),
+                "Ghost".to_string()
+            ],
+            "missing-from-raw members append at end alphabetically"
         );
     }
 }

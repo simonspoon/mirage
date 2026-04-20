@@ -840,9 +840,18 @@ pub fn seed_tables(
     spec: &SwaggerSpec,
     rows_per_table: usize,
 ) -> Result<(), rusqlite::Error> {
-    seed_tables_filtered(conn, spec, rows_per_table, None, None, None)
+    seed_tables_filtered(conn, spec, rows_per_table, None, None, None, None)
 }
 
+/// Seed tables for definitions in `spec`.
+///
+/// - `only` restricts which definitions get seeded.
+/// - `order`, when provided, controls iteration order: entries in `order` are
+///   seeded first (in that order, filtered by `only` + presence in spec), then
+///   any definitions in `only` not mentioned in `order` are seeded
+///   alphabetically. Duplicates in `order` are skipped after first sighting.
+/// - When `order` is `None`, definitions iterate in spec (HashMap) order —
+///   matches historical behavior.
 pub fn seed_tables_filtered(
     conn: &Connection,
     spec: &SwaggerSpec,
@@ -850,12 +859,69 @@ pub fn seed_tables_filtered(
     only: Option<&std::collections::HashSet<String>>,
     faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
     recipe_rules: Option<&[Rule]>,
+    order: Option<&[String]>,
 ) -> Result<(), rusqlite::Error> {
-    if let Some(ref definitions) = spec.definitions {
+    let definitions = match &spec.definitions {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let passes_filter = |name: &str| -> bool {
+        match only {
+            Some(set) => set.contains(name),
+            None => true,
+        }
+    };
+
+    let mut seeded: HashSet<String> = HashSet::new();
+
+    // Pass 1: iterate in caller-provided order.
+    if let Some(ord) = order {
+        for name in ord {
+            if seeded.contains(name) {
+                continue;
+            }
+            if !passes_filter(name) {
+                continue;
+            }
+            let schema = match definitions.get(name) {
+                Some(s) => s,
+                None => continue,
+            };
+            seed_table(
+                conn,
+                name,
+                schema,
+                rows_per_table,
+                faker_rules,
+                recipe_rules,
+            )?;
+            seeded.insert(name.clone());
+        }
+    }
+
+    // Pass 2: iterate definitions for any not yet seeded (deterministic:
+    // alphabetical when an order was supplied, spec-map order otherwise).
+    if order.is_some() {
+        let mut remaining: Vec<&String> = definitions
+            .keys()
+            .filter(|k| !seeded.contains(*k) && passes_filter(k))
+            .collect();
+        remaining.sort();
+        for name in remaining {
+            let schema = &definitions[name];
+            seed_table(
+                conn,
+                name,
+                schema,
+                rows_per_table,
+                faker_rules,
+                recipe_rules,
+            )?;
+        }
+    } else {
         for (name, schema) in definitions {
-            if let Some(filter) = only
-                && !filter.contains(name)
-            {
+            if !passes_filter(name) {
                 continue;
             }
             seed_table(
@@ -868,6 +934,7 @@ pub fn seed_tables_filtered(
             )?;
         }
     }
+
     Ok(())
 }
 
@@ -1069,7 +1136,7 @@ mod tests {
             field: "Pet.name".to_string(),
             value: serde_json::json!("Fido"),
         }];
-        seed_tables_filtered(&conn, &spec, 8, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 8, None, None, Some(&rules), None).unwrap();
 
         let names: Vec<String> = conn
             .prepare("SELECT \"name\" FROM \"Pet\"")
@@ -1092,7 +1159,7 @@ mod tests {
             field: "Pet.name".to_string(),
             options: allowed.iter().map(|s| serde_json::json!(s)).collect(),
         }];
-        seed_tables_filtered(&conn, &spec, 12, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 12, None, None, Some(&rules), None).unwrap();
 
         let names: Vec<String> = conn
             .prepare("SELECT \"name\" FROM \"Pet\"")
@@ -1118,7 +1185,7 @@ mod tests {
             min: 1000.0,
             max: 1010.0,
         }];
-        seed_tables_filtered(&conn, &spec, 15, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 15, None, None, Some(&rules), None).unwrap();
 
         let ids: Vec<i64> = conn
             .prepare("SELECT \"id\" FROM \"Pet\"")
@@ -1143,7 +1210,7 @@ mod tests {
             field: "Pet.name".to_string(),
             regex: r"[A-Z]{3}-[0-9]{4}".to_string(),
         }];
-        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None).unwrap();
 
         let pattern = regex::Regex::new(r"^[A-Z]{3}-[0-9]{4}$").unwrap();
         let names: Vec<String> = conn
@@ -1197,7 +1264,7 @@ definitions:
             op: CompareOp::Gt,
             right: serde_json::json!("Box.width"),
         }];
-        seed_tables_filtered(&conn, &spec, 25, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 25, None, None, Some(&rules), None).unwrap();
 
         let rows: Vec<(i64, i64)> = conn
             .prepare("SELECT \"height\", \"width\" FROM \"Box\"")
@@ -1224,7 +1291,7 @@ definitions:
             op: CompareOp::Lt,
             right: serde_json::json!(50),
         }];
-        seed_tables_filtered(&conn, &spec, 30, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 30, None, None, Some(&rules), None).unwrap();
 
         let heights: Vec<i64> = conn
             .prepare("SELECT \"height\" FROM \"Box\"")
@@ -1248,7 +1315,7 @@ definitions:
             field: "Pet.id".to_string(),
             value: serde_json::json!(42),
         }];
-        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules)).unwrap();
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None).unwrap();
 
         let ids: Vec<i64> = conn
             .prepare("SELECT \"id\" FROM \"Pet\"")

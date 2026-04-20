@@ -1076,9 +1076,20 @@ async fn admin_configure(
             )
                 .into_response();
         }
-        if let Err(e) =
-            seeder::seed_tables_filtered(&conn, &spec, seed_count, Some(&response_defs), None, None)
-        {
+        // Topo order (leaf defs first) so referenced tables populate before
+        // parent tables. Uses raw_spec definitions — resolve_refs clears
+        // $ref paths on the resolved spec.
+        let topo_order =
+            crate::parser::topo_sort_defs(&response_defs, raw_spec.definitions.as_ref());
+        if let Err(e) = seeder::seed_tables_filtered(
+            &conn,
+            &spec,
+            seed_count,
+            Some(&response_defs),
+            None,
+            None,
+            Some(&topo_order),
+        ) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to seed data: {e}")})),
@@ -1900,6 +1911,10 @@ async fn admin_activate_recipe(
             }
         }
 
+        // Topo order (leaf defs first) via raw_spec definitions so referenced
+        // def tables populate before parent def tables.
+        let topo_order =
+            crate::parser::topo_sort_defs(&response_defs, raw_spec.definitions.as_ref());
         if let Err(e) = seeder::seed_tables_filtered(
             &conn,
             &spec,
@@ -1907,6 +1922,7 @@ async fn admin_activate_recipe(
             Some(&response_defs),
             Some(&faker_rules),
             Some(&recipe_rules),
+            Some(&topo_order),
         ) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

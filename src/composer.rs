@@ -50,9 +50,16 @@ pub fn compose_documents(
     let field_rule_map = build_field_rule_map(recipe_rules);
     let compare_rules_by_def = build_compare_rules_by_def(recipe_rules);
 
+    // Reorder endpoints so those whose response-def is a leaf (no nested $ref
+    // to other response defs) compose first. Ensures referenced def stores
+    // populate before parent defs compose — prerequisite for SQLite-backed
+    // nested $ref sampling (sibling task kxlm).
+    let ordered_endpoints: Vec<EndpointInfo> =
+        topo_sort_endpoints_by_def(selected_endpoints, &raw_op_map, raw_defs);
+
     let mut store = DocumentStore::new();
 
-    for endpoint in selected_endpoints {
+    for endpoint in &ordered_endpoints {
         let def_name = raw_op_map
             .get(&(endpoint.path.as_str(), endpoint.method.as_str()))
             .and_then(|raw_op| crate::parser::primary_response_def(raw_op, raw_defs));
@@ -110,6 +117,50 @@ pub fn compose_documents(
     }
 
     store
+}
+
+/// Reorder `endpoints` so those whose primary response-def is topologically
+/// earlier (leaf, no nested $ref to other response defs) come first. Endpoints
+/// that map to no response def are appended at the end, preserving their
+/// relative order.
+///
+/// Determinism: endpoints mapping to the same def keep their relative input
+/// order (stable sort).
+fn topo_sort_endpoints_by_def(
+    endpoints: &[EndpointInfo],
+    raw_op_map: &HashMap<(&str, &str), &crate::parser::Operation>,
+    raw_defs: Option<&HashMap<String, SchemaObject>>,
+) -> Vec<EndpointInfo> {
+    // Collect the set of defs these endpoints reference.
+    let mut def_set: HashSet<String> = HashSet::new();
+    for ep in endpoints {
+        if let Some(raw_op) = raw_op_map.get(&(ep.path.as_str(), ep.method.as_str()))
+            && let Some(name) = crate::parser::primary_response_def(raw_op, raw_defs)
+        {
+            def_set.insert(name);
+        }
+    }
+
+    let topo = crate::parser::topo_sort_defs(&def_set, raw_defs);
+    let rank: HashMap<String, usize> = topo.into_iter().enumerate().map(|(i, n)| (n, i)).collect();
+
+    let mut indexed: Vec<(usize, usize, EndpointInfo)> = endpoints
+        .iter()
+        .enumerate()
+        .map(|(orig_idx, ep)| {
+            let def = raw_op_map
+                .get(&(ep.path.as_str(), ep.method.as_str()))
+                .and_then(|raw_op| crate::parser::primary_response_def(raw_op, raw_defs));
+            let bucket = match def {
+                Some(n) => rank.get(&n).copied().unwrap_or(usize::MAX),
+                None => usize::MAX,
+            };
+            (bucket, orig_idx, ep.clone())
+        })
+        .collect();
+
+    indexed.sort_by_key(|(bucket, orig_idx, _)| (*bucket, *orig_idx));
+    indexed.into_iter().map(|(_, _, ep)| ep).collect()
 }
 
 /// Generate a single document from a schema by faking each property.
