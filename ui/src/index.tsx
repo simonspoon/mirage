@@ -4412,18 +4412,43 @@ function RecipeConfigStep(props: {
 
   const hasAnything = () => hasPools() || hasConfigs() || hasRules() || props.recipeRules().length > 0 || virtualBuckets().length > 0;
 
+  // Endpoint chip filter — narrows table list to tables referenced by selected endpoints.
+  // Empty set = no endpoint filter applied (all tables eligible).
+  const [configEndpointFilter, setConfigEndpointFilter] = createSignal<Set<string>>(new Set());
+  const toggleEndpointChip = (label: string) => {
+    const s = new Set(configEndpointFilter());
+    if (s.has(label)) s.delete(label); else s.add(label);
+    setConfigEndpointFilter(s);
+  };
+  const allEndpointLabels = createMemo((): string[] => {
+    const set = new Set<string>();
+    for (const eps of Object.values(defToEndpoints())) {
+      for (const ep of eps) set.add(ep);
+    }
+    for (const vb of virtualBuckets()) set.add(vb.label);
+    return [...set].sort();
+  });
+
   const filteredVirtualBuckets = createMemo((): VirtualBucket[] => {
+    // Endpoint chip filter: virtual buckets are not referenced by any def, but their
+    // endpoint label is the bucket label itself — include bucket when its label is selected.
+    const epFilter = configEndpointFilter();
     const q = props.configSearch().toLowerCase();
-    if (!q) return virtualBuckets();
-    return virtualBuckets().filter(vb =>
+    let buckets = virtualBuckets();
+    if (epFilter.size > 0) {
+      buckets = buckets.filter(vb => epFilter.has(vb.label));
+    }
+    if (!q) return buckets;
+    return buckets.filter(vb =>
       vb.label.toLowerCase().includes(q) || vb.shape_label.toLowerCase().includes(q)
     );
   });
 
-  // Decide which tables render given search + changed-only filters.
+  // Decide which tables render given search + chip + changed-only filters.
   const activeTables = createMemo((): string[] => {
     const q = props.configSearch().toLowerCase();
     const showNonDefault = props.configShowNonDefault();
+    const epFilter = configEndpointFilter();
     const pools = props.recipeSharedPools();
     const arrays = arrayConfigsByDef();
     const fields = fieldRulesByDef();
@@ -4437,6 +4462,11 @@ function RecipeConfigStep(props: {
         const arrMatch = (arrays[def] || []).some(i => i.key.toLowerCase().includes(q));
         const fldMatch = (fields[def] || []).some(i => i.key.toLowerCase().includes(q));
         if (!defMatch && !epMatch && !arrMatch && !fldMatch) return false;
+      }
+      // Endpoint chip filter: def must be referenced by at least one selected endpoint.
+      if (epFilter.size > 0) {
+        const eps = d2e[def] || [];
+        if (!eps.some(ep => epFilter.has(ep))) return false;
       }
       if (showNonDefault) {
         const p = pools[def];
@@ -4486,10 +4516,11 @@ function RecipeConfigStep(props: {
     }
   };
 
-  // Reset to all-collapsed when entityGraph changes (new recipe loaded)
+  // Reset to all-collapsed + clear endpoint chip filter when entityGraph changes (new recipe loaded)
   createEffect(() => {
     props.entityGraph();
     setExpandedGroups(new Set<string>());
+    setConfigEndpointFilter(new Set<string>());
   });
 
   return (
@@ -4517,8 +4548,51 @@ function RecipeConfigStep(props: {
           placeholder="Search endpoints, pools, properties, and rules..."
           value={props.configSearch()}
           onInput={(e) => props.setConfigSearch(e.currentTarget.value)}
-          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-4"
+          class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 mb-3"
         />
+      </Show>
+
+      {/* Endpoint chip filter — select one or more endpoints to narrow table list */}
+      <Show when={hasAnything() && allEndpointLabels().length > 0}>
+        <div class="mb-4">
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-[10px] text-gray-500 font-medium uppercase tracking-wider">Endpoints</span>
+            <Show when={configEndpointFilter().size > 0}>
+              <span class="text-[10px] text-blue-300">{configEndpointFilter().size} selected</span>
+              <button
+                type="button"
+                data-testid="endpoint-chip-clear"
+                class="text-[10px] text-gray-400 hover:text-gray-200 underline"
+                onClick={() => setConfigEndpointFilter(new Set<string>())}
+              >
+                Clear
+              </button>
+            </Show>
+          </div>
+          <div data-testid="endpoint-chip-row" class="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
+            <For each={allEndpointLabels()}>
+              {(label) => {
+                const selected = () => configEndpointFilter().has(label);
+                return (
+                  <button
+                    type="button"
+                    data-testid="endpoint-chip"
+                    data-selected={selected() ? "true" : "false"}
+                    aria-pressed={selected()}
+                    onClick={() => toggleEndpointChip(label)}
+                    class={`font-mono text-[10px] px-2 py-0.5 rounded-full border transition-colors cursor-pointer ${
+                      selected()
+                        ? "bg-blue-600 border-blue-500 text-white"
+                        : "bg-gray-800/60 border-gray-700 text-gray-400 hover:border-gray-600 hover:text-gray-200"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+        </div>
       </Show>
 
       {/* Bulk controls — apply across all endpoints */}
