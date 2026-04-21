@@ -23,8 +23,8 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
