@@ -1937,13 +1937,22 @@ async fn admin_activate_recipe(
 
     // Build quantity configs: use recipe quantity_configs, with seed_count as default.
     // Only populate defaults for response_defs (no meaningless defaults for input-only types).
+    //
+    // Frozen rows count toward seed quantity (task qslt): subtract the per-def frozen
+    // count from the default so the post-composer frozen re-apply doesn't stack on
+    // top. Final per-table row count = max(seed_count, frozen_count).
+    // saturating_sub pins composed count at 0 when frozen_count > seed_count (all
+    // frozen survive; none composed). Per-def user quantity_configs still win via
+    // or_insert (scope-out: quantity-config array semantics).
     let mut effective_quantities = quantity_configs;
     for def_name in &response_defs {
+        let frozen_n = frozen.get(def_name).map(|v| v.len()).unwrap_or(0);
+        let default_n = seed_count.saturating_sub(frozen_n);
         effective_quantities
             .entry(def_name.clone())
             .or_insert(crate::composer::QuantityConfig {
-                min: seed_count,
-                max: seed_count,
+                min: default_n,
+                max: default_n,
             });
     }
 
@@ -4239,10 +4248,13 @@ definitions:
         let table_data: serde_json::Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         let rows = table_data["rows"].as_array().unwrap();
-        // Should have frozen rows + seeded rows (2 frozen + 2 seeded = 4)
-        assert!(
-            rows.len() >= 4,
-            "expected at least 4 rows (2 frozen + 2 seeded), got {}",
+        // Frozen count toward seed quantity (task qslt): seed_count=2 + 2 frozen
+        // → max(seed, frozen) = 2 rows total (not 4). Both frozen survive; zero
+        // composed rows added.
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected exactly 2 rows (max(seed_count=2, frozen=2)), got {}",
             rows.len()
         );
         // Check that the frozen rows are present (they were inserted first)
@@ -4254,6 +4266,126 @@ definitions:
         assert!(
             names.contains(&"Iceberg"),
             "should contain frozen row 'Iceberg'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_frozen_overflow_seed_count() {
+        // Task qslt: when frozen_count > seed_count, all frozen survive and
+        // zero composed rows are added. User intent wins; no truncation of
+        // frozen rows to honor seed_count.
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "Frozen Overflow",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 1,
+            "frozen_rows": {
+                "Pet": [
+                    {"name": "F1", "status": "available"},
+                    {"name": "F2", "status": "sold"},
+                    {"name": "F3", "status": "pending"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .uri("/_api/admin/tables/Pet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let table_data: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rows = table_data["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "frozen_count=3 > seed_count=1 → all 3 frozen survive, zero composed, got {}",
+            rows.len()
+        );
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        for expected in ["F1", "F2", "F3"] {
+            assert!(
+                names.contains(&expected),
+                "frozen row '{expected}' must survive overflow"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_activate_recipe_no_frozen_row_count_unchanged() {
+        // Task qslt regression guard: zero frozen rows → table row count
+        // equals seed_count exactly (no accidental shrinkage from new math).
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let body = serde_json::json!({
+            "name": "No Frozen",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 5,
+            "frozen_rows": {}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .uri("/_api/admin/tables/Pet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let table_data: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rows = table_data["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "zero frozen, seed_count=5 → exactly 5 rows, got {}",
+            rows.len()
         );
     }
 
