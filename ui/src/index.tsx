@@ -255,6 +255,7 @@ function App() {
   const [configShowNonDefault, setConfigShowNonDefault] = createSignal(false);
   const [editingRecipeId, setEditingRecipeId] = createSignal<number | null>(null);
   const [activeRecipeId, setActiveRecipeId] = createSignal<number | null>(null);
+  const [resetConfirmingId, setResetConfirmingId] = createSignal<number | null>(null);
   const [frozenRows, setFrozenRows] = createSignal<Record<string, Record<string, unknown>[]>>({});
 
   // Schema state
@@ -861,6 +862,30 @@ function App() {
       const spec: SpecInfo = await specRes.json();
       setSpecInfo(spec);
       setState("running");
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    }
+    setLoading(false);
+  };
+
+  const handleRecipeReset = async (id: number) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`/_api/admin/recipes/reset`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        try { setError(JSON.parse(text).error || text); } catch { setError(`${res.status}: ${text}`); }
+        setLoading(false);
+        return;
+      }
+      setResetConfirmingId(null);
+      const sel = selectedTable();
+      if (sel) {
+        await loadTableData(sel);
+      }
     } catch (e: any) {
       setError(String(e?.message || e));
     }
@@ -2045,48 +2070,85 @@ function App() {
                         try { return JSON.parse(recipe.selected_endpoints); } catch { return []; }
                       })();
                       return (
-                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-5 flex items-center justify-between">
-                          <div>
-                            <p class="font-semibold text-gray-100">{recipe.name}</p>
-                            <p class="text-sm text-gray-500 mt-0.5">
-                              {endpoints.length} endpoint{endpoints.length !== 1 ? "s" : ""} &middot; {recipe.seed_count} seed rows &middot; {new Date(recipe.created_at).toLocaleDateString()}
-                            </p>
+                        <div class="rounded-xl bg-[#0a101d] border border-[#141b28] p-5">
+                          <div class="flex items-center justify-between">
+                            <div>
+                              <p class="font-semibold text-gray-100">{recipe.name}</p>
+                              <p class="text-sm text-gray-500 mt-0.5">
+                                {endpoints.length} endpoint{endpoints.length !== 1 ? "s" : ""} &middot; {recipe.seed_count} seed rows &middot; {new Date(recipe.created_at).toLocaleDateString()}
+                              </p>
+                            </div>
+                            <div class="flex gap-2">
+                              <button
+                                class="px-4 py-1.5 bg-green-600 hover:bg-green-500 rounded-md text-xs font-medium transition-colors disabled:opacity-50"
+                                onClick={() => handleRecipeActivate(recipe.id)}
+                                disabled={loading()}
+                              >
+                                Activate
+                              </button>
+                              <button
+                                data-testid="recipe-reset"
+                                class="px-3 py-1.5 text-xs font-medium text-amber-400 hover:text-amber-300 border border-amber-500/20 hover:border-amber-500/40 rounded-md transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                onClick={() => setResetConfirmingId(recipe.id)}
+                                disabled={loading() || recipe.id !== activeRecipeId()}
+                                title={recipe.id !== activeRecipeId() ? "Activate this recipe to enable reset" : "Re-seed mock data"}
+                              >
+                                Reset
+                              </button>
+                              <button
+                                class="px-3 py-1.5 text-xs font-medium text-blue-400 hover:text-blue-300 border border-blue-500/20 hover:border-blue-500/40 rounded-md transition-colors disabled:opacity-50"
+                                onClick={() => handleRecipeEdit(recipe)}
+                                disabled={loading()}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors"
+                                onClick={() => handleRecipeExport(recipe.id)}
+                              >
+                                Export
+                              </button>
+                              <button
+                                class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors disabled:opacity-50"
+                                onClick={() => handleRecipeClone(recipe.id)}
+                                disabled={loading()}
+                              >
+                                Clone
+                              </button>
+                              <button
+                                class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"
+                                onClick={() => handleRecipeDelete(recipe.id)}
+                              >
+                                Delete
+                              </button>
+                            </div>
                           </div>
-                          <div class="flex gap-2">
-                            <button
-                              class="px-4 py-1.5 bg-green-600 hover:bg-green-500 rounded-md text-xs font-medium transition-colors disabled:opacity-50"
-                              onClick={() => handleRecipeActivate(recipe.id)}
-                              disabled={loading()}
-                            >
-                              Activate
-                            </button>
-                            <button
-                              class="px-3 py-1.5 text-xs font-medium text-blue-400 hover:text-blue-300 border border-blue-500/20 hover:border-blue-500/40 rounded-md transition-colors disabled:opacity-50"
-                              onClick={() => handleRecipeEdit(recipe)}
-                              disabled={loading()}
-                            >
-                              Edit
-                            </button>
-                            <button
-                              class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors"
-                              onClick={() => handleRecipeExport(recipe.id)}
-                            >
-                              Export
-                            </button>
-                            <button
-                              class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-600/30 hover:border-gray-500/50 rounded-md transition-colors disabled:opacity-50"
-                              onClick={() => handleRecipeClone(recipe.id)}
-                              disabled={loading()}
-                            >
-                              Clone
-                            </button>
-                            <button
-                              class="px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 border border-red-500/20 hover:border-red-500/40 rounded-md transition-colors"
-                              onClick={() => handleRecipeDelete(recipe.id)}
-                            >
-                              Delete
-                            </button>
-                          </div>
+                          <Show when={resetConfirmingId() === recipe.id}>
+                            <div data-testid="recipe-reset-confirm" class="mt-3 p-3 rounded border border-amber-900/50 bg-amber-900/10 space-y-2">
+                              <p class="text-xs text-amber-200">
+                                Reset mock data? Removes user-added rows and re-seeds "{recipe.name}" (frozen rows preserved).
+                              </p>
+                              <div class="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  data-testid="recipe-reset-confirm-yes"
+                                  class="text-xs text-white bg-amber-700 hover:bg-amber-600 px-2.5 py-1 rounded disabled:opacity-50"
+                                  onClick={() => handleRecipeReset(recipe.id)}
+                                  disabled={loading()}
+                                >
+                                  Confirm reset
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid="recipe-reset-confirm-no"
+                                  class="text-xs text-gray-300 hover:text-white px-2.5 py-1 border border-gray-700 rounded"
+                                  onClick={() => setResetConfirmingId(null)}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </Show>
                         </div>
                       );
                     }}
