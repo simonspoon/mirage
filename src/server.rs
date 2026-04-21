@@ -34,6 +34,11 @@ pub struct RouteRegistry {
     pub endpoints: Vec<EndpointInfo>,
     pub spec: Option<SwaggerSpec>,
     pub raw_spec: Option<SwaggerSpec>, // before resolve_refs, keeps $ref paths
+    /// Id of the recipe most recently activated on this registry. Used by
+    /// `POST /_api/admin/recipes/reset` to re-run the activation flow
+    /// without requiring the client to remember the id. In-memory only —
+    /// cleared on server restart and on delete of the matching recipe.
+    pub active_recipe_id: Option<i64>,
 }
 
 impl RouteRegistry {
@@ -44,6 +49,7 @@ impl RouteRegistry {
             endpoints: Vec::new(),
             spec: None,
             raw_spec: None,
+            active_recipe_id: None,
         }
     }
 }
@@ -1281,7 +1287,17 @@ async fn admin_delete_recipe(
 ) -> Response {
     let conn = state.recipe_db.lock().unwrap();
     match crate::recipe::delete_recipe(&conn, id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Deleting the currently active recipe must clear the registry's
+            // active_recipe_id so a subsequent POST /_api/admin/recipes/reset
+            // returns 409 instead of trying to re-activate a missing recipe.
+            drop(conn);
+            let mut reg = state.registry.write().unwrap();
+            if reg.active_recipe_id == Some(id) {
+                reg.active_recipe_id = None;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "recipe not found"})),
@@ -1638,6 +1654,15 @@ async fn admin_activate_recipe(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Response {
+    admin_run_activate(state, id).await
+}
+
+/// Shared activation body. Called by both `admin_activate_recipe`
+/// (`POST /recipes/{id}/activate`) and `admin_reset_active_recipe`
+/// (`POST /recipes/reset`). Loads the recipe, truncates mock tables,
+/// runs composer + seeder + frozen re-insert, and records `id` as the
+/// registry's `active_recipe_id` on success.
+async fn admin_run_activate(state: AppState, id: i64) -> Response {
     // Load recipe
     let recipe = {
         let conn = state.recipe_db.lock().unwrap();
@@ -2058,6 +2083,7 @@ async fn admin_activate_recipe(
         let mut reg = state.registry.write().unwrap();
         reg.routes = all_routes;
         reg.endpoints = activated_endpoints.clone();
+        reg.active_recipe_id = Some(id);
     }
 
     (
@@ -2068,6 +2094,22 @@ async fn admin_activate_recipe(
         })),
     )
         .into_response()
+}
+
+/// POST /_api/admin/recipes/reset — re-run activation for the recipe
+/// currently tracked as active on the registry. Returns 409 when no
+/// recipe is active (no prior activate in this process, or active
+/// recipe was deleted).
+async fn admin_reset_active_recipe(State(state): State<AppState>) -> Response {
+    let active = { state.registry.read().unwrap().active_recipe_id };
+    match active {
+        None => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "no active recipe"})),
+        )
+            .into_response(),
+        Some(id) => admin_run_activate(state, id).await,
+    }
 }
 
 async fn admin_get_recipe_config(
@@ -2525,6 +2567,10 @@ pub fn build_router(state: AppState) -> Router {
             "/recipes",
             post(admin_create_recipe).get(admin_list_recipes),
         )
+        // /recipes/reset is a literal route and MUST be registered before
+        // /recipes/{id} so axum matches it literally instead of capturing
+        // "reset" as the `id` path parameter.
+        .route("/recipes/reset", post(admin_reset_active_recipe))
         .route(
             "/recipes/{id}",
             get(admin_get_recipe)
@@ -3042,6 +3088,144 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 5, "should have 5 seeded rows from recipe");
+    }
+
+    /// POST /_api/admin/recipes/reset with no prior activation must return
+    /// 409 Conflict with the canonical error body.
+    #[tokio::test]
+    async fn test_reset_no_active_recipe() {
+        let router = setup_empty();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/reset")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "no active recipe");
+    }
+
+    /// Activate a recipe, POST a row to /pet so the mock table diverges
+    /// from the seeded state, then POST /recipes/reset. The reset must
+    /// re-seed the table back to exactly the recipe's seed_count rows.
+    #[tokio::test]
+    async fn test_reset_rereseeds_active_recipe() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create recipe
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Seeded row count == 5 (per recipe_test_body seed_count).
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(arr.len(), 5, "expected 5 seeded rows post-activate");
+
+        // POST a new row — mock data diverges from seed.
+        let new_pet = serde_json::json!({"name": "Ephemeral", "status": "available"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/pet")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&new_pet).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(arr.len(), 6, "expected 6 rows after user POST");
+
+        // POST /recipes/reset → 200, seed restored.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/reset")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "activated");
+
+        let req = Request::builder().uri("/pet").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(arr.len(), 5, "expected 5 seeded rows after reset");
+    }
+
+    /// Deleting the currently active recipe must clear the registry's
+    /// active_recipe_id so the next reset returns 409 instead of trying
+    /// to re-activate a missing recipe.
+    #[tokio::test]
+    async fn test_delete_active_recipe_clears_active() {
+        let router = setup_empty();
+        let body = recipe_test_body();
+
+        // Create + activate.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Delete the active recipe.
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Reset must now 409 — active_recipe_id was cleared on delete.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes/reset")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
