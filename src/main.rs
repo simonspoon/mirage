@@ -79,6 +79,15 @@ enum RecipesCommand {
         #[arg(long, env = "MIRAGE_URL")]
         url: Option<String>,
     },
+    /// Re-seed the currently active recipe back to its seeded state
+    ///
+    /// Calls `POST /_api/admin/recipes/reset` on a running server. Exits
+    /// non-zero with `{"error": "no active recipe"}` (HTTP 409) when
+    /// nothing has been activated yet.
+    Reset {
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
     /// Create a new recipe from a spec file, endpoints file, and optional config
     Create {
         /// Recipe name
@@ -572,6 +581,20 @@ async fn run_recipes(args: &RecipesArgs) {
                 "endpoints": endpoints,
             });
             println!("{payload}");
+        }
+        RecipesCommand::Reset { url } => {
+            let base = resolve_base_url(url);
+            let resp = client
+                .post(format!("{base}/_api/admin/recipes/reset"))
+                .send()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+            let resp = ensure_success(resp).await;
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+            println!("{body}");
         }
         RecipesCommand::Create {
             name,
