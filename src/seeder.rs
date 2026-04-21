@@ -840,7 +840,7 @@ pub fn seed_tables(
     spec: &SwaggerSpec,
     rows_per_table: usize,
 ) -> Result<(), rusqlite::Error> {
-    seed_tables_filtered(conn, spec, rows_per_table, None, None, None, None)
+    seed_tables_filtered(conn, spec, rows_per_table, None, None, None, None, None)
 }
 
 /// Seed tables for definitions in `spec`.
@@ -852,6 +852,7 @@ pub fn seed_tables(
 ///   alphabetically. Duplicates in `order` are skipped after first sighting.
 /// - When `order` is `None`, definitions iterate in spec (HashMap) order —
 ///   matches historical behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn seed_tables_filtered(
     conn: &Connection,
     spec: &SwaggerSpec,
@@ -860,6 +861,7 @@ pub fn seed_tables_filtered(
     faker_rules: Option<&HashMap<String, HashMap<String, FakerStrategy>>>,
     recipe_rules: Option<&[Rule]>,
     order: Option<&[String]>,
+    overrides: Option<&HashMap<String, usize>>,
 ) -> Result<(), rusqlite::Error> {
     let definitions = match &spec.definitions {
         Some(d) => d,
@@ -871,6 +873,16 @@ pub fn seed_tables_filtered(
             Some(set) => set.contains(name),
             None => true,
         }
+    };
+
+    // Per-def count: caller override wins over uniform rows_per_table. Used
+    // by activation path to subtract frozen-row count per def so
+    // seed + re-apply yields max(seed_count, frozen_count), not a sum.
+    let count_for = |name: &str| -> usize {
+        overrides
+            .and_then(|m| m.get(name))
+            .copied()
+            .unwrap_or(rows_per_table)
     };
 
     let mut seeded: HashSet<String> = HashSet::new();
@@ -892,7 +904,7 @@ pub fn seed_tables_filtered(
                 conn,
                 name,
                 schema,
-                rows_per_table,
+                count_for(name),
                 faker_rules,
                 recipe_rules,
             )?;
@@ -914,7 +926,7 @@ pub fn seed_tables_filtered(
                 conn,
                 name,
                 schema,
-                rows_per_table,
+                count_for(name),
                 faker_rules,
                 recipe_rules,
             )?;
@@ -928,7 +940,7 @@ pub fn seed_tables_filtered(
                 conn,
                 name,
                 schema,
-                rows_per_table,
+                count_for(name),
                 faker_rules,
                 recipe_rules,
             )?;
@@ -1136,7 +1148,7 @@ mod tests {
             field: "Pet.name".to_string(),
             value: serde_json::json!("Fido"),
         }];
-        seed_tables_filtered(&conn, &spec, 8, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 8, None, None, Some(&rules), None, None).unwrap();
 
         let names: Vec<String> = conn
             .prepare("SELECT \"name\" FROM \"Pet\"")
@@ -1159,7 +1171,7 @@ mod tests {
             field: "Pet.name".to_string(),
             options: allowed.iter().map(|s| serde_json::json!(s)).collect(),
         }];
-        seed_tables_filtered(&conn, &spec, 12, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 12, None, None, Some(&rules), None, None).unwrap();
 
         let names: Vec<String> = conn
             .prepare("SELECT \"name\" FROM \"Pet\"")
@@ -1185,7 +1197,7 @@ mod tests {
             min: 1000.0,
             max: 1010.0,
         }];
-        seed_tables_filtered(&conn, &spec, 15, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 15, None, None, Some(&rules), None, None).unwrap();
 
         let ids: Vec<i64> = conn
             .prepare("SELECT \"id\" FROM \"Pet\"")
@@ -1210,7 +1222,7 @@ mod tests {
             field: "Pet.name".to_string(),
             regex: r"[A-Z]{3}-[0-9]{4}".to_string(),
         }];
-        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None, None).unwrap();
 
         let pattern = regex::Regex::new(r"^[A-Z]{3}-[0-9]{4}$").unwrap();
         let names: Vec<String> = conn
@@ -1264,7 +1276,7 @@ definitions:
             op: CompareOp::Gt,
             right: serde_json::json!("Box.width"),
         }];
-        seed_tables_filtered(&conn, &spec, 25, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 25, None, None, Some(&rules), None, None).unwrap();
 
         let rows: Vec<(i64, i64)> = conn
             .prepare("SELECT \"height\", \"width\" FROM \"Box\"")
@@ -1291,7 +1303,7 @@ definitions:
             op: CompareOp::Lt,
             right: serde_json::json!(50),
         }];
-        seed_tables_filtered(&conn, &spec, 30, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 30, None, None, Some(&rules), None, None).unwrap();
 
         let heights: Vec<i64> = conn
             .prepare("SELECT \"height\" FROM \"Box\"")
@@ -1315,7 +1327,7 @@ definitions:
             field: "Pet.id".to_string(),
             value: serde_json::json!(42),
         }];
-        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None).unwrap();
+        seed_tables_filtered(&conn, &spec, 10, None, None, Some(&rules), None, None).unwrap();
 
         let ids: Vec<i64> = conn
             .prepare("SELECT \"id\" FROM \"Pet\"")
