@@ -1658,6 +1658,86 @@ async fn admin_activate_recipe(
     admin_run_activate(state, id).await
 }
 
+/// Insert every frozen row for each table in `allowed_tables` into SQLite.
+/// Used twice in the activation pipeline:
+///   1. Pre-compose with `response_defs` — so composer's nested `$ref`
+///      sampler (`composer::sample_row_from_table`) sees frozen rows and
+///      composed parent docs can reference them (bug cyco).
+///   2. Post-compose with the set of defs the composer streamed to — to
+///      restore frozen rows on tables `seeder::insert_composed_rows`
+///      truncated. Nested-only defs are excluded here; their pre-compose
+///      insert already survived through compose.
+///
+/// Ignores rows whose table is not in `allowed_tables`. Ignores columns not
+/// defined on the spec schema. Logs and continues on per-row SQL errors.
+fn reapply_frozen_rows(
+    conn: &rusqlite::Connection,
+    frozen: &crate::recipe::FrozenRows,
+    allowed_tables: &HashSet<String>,
+    spec: &SwaggerSpec,
+) {
+    if frozen.is_empty() {
+        return;
+    }
+    let spec_defs = spec.definitions.as_ref();
+    for (table_name, rows) in frozen {
+        if !allowed_tables.contains(table_name) {
+            continue;
+        }
+        let valid_columns: HashSet<String> = spec_defs
+            .and_then(|defs| defs.get(table_name))
+            .and_then(|schema| schema.properties.as_ref())
+            .map(|props| props.keys().cloned().collect())
+            .unwrap_or_default();
+        let safe_table = table_name.replace('"', "\"\"");
+        for row in rows {
+            let obj = match row.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+            let mut col_names: Vec<String> = Vec::new();
+            let mut col_values: Vec<String> = Vec::new();
+            for (col, val) in obj {
+                if !valid_columns.contains(col) {
+                    continue;
+                }
+                let safe_col = col.replace('"', "\"\"");
+                col_names.push(format!("\"{}\"", safe_col));
+                let sql_val = match val {
+                    serde_json::Value::Null => "NULL".to_string(),
+                    serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(s) => {
+                        format!("'{}'", s.replace('\'', "''"))
+                    }
+                    other => {
+                        format!(
+                            "'{}'",
+                            serde_json::to_string(other)
+                                .unwrap_or_default()
+                                .replace('\'', "''")
+                        )
+                    }
+                };
+                col_values.push(sql_val);
+            }
+            if !col_names.is_empty() {
+                let sql = format!(
+                    "INSERT INTO \"{}\" ({}) VALUES ({})",
+                    safe_table,
+                    col_names.join(", "),
+                    col_values.join(", ")
+                );
+                if let Err(e) = conn.execute(&sql, []) {
+                    eprintln!(
+                        "Warning: failed to re-insert frozen row into \"{table_name}\": {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Shared activation body. Called by both `admin_activate_recipe`
 /// (`POST /recipes/{id}/activate`) and `admin_reset_active_recipe`
 /// (`POST /recipes/reset`). Loads the recipe, truncates mock tables,
@@ -1900,6 +1980,16 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
             )
                 .into_response();
         }
+
+        // Apply frozen rows to backing tables BEFORE composer runs (bug cyco).
+        // Composer's nested `$ref` sampler (composer::sample_row_from_table)
+        // picks from the live SQLite table; without this pre-apply it would
+        // only see seeded rows and never reference frozen rows from parent
+        // composed docs. Composer-owned defs (endpoint-bearing) are truncated
+        // by insert_composed_rows; the post-compose re-apply restores their
+        // frozen rows. Nested-only defs (e.g. Address) survive untouched
+        // through compose, so this pre-apply is their only insert.
+        reapply_frozen_rows(&conn, &frozen, &response_defs, &spec);
     }
 
     // Generate document store using composer
@@ -1931,6 +2021,13 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
     // composed rows of earlier defs from SQLite (task thoh, parent baqf).
     {
         let conn = state.db.lock().unwrap();
+        // Track which defs the composer streamed to — these are the only
+        // tables `insert_composed_rows` truncated. Used below to restrict
+        // the post-compose frozen re-apply to composer-owned defs only.
+        // Nested-only defs (e.g. Address) received their frozen rows in the
+        // pre-compose pass and must NOT be re-inserted here (would
+        // duplicate, bug cyco rollback).
+        let mut composer_owned_defs: HashSet<String> = HashSet::new();
         let compose_result = crate::composer::compose_documents(
             &spec,
             &raw_spec,
@@ -1941,6 +2038,7 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
             &recipe_rules,
             &conn,
             |def_name, docs| {
+                composer_owned_defs.insert(def_name.to_string());
                 let mut single = HashMap::new();
                 single.insert(def_name.to_string(), docs.to_vec());
                 seeder::insert_composed_rows(&conn, &single)
@@ -1954,66 +2052,10 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
                 .into_response();
         }
 
-        // Re-apply frozen rows (insert_composed_rows truncated the tables)
-        if !frozen.is_empty() {
-            let spec_defs = spec.definitions.as_ref();
-            for (table_name, rows) in &frozen {
-                if !response_defs.contains(table_name) {
-                    continue;
-                }
-                let valid_columns: HashSet<String> = spec_defs
-                    .and_then(|defs| defs.get(table_name))
-                    .and_then(|schema| schema.properties.as_ref())
-                    .map(|props| props.keys().cloned().collect())
-                    .unwrap_or_default();
-                let safe_table = table_name.replace('"', "\"\"");
-                for row in rows {
-                    let obj = match row.as_object() {
-                        Some(o) => o,
-                        None => continue,
-                    };
-                    let mut col_names: Vec<String> = Vec::new();
-                    let mut col_values: Vec<String> = Vec::new();
-                    for (col, val) in obj {
-                        if !valid_columns.contains(col) {
-                            continue;
-                        }
-                        let safe_col = col.replace('"', "\"\"");
-                        col_names.push(format!("\"{}\"", safe_col));
-                        let sql_val = match val {
-                            serde_json::Value::Null => "NULL".to_string(),
-                            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::String(s) => {
-                                format!("'{}'", s.replace('\'', "''"))
-                            }
-                            other => {
-                                format!(
-                                    "'{}'",
-                                    serde_json::to_string(other)
-                                        .unwrap_or_default()
-                                        .replace('\'', "''")
-                                )
-                            }
-                        };
-                        col_values.push(sql_val);
-                    }
-                    if !col_names.is_empty() {
-                        let sql = format!(
-                            "INSERT INTO \"{}\" ({}) VALUES ({})",
-                            safe_table,
-                            col_names.join(", "),
-                            col_values.join(", ")
-                        );
-                        if let Err(e) = conn.execute(&sql, []) {
-                            eprintln!(
-                                "Warning: failed to re-insert frozen row into \"{table_name}\": {e}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // Re-apply frozen rows for composer-owned defs only.
+        // insert_composed_rows truncated these tables; nested-only defs
+        // kept their pre-compose frozen insert untouched.
+        reapply_frozen_rows(&conn, &frozen, &composer_owned_defs, &spec);
     }
 
     let activated_endpoints: Vec<EndpointInfo> = all_routes
@@ -4674,6 +4716,104 @@ definitions:
             names.iter().filter(|n| **n == "ResetCatB").count(),
             1,
             "ResetCatB must appear exactly once after reset"
+        );
+    }
+
+    /// Regression guard (bug cyco): composer's nested `$ref` sampler reads
+    /// live SQLite rows. Frozen rows must be in the backing table BEFORE
+    /// compose_documents runs, so composed parent docs can reference them.
+    /// Before the fix, frozen rows were only re-applied post-compose; all
+    /// composed Pets pointed exclusively to seeded Categories, never frozen.
+    ///
+    /// Test shape: seed_count=50, frozen=2 Category rows. Pool for nested
+    /// sampling = 52; 50 composed Pets. Pre-fix P(no Pet references frozen)
+    /// per activation = (50/52)^50 ≈ 0.143. We retry up to 10 activations
+    /// via /reset, so P(all attempts miss) ≈ 0.143^10 ≈ 4e-9 — well below
+    /// flake bar. Post-fix: ≈ 0.86 hit rate per attempt; essentially always
+    /// passes on the first attempt.
+    #[tokio::test]
+    async fn test_activate_recipe_frozen_nested_def_sampled_by_parent() {
+        let router = setup_empty();
+        let spec_yaml = std::fs::read_to_string("tests/fixtures/petstore.yaml").unwrap();
+        let frozen_cat_a_id: i64 = 9001;
+        let frozen_cat_b_id: i64 = 9002;
+        let body = serde_json::json!({
+            "name": "Frozen Nested Sampled",
+            "spec_source": spec_yaml,
+            "endpoints": [
+                {"method": "get", "path": "/pet/{petId}"},
+                {"method": "post", "path": "/pet"}
+            ],
+            "seed_count": 50,
+            "frozen_rows": {
+                "Category": [
+                    {"id": frozen_cat_a_id, "name": "FrozenCatA"},
+                    {"id": frozen_cat_b_id, "name": "FrozenCatB"}
+                ]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Activate once.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Search composed Pets across up to 10 reset attempts for a Pet whose
+        // category points at a frozen Category. Combined miss-prob ≈ 4e-9.
+        let mut found_frozen_ref = false;
+        let mut last_observed_category_ids: Vec<i64> = Vec::new();
+        for attempt in 0..10 {
+            if attempt > 0 {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/_api/admin/recipes/reset")
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = router.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+            let req = Request::builder()
+                .uri("/_api/admin/tables/Pet")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let table_data: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let rows = table_data["rows"].as_array().unwrap();
+            last_observed_category_ids = rows
+                .iter()
+                .filter_map(|r| r["category"]["id"].as_i64())
+                .collect();
+            if last_observed_category_ids
+                .iter()
+                .any(|cid| *cid == frozen_cat_a_id || *cid == frozen_cat_b_id)
+            {
+                found_frozen_ref = true;
+                break;
+            }
+        }
+        assert!(
+            found_frozen_ref,
+            "no composed Pet referenced a frozen Category across 10 activations — \
+             composer's nested $ref sampler is not seeing frozen rows. \
+             Last observed category ids on Pet rows: {last_observed_category_ids:?}"
         );
     }
 
