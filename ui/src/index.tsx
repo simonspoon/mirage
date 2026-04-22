@@ -114,6 +114,9 @@ interface Recipe {
   rules: string;
   frozen_rows: string;
   custom_lists: string;
+  // Per-table seed counts. JSON-encoded Record<defName, number>. Empty "{}"
+  // when no per-table overrides saved — activation falls back to seed_count.
+  seed_counts: string;
 }
 
 // Recipe rule data model — mirrors the Rust serde tagged union in src/rules.rs.
@@ -253,6 +256,10 @@ function App() {
   const [recipeSpecText, setRecipeSpecText] = createSignal("");
   const [recipeName, setRecipeName] = createSignal("");
   const [recipeSeedCount, setRecipeSeedCount] = createSignal(10);
+  // Per-table seed counts. Populated by Configure step's per-table rows inputs.
+  // Keys are def names (e.g. "AccessDto"). Defs absent from map fall back to
+  // recipeSeedCount() on activation (server-side; see server.rs activation).
+  const [recipeSeedCounts, setRecipeSeedCounts] = createSignal<Record<string, number>>({});
   const [recipeAvailableEndpoints, setRecipeAvailableEndpoints] = createSignal<Endpoint[]>([]);
   const [recipeSelectedEndpoints, setRecipeSelectedEndpoints] = createSignal<boolean[]>([]);
   const [recipeStep, setRecipeStep] = createSignal<"paste" | "select" | "config" | "name">("paste");
@@ -727,6 +734,7 @@ function App() {
             spec_source: recipeSpecText().trim(),
             endpoints,
             seed_count: recipeSeedCount(),
+            seed_counts: recipeSeedCounts(),
             quantity_configs: recipeQuantityConfigs(),
             faker_rules: recipeFakerRules(),
             rules: recipeRules(),
@@ -745,6 +753,7 @@ function App() {
         setRecipeSpecText("");
         setRecipeName("");
         setRecipeSeedCount(10);
+        setRecipeSeedCounts({});
         setRecipeAvailableEndpoints([]);
         setRecipeSelectedEndpoints([]);
         setRecipeStep("paste");
@@ -779,6 +788,7 @@ function App() {
           spec_source: recipeSpecText().trim(),
           endpoints,
           seed_count: recipeSeedCount(),
+          seed_counts: recipeSeedCounts(),
           quantity_configs: recipeQuantityConfigs(),
           faker_rules: recipeFakerRules(),
           rules: recipeRules(),
@@ -974,6 +984,18 @@ function App() {
       try { quantityConfigs = JSON.parse(recipe.quantity_configs); } catch { /* empty */ }
       let fakerRules: Record<string, string> = {};
       try { fakerRules = JSON.parse(recipe.faker_rules); } catch { /* empty */ }
+      // Parse per-table seed counts. Missing/invalid = empty map; Configure
+      // step falls back to recipeSeedCount() default when rendering inputs.
+      let seedCounts: Record<string, number> = {};
+      try {
+        const parsed = JSON.parse(recipe.seed_counts ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            const n = Number(v);
+            if (Number.isInteger(n) && n >= 1 && n <= 100) seedCounts[k] = n;
+          }
+        }
+      } catch { /* empty */ }
       let customLists: Record<string, string[]> = {};
       try {
         const parsed = JSON.parse(recipe.custom_lists ?? "{}");
@@ -996,6 +1018,7 @@ function App() {
       setRecipeSelectedEndpoints(selectedFlags);
       setRecipeName(recipe.name);
       setRecipeSeedCount(recipe.seed_count);
+      setRecipeSeedCounts(seedCounts);
       setRecipeQuantityConfigs(quantityConfigs);
       setRecipeFakerRules(fakerRules);
       setRecipeCustomLists(customLists);
@@ -1014,6 +1037,7 @@ function App() {
     setRecipeSpecText("");
     setRecipeName("");
     setRecipeSeedCount(10);
+    setRecipeSeedCounts({});
     setRecipeAvailableEndpoints([]);
     setRecipeSelectedEndpoints([]);
     setRecipeStep("paste");
@@ -2015,6 +2039,8 @@ function App() {
                   setRecipeRules={setRecipeRules}
                   recipeSeedCount={recipeSeedCount}
                   setRecipeSeedCount={setRecipeSeedCount}
+                  recipeSeedCounts={recipeSeedCounts}
+                  setRecipeSeedCounts={setRecipeSeedCounts}
                   entityGraph={entityGraph}
                   configSearch={configSearch}
                   setConfigSearch={setConfigSearch}
@@ -4696,6 +4722,11 @@ function RecipeConfigStep(props: {
   setRecipeRules: Setter<Rule[]>;
   recipeSeedCount: Accessor<number>;
   setRecipeSeedCount: Setter<number>;
+  // Per-table seed counts, keyed by def name. Defs absent from the map fall
+  // back to props.recipeSeedCount() when rendering an input. Per-header input
+  // writes only that def's entry; typing in table A never touches table B.
+  recipeSeedCounts: Accessor<Record<string, number>>;
+  setRecipeSeedCounts: Setter<Record<string, number>>;
   entityGraph: Accessor<any>;
   configSearch: Accessor<string>;
   setConfigSearch: Setter<string>;
@@ -5073,31 +5104,47 @@ function RecipeConfigStep(props: {
     setExpandedGroups(s);
   };
 
-  // Inline seed-count edit — raw text buffer + derived validity. Shared across all headers
-  // because recipeSeedCount() is recipe-wide. Buffer re-syncs from the signal only on
-  // external changes (recipe load, Step 5 edit), not on user typing.
-  const [seedInputRaw, setSeedInputRaw] = createSignal<string>(String(props.recipeSeedCount()));
-  let lastSyncedSeed = props.recipeSeedCount();
-  createEffect(() => {
-    const current = props.recipeSeedCount();
-    if (current !== lastSyncedSeed) {
-      lastSyncedSeed = current;
-      setSeedInputRaw(String(current));
-    }
-  });
-  const seedInputValid = () => {
-    const raw = seedInputRaw().trim();
+  // Per-table seed-count edit buffers.
+  //
+  // Each expanded table header owns its own rows input, keyed by def name. The
+  // raw-text buffer holds in-progress edits (e.g. mid-typing "" or "12a") so
+  // the input stays responsive; the validated integer commits into
+  // props.recipeSeedCounts[defName] only when the buffer parses as 1–100.
+  //
+  // Typing in table A's input only touches seedInputRaw[A] and, on valid
+  // commit, recipeSeedCounts[A]. Table B's input remains bound to
+  // recipeSeedCounts[B] (or the fresh default) and never re-renders with a
+  // different value.
+  //
+  // Fresh default for a def that has no entry yet: props.recipeSeedCount()
+  // (recipe-wide scalar, fallback value, default 10). New recipes start with
+  // every def implicitly at 10; once edited, the def is pinned in the map.
+  const [seedInputRaw, setSeedInputRaw] = createSignal<Record<string, string>>({});
+  const effectiveSeedCountFor = (defName: string): number => {
+    const map = props.recipeSeedCounts();
+    if (Object.prototype.hasOwnProperty.call(map, defName)) return map[defName];
+    return props.recipeSeedCount();
+  };
+  const seedInputRawFor = (defName: string): string => {
+    const buf = seedInputRaw();
+    if (Object.prototype.hasOwnProperty.call(buf, defName)) return buf[defName];
+    return String(effectiveSeedCountFor(defName));
+  };
+  const seedInputValidFor = (defName: string): boolean => {
+    const raw = seedInputRawFor(defName).trim();
     if (raw === "") return false;
     const n = Number(raw);
     if (!Number.isInteger(n)) return false;
     return n >= 1 && n <= 100;
   };
-  const commitSeedInput = (raw: string) => {
-    setSeedInputRaw(raw);
+  const setSeedInputRawFor = (defName: string, raw: string) => {
+    setSeedInputRaw((prev) => ({ ...prev, [defName]: raw }));
+  };
+  const commitSeedInputFor = (defName: string, raw: string) => {
+    setSeedInputRawFor(defName, raw);
     const n = Number(raw.trim());
     if (Number.isInteger(n) && n >= 1 && n <= 100) {
-      lastSyncedSeed = n;
-      props.setRecipeSeedCount(n);
+      props.setRecipeSeedCounts({ ...props.recipeSeedCounts(), [defName]: n });
     }
   };
 
@@ -5511,28 +5558,31 @@ function RecipeConfigStep(props: {
                   <span class="font-medium text-blue-200">{defName}</span>
                   <span
                     class="flex items-center gap-1 text-[10px] text-gray-400"
-                    title="Rows seeded per table (recipe-wide setting)"
+                    title="Rows seeded for this table"
                     onClick={(e) => e.stopPropagation()}
                     onKeyDown={(e) => e.stopPropagation()}
                   >
                     <input
                       data-testid="table-header-seed-input"
+                      data-def={defName}
                       type="number"
                       min={1}
                       max={100}
                       step={1}
-                      value={seedInputRaw()}
-                      onInput={(e) => commitSeedInput(e.currentTarget.value)}
-                      onBlur={(e) => {
+                      value={seedInputRawFor(defName)}
+                      onInput={(e) => commitSeedInputFor(defName, e.currentTarget.value)}
+                      onBlur={() => {
                         // On blur, reset raw to canonical valid value if current is invalid.
-                        if (!seedInputValid()) setSeedInputRaw(String(props.recipeSeedCount()));
+                        if (!seedInputValidFor(defName)) {
+                          setSeedInputRawFor(defName, String(effectiveSeedCountFor(defName)));
+                        }
                       }}
                       onClick={(e) => e.stopPropagation()}
                       onKeyDown={(e) => e.stopPropagation()}
-                      class={`w-12 bg-[#070c17] border rounded px-1 py-0.5 text-[11px] text-gray-100 text-center focus:outline-none ${seedInputValid() ? "border-gray-800 focus:border-gray-700" : "border-red-500/70 focus:border-red-500"}`}
+                      class={`w-12 bg-[#070c17] border rounded px-1 py-0.5 text-[11px] text-gray-100 text-center focus:outline-none ${seedInputValidFor(defName) ? "border-gray-800 focus:border-gray-700" : "border-red-500/70 focus:border-red-500"}`}
                     />
                     <span class="text-gray-500">rows</span>
-                    <Show when={!seedInputValid()}>
+                    <Show when={!seedInputValidFor(defName)}>
                       <span class="text-[10px] text-red-400 ml-1">1–100</span>
                     </Show>
                   </span>

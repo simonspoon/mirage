@@ -17,6 +17,12 @@ pub struct Recipe {
     pub rules: String,
     pub frozen_rows: String,
     pub custom_lists: String,
+    /// Per-table seed counts. JSON-encoded `{def_name: usize}` map. Empty `{}`
+    /// means no per-table overrides stored — activation falls back to
+    /// `seed_count` scalar. Populated by the Configure step's per-table rows
+    /// inputs (task mqvu). Migration of pre-existing recipes from scalar
+    /// `seed_count` to this map is sibling task gtjj.
+    pub seed_counts: String,
 }
 
 pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -85,6 +91,15 @@ pub fn init_recipe_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             if msg.contains("duplicate column") => {}
         Err(e) => return Err(e),
     }
+    match conn.execute(
+        "ALTER TABLE \"recipes\" ADD COLUMN \"seed_counts\" TEXT NOT NULL DEFAULT '{}'",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column") => {}
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -100,6 +115,7 @@ pub fn create_recipe(
     rules: Option<&str>,
     frozen_rows: Option<&str>,
     custom_lists: Option<&str>,
+    seed_counts: Option<&str>,
 ) -> Result<Recipe, rusqlite::Error> {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let quantity_configs = quantity_configs.unwrap_or("{}");
@@ -107,12 +123,13 @@ pub fn create_recipe(
     let rules = rules.unwrap_or("[]");
     let frozen_rows = frozen_rows.unwrap_or("{}");
     let custom_lists = custom_lists.unwrap_or("{}");
+    let seed_counts = seed_counts.unwrap_or("{}");
     // "shared_pools" column retained for schema back-compat; we write the
     // default empty-object literal so old deployments do not break, but the
     // value is never read back out.
     conn.execute(
-        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\") VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, quantity_configs, faker_rules, rules, frozen_rows, custom_lists],
+        "INSERT INTO \"recipes\" (\"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"shared_pools\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\", \"seed_counts\") VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, created_at, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, seed_counts],
     )?;
     let id = conn.last_insert_rowid();
     Ok(Recipe {
@@ -127,12 +144,13 @@ pub fn create_recipe(
         rules: rules.to_string(),
         frozen_rows: frozen_rows.to_string(),
         custom_lists: custom_lists.to_string(),
+        seed_counts: seed_counts.to_string(),
     })
 }
 
 pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" ORDER BY \"id\"",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\", \"seed_counts\" FROM \"recipes\" ORDER BY \"id\"",
     )?;
     let recipes = stmt
         .query_map([], |row| {
@@ -148,6 +166,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
                 rules: row.get(8)?,
                 frozen_rows: row.get(9)?,
                 custom_lists: row.get(10)?,
+                seed_counts: row.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -156,7 +175,7 @@ pub fn list_recipes(conn: &Connection) -> Result<Vec<Recipe>, rusqlite::Error> {
 
 pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\" FROM \"recipes\" WHERE \"id\" = ?1",
+        "SELECT \"id\", \"name\", \"spec_source\", \"selected_endpoints\", \"seed_count\", \"created_at\", \"quantity_configs\", \"faker_rules\", \"rules\", \"frozen_rows\", \"custom_lists\", \"seed_counts\" FROM \"recipes\" WHERE \"id\" = ?1",
     )?;
     match stmt.query_row([id], |row| {
         Ok(Recipe {
@@ -171,6 +190,7 @@ pub fn get_recipe(conn: &Connection, id: i64) -> Result<Option<Recipe>, rusqlite
             rules: row.get(8)?,
             frozen_rows: row.get(9)?,
             custom_lists: row.get(10)?,
+            seed_counts: row.get(11)?,
         })
     }) {
         Ok(recipe) => Ok(Some(recipe)),
@@ -210,12 +230,13 @@ pub fn update_recipe(
     rules: &str,
     frozen_rows: &str,
     custom_lists: &str,
+    seed_counts: &str,
 ) -> Result<bool, rusqlite::Error> {
     // "shared_pools" column retained for schema back-compat; the column is
     // deliberately not updated here so old rows keep whatever they had.
     let changes = conn.execute(
-        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"quantity_configs\" = ?5, \"faker_rules\" = ?6, \"rules\" = ?7, \"frozen_rows\" = ?8, \"custom_lists\" = ?9 WHERE \"id\" = ?10",
-        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, id],
+        "UPDATE \"recipes\" SET \"name\" = ?1, \"spec_source\" = ?2, \"selected_endpoints\" = ?3, \"seed_count\" = ?4, \"quantity_configs\" = ?5, \"faker_rules\" = ?6, \"rules\" = ?7, \"frozen_rows\" = ?8, \"custom_lists\" = ?9, \"seed_counts\" = ?10 WHERE \"id\" = ?11",
+        rusqlite::params![name, spec_source, selected_endpoints_json, seed_count, quantity_configs, faker_rules, rules, frozen_rows, custom_lists, seed_counts, id],
     )?;
     Ok(changes > 0)
 }
@@ -262,7 +283,10 @@ mod tests {
     }
 
     fn insert_recipe(conn: &Connection, name: &str) {
-        create_recipe(conn, name, "spec", "[]", 10, None, None, None, None, None).unwrap();
+        create_recipe(
+            conn, name, "spec", "[]", 10, None, None, None, None, None, None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -310,5 +334,61 @@ mod tests {
         insert_recipe(&conn, "My Recipe (copy)");
         let name = find_unique_clone_name(&conn, "My Recipe (copy)").unwrap();
         assert_eq!(name, "My Recipe (copy) (copy)");
+    }
+
+    #[test]
+    fn test_seed_counts_roundtrip_create_and_update() {
+        let conn = setup_db();
+        let payload = r#"{"AccessDto":7,"AddressDto":3}"#;
+        let recipe = create_recipe(
+            &conn,
+            "My Recipe",
+            "spec",
+            "[]",
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(payload),
+        )
+        .unwrap();
+        assert_eq!(recipe.seed_counts, payload);
+        let fetched = get_recipe(&conn, recipe.id).unwrap().unwrap();
+        assert_eq!(fetched.seed_counts, payload);
+        let listed = list_recipes(&conn).unwrap();
+        assert_eq!(listed[0].seed_counts, payload);
+
+        let updated_payload = r#"{"AccessDto":12}"#;
+        assert!(update_recipe(
+            &conn,
+            recipe.id,
+            "My Recipe",
+            "spec",
+            "[]",
+            10,
+            "{}",
+            "{}",
+            "[]",
+            "{}",
+            "{}",
+            updated_payload,
+        )
+        .unwrap());
+        let after = get_recipe(&conn, recipe.id).unwrap().unwrap();
+        assert_eq!(after.seed_counts, updated_payload);
+    }
+
+    #[test]
+    fn test_seed_counts_defaults_to_empty_object() {
+        let conn = setup_db();
+        let recipe = create_recipe(
+            &conn, "R", "spec", "[]", 10, None, None, None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(recipe.seed_counts, "{}");
+        let fetched = get_recipe(&conn, recipe.id).unwrap().unwrap();
+        assert_eq!(fetched.seed_counts, "{}");
     }
 }

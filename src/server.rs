@@ -1137,6 +1137,9 @@ struct CreateRecipeRequest {
     rules: Option<serde_json::Value>,
     frozen_rows: Option<serde_json::Value>,
     custom_lists: Option<serde_json::Value>,
+    /// Per-table seed counts map (`{def_name: usize}`). When absent or empty,
+    /// activation falls back to the scalar `seed_count` for every def.
+    seed_counts: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1150,6 +1153,8 @@ struct UpdateRecipeRequest {
     rules: Option<serde_json::Value>,
     frozen_rows: Option<serde_json::Value>,
     custom_lists: Option<serde_json::Value>,
+    /// Per-table seed counts map. See CreateRecipeRequest::seed_counts.
+    seed_counts: Option<serde_json::Value>,
 }
 
 async fn admin_create_recipe(
@@ -1200,6 +1205,10 @@ async fn admin_create_recipe(
         .custom_lists
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let seed_counts_str = body
+        .seed_counts
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules against the spec (resolve refs first so field lookups work)
     if let Some(ref rs) = rules_str
@@ -1225,6 +1234,7 @@ async fn admin_create_recipe(
             rules_str.as_deref(),
             frozen_rows_str.as_deref(),
             custom_lists_str.as_deref(),
+            seed_counts_str.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1357,6 +1367,7 @@ async fn admin_clone_recipe(
         Some(&recipe.rules),
         Some(&recipe.frozen_rows),
         Some(&recipe.custom_lists),
+        Some(&recipe.seed_counts),
     ) {
         Ok(new_recipe) => {
             (StatusCode::CREATED, Json(serde_json::json!(new_recipe))).into_response()
@@ -1423,6 +1434,11 @@ async fn admin_update_recipe(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|| "{}".to_string());
+    let seed_counts_str = body
+        .seed_counts
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
 
     // Validate rules with the same checks as create_recipe.
     if let Err(e) = validate_recipe_rules(&rules_str, &parsed_spec) {
@@ -1446,6 +1462,7 @@ async fn admin_update_recipe(
         &rules_str,
         &frozen_rows_str,
         &custom_lists_str,
+        &seed_counts_str,
     ) {
         Ok(true) => match crate::recipe::get_recipe(&conn, id) {
             Ok(Some(recipe)) => Json(serde_json::json!(recipe)).into_response(),
@@ -1483,6 +1500,8 @@ async fn admin_export_recipe(
                 serde_json::from_str(&recipe.frozen_rows).unwrap_or(serde_json::json!({}));
             let custom_lists: serde_json::Value =
                 serde_json::from_str(&recipe.custom_lists).unwrap_or(serde_json::json!({}));
+            let seed_counts: serde_json::Value =
+                serde_json::from_str(&recipe.seed_counts).unwrap_or(serde_json::json!({}));
 
             let export = serde_json::json!({
                 "mirage_recipe": 2,
@@ -1495,6 +1514,7 @@ async fn admin_export_recipe(
                 "rules": rules,
                 "frozen_rows": frozen_rows,
                 "custom_lists": custom_lists,
+                "seed_counts": seed_counts,
             });
 
             let filename = format!(
@@ -1617,6 +1637,9 @@ async fn admin_import_recipe(
     let custom_lists_str = body
         .get("custom_lists")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
+    let seed_counts_str = body
+        .get("seed_counts")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
 
     // Validate rules from the imported recipe.
     if let Some(ref rs) = rules_str
@@ -1641,6 +1664,7 @@ async fn admin_import_recipe(
         rules_str.as_deref(),
         frozen_rows_str.as_deref(),
         custom_lists_str.as_deref(),
+        seed_counts_str.as_deref(),
     ) {
         Ok(recipe) => (StatusCode::CREATED, Json(serde_json::json!(recipe))).into_response(),
         Err(e) => (
@@ -1791,6 +1815,29 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
     };
 
     let seed_count = recipe.seed_count as usize;
+
+    // Parse per-table seed counts from recipe. Missing/invalid → empty map
+    // (scalar seed_count fallback covers every def). Populated by the
+    // Configure step's per-table rows inputs (task mqvu).
+    let per_def_seed_counts: HashMap<String, usize> =
+        match serde_json::from_str::<HashMap<String, serde_json::Value>>(&recipe.seed_counts) {
+            Ok(raw) => raw
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let n = v
+                        .as_u64()
+                        .or_else(|| v.as_i64().filter(|n| *n >= 0).map(|n| n as u64))?;
+                    Some((k, n as usize))
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to parse seed_counts for recipe {}: {e}",
+                    recipe.id
+                );
+                HashMap::new()
+            }
+        };
 
     // Parse quantity_configs from recipe
     let quantity_configs = crate::composer::parse_quantity_configs(&recipe.quantity_configs);
@@ -1943,19 +1990,30 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
         let topo_order =
             crate::parser::topo_sort_defs(&response_defs, raw_spec.definitions.as_ref());
 
-        // Per-def seed overrides: subtract frozen-row count from the uniform
-        // seed_count for every def carrying frozen rows. Post-composer frozen
-        // re-apply then tops the table back up to seed_count. Without this,
-        // non-composer defs (nested-only types like Address — no direct
-        // endpoint response) would accumulate seed_count + frozen_count rows,
-        // since composer's DELETE only wipes tables it explicitly writes to
-        // (primary response defs). Bug edrs: 2 frozen + 5 seeded + 2 frozen
-        // re-applied = 9 rows instead of max(seed, frozen) = 5.
+        // Per-def seed overrides: starts from `per_def_seed_counts` (task
+        // mqvu — per-table rows input in Configure step). For every
+        // response_def not in the map, falls back to scalar `seed_count`
+        // (back-compat for old recipes; migration sibling gtjj fans out the
+        // scalar onto the map at load time).
+        //
+        // Then, for every def carrying frozen rows, subtracts the frozen
+        // count from its per-def base. Post-composer frozen re-apply tops the
+        // table back up. Without this, non-composer defs (nested-only types
+        // like Address — no direct endpoint response) would accumulate
+        // base + frozen_count rows, since composer's DELETE only wipes tables
+        // it explicitly writes to (primary response defs). Bug edrs: 2 frozen
+        // + 5 seeded + 2 frozen re-applied = 9 rows instead of max = 5.
         let mut seed_overrides: HashMap<String, usize> = HashMap::new();
-        for (def_name, rows) in &frozen {
-            if response_defs.contains(def_name) {
-                seed_overrides.insert(def_name.clone(), seed_count.saturating_sub(rows.len()));
-            } else {
+        for def_name in &response_defs {
+            let base = per_def_seed_counts
+                .get(def_name)
+                .copied()
+                .unwrap_or(seed_count);
+            let frozen_n = frozen.get(def_name).map(|v| v.len()).unwrap_or(0);
+            seed_overrides.insert(def_name.clone(), base.saturating_sub(frozen_n));
+        }
+        for def_name in frozen.keys() {
+            if !response_defs.contains(def_name) {
                 eprintln!("Warning: frozen_rows references unknown table \"{def_name}\", skipping");
             }
         }
@@ -1991,19 +2049,24 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
     // Generate document store using composer
     let entity_graph = crate::entity_graph::build_entity_graph(&raw_spec, &selected_ops);
 
-    // Build quantity configs: use recipe quantity_configs, with seed_count as default.
+    // Build quantity configs: use recipe quantity_configs, with the per-def
+    // seed count (or scalar seed_count fallback) as default.
     // Only populate defaults for response_defs (no meaningless defaults for input-only types).
     //
     // Frozen rows count toward seed quantity (task qslt): subtract the per-def frozen
     // count from the default so the post-composer frozen re-apply doesn't stack on
-    // top. Final per-table row count = max(seed_count, frozen_count).
-    // saturating_sub pins composed count at 0 when frozen_count > seed_count (all
+    // top. Final per-table row count = max(base, frozen_count).
+    // saturating_sub pins composed count at 0 when frozen_count > base (all
     // frozen survive; none composed). Per-def user quantity_configs still win via
     // or_insert (scope-out: quantity-config array semantics).
     let mut effective_quantities = quantity_configs;
     for def_name in &response_defs {
+        let base = per_def_seed_counts
+            .get(def_name)
+            .copied()
+            .unwrap_or(seed_count);
         let frozen_n = frozen.get(def_name).map(|v| v.len()).unwrap_or(0);
-        let default_n = seed_count.saturating_sub(frozen_n);
+        let default_n = base.saturating_sub(frozen_n);
         effective_quantities
             .entry(def_name.clone())
             .or_insert(crate::composer::QuantityConfig {
@@ -3071,6 +3134,162 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 5, "should have 5 seeded rows from recipe");
+    }
+
+    /// Activation with per-table seed_counts map must seed each table to its
+    /// own count; defs absent from the map fall back to scalar seed_count.
+    /// Exercises all the wiring added for task mqvu: CreateRecipeRequest →
+    /// recipes table seed_counts column → activation handler parse → per-def
+    /// overrides passed to seeder.
+    #[tokio::test]
+    async fn test_activate_with_seed_counts_per_table() {
+        let router = setup_empty();
+        let spec_source = std::fs::read_to_string("tests/fixtures/mega.yaml").unwrap();
+
+        // Widget, Gadget, Thing, Owner are all endpoint-bearing defs in mega.yaml
+        // with direct collection GETs (no path param). seed_counts pins Widget=7,
+        // Gadget=3, Thing=2. Owner absent → scalar fallback of 5.
+        let body = serde_json::json!({
+            "name": "mqvu per-table seed counts",
+            "spec_source": spec_source,
+            "endpoints": [
+                {"method": "get", "path": "/widgets"},
+                {"method": "get", "path": "/gadgets"},
+                {"method": "get", "path": "/things"},
+                {"method": "get", "path": "/owners"},
+            ],
+            "seed_count": 5,
+            "seed_counts": {"Widget": 7, "Gadget": 3, "Thing": 2}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(
+            created["seed_counts"],
+            serde_json::json!(r#"{"Gadget":3,"Thing":2,"Widget":7}"#).as_str().unwrap_or_default(),
+            "seed_counts persisted as JSON string — actual: {}",
+            created["seed_counts"]
+        );
+
+        // GET the recipe back — verifies list/get SELECT round-trip.
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let fetched: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let fetched_map: std::collections::HashMap<String, i64> =
+            serde_json::from_str(fetched["seed_counts"].as_str().unwrap()).unwrap();
+        assert_eq!(fetched_map.get("Widget"), Some(&7));
+        assert_eq!(fetched_map.get("Gadget"), Some(&3));
+        assert_eq!(fetched_map.get("Thing"), Some(&2));
+        assert!(!fetched_map.contains_key("Owner"));
+
+        // Activate.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/_api/admin/recipes/{id}/activate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Each endpoint returns exactly the mapped row count; Owner falls
+        // back to scalar seed_count = 5.
+        let cases: &[(&str, usize)] = &[
+            ("/widgets", 7),
+            ("/gadgets", 3),
+            ("/things", 2),
+            ("/owners", 5),
+        ];
+        for (path, expected) in cases {
+            let req = Request::builder().uri(*path).body(Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "GET {path} not OK");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let arr: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                arr.len(),
+                *expected,
+                "GET {path} row count mismatch — per-table seed_counts not honored",
+            );
+        }
+    }
+
+    /// Editing one table's seed count via PUT must not change other tables'
+    /// seed counts. Round-trip through create → update → get with distinct
+    /// per-def entries guards the "independent editing" acceptance criterion
+    /// from the server side.
+    #[tokio::test]
+    async fn test_update_recipe_seed_counts_independent_entries() {
+        let router = setup_empty();
+        let spec_source = std::fs::read_to_string("tests/fixtures/mega.yaml").unwrap();
+
+        // Initial create — two tables set to same value.
+        let body = serde_json::json!({
+            "name": "mqvu independent edit",
+            "spec_source": spec_source.clone(),
+            "endpoints": [
+                {"method": "get", "path": "/widgets"},
+                {"method": "get", "path": "/gadgets"},
+            ],
+            "seed_count": 5,
+            "seed_counts": {"Widget": 5, "Gadget": 5}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_api/admin/recipes")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Edit — bump Widget to 9. Gadget stays 5.
+        let update = serde_json::json!({
+            "name": "mqvu independent edit",
+            "spec_source": spec_source,
+            "endpoints": [
+                {"method": "get", "path": "/widgets"},
+                {"method": "get", "path": "/gadgets"},
+            ],
+            "seed_count": 5,
+            "seed_counts": {"Widget": 9, "Gadget": 5}
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&update).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET and verify Gadget untouched.
+        let req = Request::builder()
+            .uri(format!("/_api/admin/recipes/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let fetched: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let m: std::collections::HashMap<String, i64> =
+            serde_json::from_str(fetched["seed_counts"].as_str().unwrap()).unwrap();
+        assert_eq!(m.get("Widget"), Some(&9), "Widget must bump to 9");
+        assert_eq!(m.get("Gadget"), Some(&5), "Gadget must remain untouched");
     }
 
     /// POST /_api/admin/recipes/reset with no prior activation must return
