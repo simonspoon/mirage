@@ -27,6 +27,13 @@ pub struct VirtualRoot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EndpointEdge {
+    pub endpoint: EndpointInfo,
+    pub target_def: String,
+    pub direction: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityGraph {
     pub nodes: Vec<String>,
     pub roots: HashMap<String, Vec<EndpointInfo>>,
@@ -35,6 +42,7 @@ pub struct EntityGraph {
     pub array_properties: Vec<ArrayPropInfo>,
     pub scalar_properties: Vec<ScalarPropInfo>,
     pub virtual_roots: Vec<VirtualRoot>,
+    pub endpoint_edges: Vec<EndpointEdge>,
 }
 
 /// Extract the root definition name from a schema's $ref (or items.$ref for arrays).
@@ -201,6 +209,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
     let mut all_nodes: HashSet<String> = HashSet::new();
     let mut roots: HashMap<String, Vec<EndpointInfo>> = HashMap::new();
     let mut virtual_roots: Vec<VirtualRoot> = Vec::new();
+    let mut endpoint_edges: Vec<EndpointEdge> = Vec::new();
 
     for (path, method) in selected {
         let path_item = match spec.paths.get(path.as_str()) {
@@ -249,6 +258,18 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
             }
         }
         if let Some(name) = response_root {
+            if let Some(defs) = spec_defs
+                && defs.contains_key(&name)
+            {
+                endpoint_edges.push(EndpointEdge {
+                    endpoint: EndpointInfo {
+                        method: method.clone(),
+                        path: path.clone(),
+                    },
+                    target_def: name.clone(),
+                    direction: "output".to_string(),
+                });
+            }
             endpoint_roots.push(name);
         }
 
@@ -259,9 +280,25 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
                 if param.r#in == "body"
                     && let Some(schema) = &param.schema
                     && let Some(name) = root_def_name(schema, None)
-                    && !endpoint_roots.contains(&name)
                 {
-                    endpoint_roots.push(name);
+                    // Input edge emission is independent of the
+                    // endpoint_roots dedup — POST /pet with Pet body AND
+                    // Pet response must yield both input and output edges.
+                    if let Some(defs) = spec_defs
+                        && defs.contains_key(&name)
+                    {
+                        endpoint_edges.push(EndpointEdge {
+                            endpoint: EndpointInfo {
+                                method: method.clone(),
+                                path: path.clone(),
+                            },
+                            target_def: name.clone(),
+                            direction: "input".to_string(),
+                        });
+                    }
+                    if !endpoint_roots.contains(&name) {
+                        endpoint_roots.push(name);
+                    }
                 }
             }
         }
@@ -312,6 +349,8 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
     let ext_only = parser::extension_only_roots(spec);
     all_nodes.retain(|n| !ext_only.contains(n));
     roots.retain(|k, _| !ext_only.contains(k));
+    endpoint_edges.retain(|e| !ext_only.contains(&e.target_def));
+    endpoint_edges.retain(|e| all_nodes.contains(&e.target_def));
 
     // Build edges for each node
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
@@ -364,6 +403,22 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         (&a.endpoint.path, &a.endpoint.method).cmp(&(&b.endpoint.path, &b.endpoint.method))
     });
 
+    // Sort endpoint_edges by (path, method, direction, target_def) for determinism
+    endpoint_edges.sort_by(|a, b| {
+        (
+            &a.endpoint.path,
+            &a.endpoint.method,
+            &a.direction,
+            &a.target_def,
+        )
+            .cmp(&(
+                &b.endpoint.path,
+                &b.endpoint.method,
+                &b.direction,
+                &b.target_def,
+            ))
+    });
+
     EntityGraph {
         nodes,
         roots,
@@ -372,6 +427,7 @@ pub fn build_entity_graph(spec: &SwaggerSpec, selected: &[(String, String)]) -> 
         array_properties,
         scalar_properties,
         virtual_roots,
+        endpoint_edges,
     }
 }
 
@@ -441,6 +497,7 @@ mod tests {
         assert!(graph.shared_entities.is_empty());
         assert!(graph.array_properties.is_empty());
         assert!(graph.virtual_roots.is_empty());
+        assert!(graph.endpoint_edges.is_empty());
     }
 
     #[test]
@@ -753,5 +810,358 @@ paths:
             root_def_name(&schema, Some(&defs)),
             Some("CatalogPage".to_string())
         );
+    }
+
+    // --- endpoint_edges: directed endpoint→schema edges ---
+
+    #[test]
+    fn test_endpoint_edges_output_only_get_pet() {
+        let spec = load_petstore();
+        let selected = vec![("/pet/{petId}".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        let e = &graph.endpoint_edges[0];
+        assert_eq!(e.target_def, "Pet");
+        assert_eq!(e.direction, "output");
+        assert_eq!(e.endpoint.method, "get");
+        assert_eq!(e.endpoint.path, "/pet/{petId}");
+    }
+
+    #[test]
+    fn test_endpoint_edges_input_and_output_post_pet() {
+        let spec = load_petstore();
+        let selected = vec![("/pet".to_string(), "post".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 2);
+        assert!(graph.endpoint_edges.iter().any(|e| e.target_def == "Pet"
+            && e.direction == "input"
+            && e.endpoint.method == "post"
+            && e.endpoint.path == "/pet"));
+        assert!(graph.endpoint_edges.iter().any(|e| e.target_def == "Pet"
+            && e.direction == "output"
+            && e.endpoint.method == "post"
+            && e.endpoint.path == "/pet"));
+    }
+
+    #[test]
+    fn test_endpoint_edges_no_ref_endpoint_absent() {
+        let spec = load_petstore();
+        let selected = vec![("/pet/{petId}".to_string(), "delete".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(graph.endpoint_edges.is_empty());
+        assert!(graph.virtual_roots.is_empty());
+    }
+
+    #[test]
+    fn test_endpoint_edges_merged_get_and_post() {
+        let spec = load_petstore();
+        let selected = vec![
+            ("/pet/{petId}".to_string(), "get".to_string()),
+            ("/pet".to_string(), "post".to_string()),
+        ];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 3);
+        let out_count = graph
+            .endpoint_edges
+            .iter()
+            .filter(|e| e.direction == "output")
+            .count();
+        let in_count = graph
+            .endpoint_edges
+            .iter()
+            .filter(|e| e.direction == "input")
+            .count();
+        assert_eq!(out_count, 2);
+        assert_eq!(in_count, 1);
+        // regression guard: Pet remains root from both endpoints
+        let pet_roots = graph.roots.get("Pet").unwrap();
+        assert_eq!(pet_roots.len(), 2);
+    }
+
+    #[test]
+    fn test_endpoint_edges_virtual_root_endpoint_absent() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Array Test
+  version: "1.0"
+paths:
+  /numbers:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: array
+            items:
+              type: integer
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/numbers".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(graph.endpoint_edges.is_empty());
+        assert_eq!(graph.virtual_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_endpoint_edges_primary_2xx_selection_200_wins_over_201() {
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: Multi2xx
+  version: "1.0"
+paths:
+  /thing:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/AlphaResp"
+        "201":
+          description: created
+          schema:
+            $ref: "#/definitions/BetaResp"
+definitions:
+  AlphaResp:
+    type: object
+    properties:
+      id:
+        type: integer
+  BetaResp:
+    type: object
+    properties:
+      id:
+        type: integer
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/thing".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        assert_eq!(graph.endpoint_edges[0].target_def, "AlphaResp");
+        assert_eq!(graph.endpoint_edges[0].direction, "output");
+    }
+
+    #[test]
+    fn test_endpoint_edges_primary_2xx_falls_back_to_201() {
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: Only201
+  version: "1.0"
+paths:
+  /thing:
+    post:
+      responses:
+        "201":
+          description: created
+          schema:
+            $ref: "#/definitions/BetaResp"
+definitions:
+  BetaResp:
+    type: object
+    properties:
+      id:
+        type: integer
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/thing".to_string(), "post".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        assert_eq!(graph.endpoint_edges[0].target_def, "BetaResp");
+    }
+
+    #[test]
+    fn test_endpoint_edges_primary_2xx_falls_back_to_first_2xx() {
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: Only2xx
+  version: "1.0"
+paths:
+  /thing:
+    post:
+      responses:
+        "202":
+          description: accepted
+          schema:
+            $ref: "#/definitions/GammaResp"
+        "204":
+          description: no content
+definitions:
+  GammaResp:
+    type: object
+    properties:
+      id:
+        type: integer
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/thing".to_string(), "post".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        assert_eq!(graph.endpoint_edges[0].target_def, "GammaResp");
+    }
+
+    #[test]
+    fn test_endpoint_edges_non_definition_response_absent() {
+        let yaml = r#"
+swagger: "2.0"
+info:
+  title: Primitive
+  version: "1.0"
+paths:
+  /name:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+"#;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/name".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(graph.endpoint_edges.is_empty());
+        assert_eq!(graph.virtual_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_endpoint_edges_extension_only_target_filtered() {
+        // Base is used only as allOf ref → extension-only root.
+        // Endpoint response $ref points at Base, so the edge target falls
+        // into ext_only and must be filtered.
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: ExtOnly
+  version: "1.0"
+paths:
+  /base:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/Base"
+definitions:
+  Base:
+    type: object
+    properties:
+      id:
+        type: integer
+  Child:
+    allOf:
+      - $ref: "#/definitions/Base"
+      - type: object
+        properties:
+          extra:
+            type: string
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let ext_only = parser::extension_only_roots(&spec);
+        let selected = vec![("/base".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(
+            graph
+                .endpoint_edges
+                .iter()
+                .all(|e| !ext_only.contains(&e.target_def))
+        );
+    }
+
+    #[test]
+    fn test_endpoint_edges_shape_b_unwraps_to_element() {
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: ShapeB
+  version: "1.0"
+paths:
+  /catalog:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/CatalogPage"
+definitions:
+  CatalogPage:
+    type: array
+    items:
+      $ref: "#/definitions/CatalogItem"
+  CatalogItem:
+    type: object
+    properties:
+      id:
+        type: integer
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/catalog".to_string(), "get".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        assert_eq!(graph.endpoint_edges[0].target_def, "CatalogItem");
+        assert_eq!(graph.endpoint_edges[0].direction, "output");
+    }
+
+    #[test]
+    fn test_endpoint_edges_body_param_no_shape_b_unwrap() {
+        let yaml = r##"
+swagger: "2.0"
+info:
+  title: BodyWrapper
+  version: "1.0"
+paths:
+  /items:
+    post:
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/CreateReq"
+      responses:
+        "200":
+          description: ok
+definitions:
+  CreateReq:
+    type: array
+    items:
+      $ref: "#/definitions/Item"
+  Item:
+    type: object
+    properties:
+      id:
+        type: integer
+"##;
+        let spec: SwaggerSpec = serde_yaml::from_str(yaml).unwrap();
+        let selected = vec![("/items".to_string(), "post".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        assert_eq!(graph.endpoint_edges.len(), 1);
+        assert_eq!(graph.endpoint_edges[0].target_def, "CreateReq");
+        assert_eq!(graph.endpoint_edges[0].direction, "input");
+    }
+
+    #[test]
+    fn test_endpoint_edges_empty_selection() {
+        let spec = load_petstore();
+        let selected: Vec<(String, String)> = vec![];
+        let graph = build_entity_graph(&spec, &selected);
+        assert!(graph.endpoint_edges.is_empty());
+    }
+
+    #[test]
+    fn test_entity_graph_endpoint_edges_serde_roundtrip() {
+        let spec = load_petstore();
+        let selected = vec![("/pet".to_string(), "post".to_string())];
+        let graph = build_entity_graph(&spec, &selected);
+        let v = serde_json::to_value(&graph).unwrap();
+        assert!(v["endpoint_edges"].is_array());
+        let arr = v["endpoint_edges"].as_array().unwrap();
+        assert!(!arr.is_empty());
+        for el in arr {
+            assert!(el.get("endpoint").is_some());
+            assert!(el.get("target_def").is_some());
+            assert!(el.get("direction").is_some());
+        }
     }
 }

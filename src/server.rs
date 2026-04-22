@@ -1729,9 +1729,7 @@ fn reapply_frozen_rows(
                     col_values.join(", ")
                 );
                 if let Err(e) = conn.execute(&sql, []) {
-                    eprintln!(
-                        "Warning: failed to re-insert frozen row into \"{table_name}\": {e}"
-                    );
+                    eprintln!("Warning: failed to re-insert frozen row into \"{table_name}\": {e}");
                 }
             }
         }
@@ -1958,9 +1956,7 @@ async fn admin_run_activate(state: AppState, id: i64) -> Response {
             if response_defs.contains(def_name) {
                 seed_overrides.insert(def_name.clone(), seed_count.saturating_sub(rows.len()));
             } else {
-                eprintln!(
-                    "Warning: frozen_rows references unknown table \"{def_name}\", skipping"
-                );
+                eprintln!("Warning: frozen_rows references unknown table \"{def_name}\", skipping");
             }
         }
 
