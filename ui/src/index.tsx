@@ -270,6 +270,7 @@ function App() {
   const [schemaGraph, setSchemaGraph] = createSignal<any>(null);
   const [schemaGraphGroupBy, setSchemaGraphGroupBy] = createSignal<"alpha" | "endpoint">("alpha");
   const [schemaGraphHopDepth, setSchemaGraphHopDepth] = createSignal(1);
+  const [endpointLayerOn, setEndpointLayerOn] = createSignal<boolean>(false);
 
   // Progressive exploration graph state
   const [graphFocused, setGraphFocused] = createSignal<string | null>(null);
@@ -1800,6 +1801,8 @@ function App() {
               setSchemaGraphGroupBy={setSchemaGraphGroupBy}
               schemaGraphHopDepth={schemaGraphHopDepth}
               setSchemaGraphHopDepth={setSchemaGraphHopDepth}
+              endpointLayerOn={endpointLayerOn}
+              setEndpointLayerOn={setEndpointLayerOn}
               expandedDefs={expandedDefs}
               toggleDef={toggleDef}
               selectEntity={selectEntity}
@@ -2320,6 +2323,8 @@ function SchemasPage(props: {
   setSchemaGraphGroupBy: Setter<"alpha" | "endpoint">;
   schemaGraphHopDepth: Accessor<number>;
   setSchemaGraphHopDepth: Setter<number>;
+  endpointLayerOn: Accessor<boolean>;
+  setEndpointLayerOn: Setter<boolean>;
   expandedDefs: Accessor<Set<string>>;
   toggleDef: (name: string) => void;
   selectEntity: (name: string) => void;
@@ -2512,6 +2517,10 @@ function SchemasPage(props: {
                     class={`px-2.5 py-1 text-xs rounded-md transition-colors ${props.schemaGraphGroupBy() === "endpoint" ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
                     onClick={() => props.setSchemaGraphGroupBy("endpoint")}
                   >By endpoint</button>
+                  <button
+                    class={`px-2.5 py-1 text-xs rounded-md transition-colors ml-2 ${props.endpointLayerOn() ? "bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/30" : "text-gray-400 hover:text-gray-200"}`}
+                    onClick={() => props.setEndpointLayerOn((v) => !v)}
+                  >Endpoints</button>
                   <Show when={props.emptyTableNames().size > 0}>
                     <button
                       class={`px-2.5 py-1 text-xs rounded-md transition-colors ml-auto ${
