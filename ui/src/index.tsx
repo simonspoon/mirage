@@ -701,6 +701,26 @@ function App() {
       setRecipeFakerRules(rules);
     }
 
+    // Fan out recipeSeedCount() onto every response def when seed_counts map
+    // is empty (task gtjj migration). Handles two cases:
+    //   1. Fresh recipe: recipeSeedCount()=10 → { defA:10, defB:10, ... }
+    //   2. Pre-change recipe (old global seed_count, empty seed_counts): old
+    //      scalar value fans out onto every def so per-table inputs show it
+    //      and saving persists the materialized map.
+    // Skipped when map already has entries (edit-mode tab-switch or user
+    // already edited some defs) — preserves prior per-def values.
+    if (Object.keys(recipeSeedCounts()).length === 0) {
+      const defs = new Set<string>();
+      for (const sp of graph.scalar_properties || []) defs.add(sp.def_name);
+      for (const ap of graph.array_properties || []) defs.add(ap.def_name);
+      if (defs.size > 0) {
+        const base = recipeSeedCount();
+        const counts: Record<string, number> = {};
+        for (const def of defs) counts[def] = base;
+        setRecipeSeedCounts(counts);
+      }
+    }
+
     setRecipeStep("config");
   };
 
