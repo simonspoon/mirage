@@ -17,11 +17,19 @@ import {
 import { computeDagrePositions } from "./dagreLayout";
 
 export type EdgeStyle = { stroke: string; dasharray: string | undefined };
+export type EdgeRefKind =
+  | "ref"
+  | "items"
+  | "extends"
+  | "endpoint-input"
+  | "endpoint-output";
 export const EDGE_STYLE = {
-  extends: { stroke: "#a78bfa", dasharray: "4,3" },
-  ref:     { stroke: "#4b5563", dasharray: undefined },
-  items:   { stroke: "#4b5563", dasharray: undefined },
-} satisfies Record<"ref" | "items" | "extends", EdgeStyle>;
+  extends:           { stroke: "#a78bfa", dasharray: "4,3" },
+  ref:               { stroke: "#4b5563", dasharray: undefined },
+  items:             { stroke: "#4b5563", dasharray: undefined },
+  "endpoint-input":  { stroke: "#34d399", dasharray: "2,3" },
+  "endpoint-output": { stroke: "#f59e0b", dasharray: undefined },
+} satisfies Record<EdgeRefKind, EdgeStyle>;
 
 // Pure fit-to-viewport transform. Takes plain snapshot positions +
 // per-node width/height function refs + scalar viewport. No reactive
@@ -3286,7 +3294,7 @@ function SchemasPage(props: {
                       hasExtends: boolean;
                       required: boolean;
                       typeLabel: string;
-                      refKind: "ref" | "items" | "extends";
+                      refKind: EdgeRefKind;
                     }
 
                     // Compute edges between visible entities
@@ -3347,22 +3355,87 @@ function SchemasPage(props: {
                         }
                       }
 
+                      // Endpoint-touching edges (layer ON). Each endpoint_edges
+                      // entry carries direction='input'|'output'. INPUT =
+                      // endpoint -> schema (request body ingests def). OUTPUT
+                      // = schema -> endpoint (response emits def). Edge id
+                      // includes direction so input+output between same
+                      // (endpoint, def) pair yield distinct dedup keys
+                      // (pseudo-node dedup in appendEndpointPseudoNodes merges
+                      // by (method,path) only — edge id collision would drop
+                      // one direction silently). Both endpoints must be in
+                      // visibleSet; the ep:: pseudo-node is appended in
+                      // appendEndpointPseudoNodes only when target_def is in
+                      // baseList, so presence in visibleSet is the invariant.
+                      if (props.endpointLayerOn()) {
+                        for (const e of endpointEdges()) {
+                          const epKey = `${ENDPOINT_KEY_PREFIX}${e.endpoint.method}::${e.endpoint.path}`;
+                          const defName = e.target_def;
+                          if (!visibleSet.has(epKey)) continue;
+                          if (!visibleSet.has(defName)) continue;
+                          let source: string;
+                          let target: string;
+                          let refKind: EdgeRefKind;
+                          if (e.direction === "input") {
+                            source = epKey;
+                            target = defName;
+                            refKind = "endpoint-input";
+                          } else if (e.direction === "output") {
+                            source = defName;
+                            target = epKey;
+                            refKind = "endpoint-output";
+                          } else {
+                            continue; // runtime safety — unknown direction
+                          }
+                          edgeList.push({
+                            id: `${epKey}::${e.direction}::${defName}`,
+                            source,
+                            sourceField: "",
+                            sourceFieldIndex: 0,
+                            target,
+                            cardinality: "1:1",
+                            hasExtends: false,
+                            required: false,
+                            typeLabel: e.direction === "input"
+                              ? `${e.endpoint.method.toUpperCase()} ${e.endpoint.path} -> ${defName}`
+                              : `${defName} -> ${e.endpoint.method.toUpperCase()} ${e.endpoint.path}`,
+                            refKind,
+                          });
+                        }
+                      }
+
                       return edgeList;
                     });
 
                     // Compute layout: positions + SVG dimensions. Dagre-backed
                     // ER-style layout — DagPositions shape keeps the orthogonal
                     // edge router and fit-to-viewport engine-agnostic.
-                    const dagLayout = createMemo(() =>
-                      computeDagrePositions(
+                    const dagLayout = createMemo(() => {
+                      // GraphEdge.refKind in dagLayout.ts is
+                      // 'extends'|'ref'|'items' — dagre's extends-inversion
+                      // branch keys strictly on === 'extends'. Map
+                      // endpoint-input/output → 'ref' at the boundary so
+                      // dagre treats them as plain directed edges and no
+                      // inversion fires. EdgeInfo.refKind is preserved on
+                      // the original edges array (render branch reads it).
+                      const layoutEdges = graphEdges().map((e) => ({
+                        id: e.id,
+                        source: e.source,
+                        target: e.target,
+                        refKind: (e.refKind === "extends" ? "extends" : "ref") as
+                          | "extends"
+                          | "ref"
+                          | "items",
+                      }));
+                      return computeDagrePositions(
                         visibleList(),
-                        graphEdges(),
+                        layoutEdges,
                         props.definitions(),
                         stubSet(),
                         bandGap,
                         { widthOf },
-                      ),
-                    );
+                      );
+                    });
 
                     const entityPositions = createMemo(() => dagLayout().positions);
                     const svgWidth = () => dagLayout().width;
@@ -3377,6 +3450,14 @@ function SchemasPage(props: {
                       for (const name of visibleList()) {
                         const p = pos[name];
                         if (!p) continue;
+                        if (name.startsWith(ENDPOINT_KEY_PREFIX)) {
+                          // Endpoint pseudo-node: single-row pill, fixed
+                          // HEADER_HEIGHT. Including it here lets the edge
+                          // router treat ep:: nodes as obstructions and the
+                          // cardinality-clamp helper keep labels in bounds.
+                          rects[name] = { x: p.x, y: p.y, w: widthOf(name), h: HEADER_HEIGHT };
+                          continue;
+                        }
                         const def = defs[name];
                         let h = HEADER_HEIGHT;
                         if (def && !stubs.has(name)) {
@@ -3788,6 +3869,16 @@ function SchemasPage(props: {
                               <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={EDGE_STYLE.ref.stroke} stroke-dasharray={EDGE_STYLE.ref.dasharray} stroke-width="1" /></svg>
                               property ref
                             </span>
+                            <Show when={props.endpointLayerOn()}>
+                              <span class="flex items-center gap-1">
+                                <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={EDGE_STYLE["endpoint-input"].stroke} stroke-dasharray={EDGE_STYLE["endpoint-input"].dasharray} stroke-width="1" /></svg>
+                                endpoint input
+                              </span>
+                              <span class="flex items-center gap-1">
+                                <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={EDGE_STYLE["endpoint-output"].stroke} stroke-dasharray={EDGE_STYLE["endpoint-output"].dasharray} stroke-width="1" /></svg>
+                                endpoint output
+                              </span>
+                            </Show>
                           </div>
                           <div class="flex items-center gap-1">
                             <button
@@ -3819,6 +3910,16 @@ function SchemasPage(props: {
                           <g data-relationship-edges>
                             <For each={graphEdges()}>
                               {(edge) => {
+                                // Endpoint edges touch an ep:: pseudo-node on
+                                // one side (input: source=ep, output:
+                                // target=ep). The pseudo-node has no def, no
+                                // property rows, and no sourceField — so row-
+                                // index math + def.properties lookups return
+                                // garbage or crash. Gate every helper that
+                                // reads row-indexed Y or sourceField on this
+                                // flag and return ep:: specific strings /
+                                // header-center Y.
+                                const isEndpointEdge = edge.refKind.startsWith("endpoint-");
                                 // Use reactive getters so SolidJS tracks stubSet()/entityPositions() as dependencies
                                 const sourcePos = () => entityPositions()[edge.source];
                                 const targetPos = () => entityPositions()[edge.target];
@@ -3827,6 +3928,17 @@ function SchemasPage(props: {
                                 const sy = () => {
                                   const pos = sourcePos();
                                   if (!pos) return 0;
+                                  // Endpoint pseudo-node source (endpoint-input
+                                  // direction) OR endpoint-output from def
+                                  // source: in both cases, source row-index
+                                  // math is meaningless for the ep:: side.
+                                  // For endpoint-input (source=ep::), anchor
+                                  // on ep:: header center. For endpoint-output
+                                  // (source=def), also anchor on def header
+                                  // center — no single "source field" exists.
+                                  if (isEndpointEdge) {
+                                    return pos.y + HEADER_HEIGHT / 2;
+                                  }
                                   if (stubSet().has(edge.source)) {
                                     return pos.y + HEADER_HEIGHT / 2;
                                   }
@@ -3843,6 +3955,9 @@ function SchemasPage(props: {
                                 const ty = () => {
                                   const pos = targetPos();
                                   if (!pos) return 0;
+                                  if (isEndpointEdge) {
+                                    return pos.y + HEADER_HEIGHT / 2;
+                                  }
                                   if (stubSet().has(edge.target)) {
                                     return pos.y + HEADER_HEIGHT / 2;
                                   }
@@ -4044,7 +4159,7 @@ function SchemasPage(props: {
                                 };
 
                                 const routeInfo =
-                                  edge.refKind === "extends"
+                                  edge.refKind === "extends" || isEndpointEdge
                                     ? undefined
                                     : createMemo(route);
                                 // Build an SVG path `d` directly from a dagre polyline:
@@ -4071,6 +4186,18 @@ function SchemasPage(props: {
                                     // from source row to parent header.
                                     const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
                                     return `M ${_sx} ${_sy} V ${_ty} H ${_tx}`;
+                                  }
+                                  if (isEndpointEdge) {
+                                    // Endpoint edges: use dagre polyline so
+                                    // path + arrow-tangent agree. Elbow router
+                                    // would diverge from dagre pts[last] and
+                                    // misalign the arrowhead. Fallback to a
+                                    // direct line when dagre omits points
+                                    // (shouldn't happen for kept edges).
+                                    const pts = dagrePoints();
+                                    if (pts) return polylinePath(pts);
+                                    const _sx = sx(), _sy = sy(), _tx = tx(), _ty = ty();
+                                    return `M ${_sx} ${_sy} L ${_tx} ${_ty}`;
                                   }
                                   return routeInfo?.().d ?? "";
                                 };
@@ -4123,20 +4250,56 @@ function SchemasPage(props: {
                                 const focalConnected = () => isFocalConnected(edge);
                                 const showLabel = () => isHovered() || focalConnected();
 
-                                // Midpoint label text: "extends" for extends edges, else source field name.
-                                const labelText = () =>
-                                  edge.refKind === "extends" ? "extends" : edge.sourceField;
+                                // Endpoint-edge pretty string — parse ep::
+                                // source or target into METHOD path. Used for
+                                // tooltip/label text so ep::get::/users renders
+                                // as "GET /users". Returns null when name is
+                                // not an endpoint key (defensive).
+                                const prettyEp = (name: string): string | null => {
+                                  const parsed = parseEndpointKey(name);
+                                  if (!parsed) return null;
+                                  return `${parsed.method.toUpperCase()} ${parsed.path}`;
+                                };
+                                // Midpoint label text: "extends" for extends edges,
+                                // direction ('input'/'output') for endpoint edges,
+                                // else source field name.
+                                const labelText = () => {
+                                  if (edge.refKind === "endpoint-input") return "input";
+                                  if (edge.refKind === "endpoint-output") return "output";
+                                  return edge.refKind === "extends" ? "extends" : edge.sourceField;
+                                };
 
-                                // Hover two-line content. line1 = 'extends' for extends edges (def.properties['extends']
-                                // does not exist, so use pseudo-key), else 'source.field'. line2 = '-> target'.
-                                const hoverLine1 = () =>
-                                  edge.refKind === "extends"
+                                // Hover two-line content. Endpoint edges: line1
+                                // = METHOD path, line2 = '-> target' pretty
+                                // (def name or pretty endpoint). Extends: line1
+                                // = 'extends'. Else: line1 = 'source.field'.
+                                const hoverLine1 = () => {
+                                  if (isEndpointEdge) {
+                                    return prettyEp(edge.source) ?? edge.source;
+                                  }
+                                  return edge.refKind === "extends"
                                     ? "extends"
                                     : `${edge.source}.${edge.sourceField}`;
-                                const hoverLine2 = () => `-> ${edge.target}`;
+                                };
+                                const hoverLine2 = () => {
+                                  if (isEndpointEdge) {
+                                    return `-> ${prettyEp(edge.target) ?? edge.target}`;
+                                  }
+                                  return `-> ${edge.target}`;
+                                };
 
-                                // Native SVG <title> content: "source.field -> target\ntype\nrequired: yes|no"
+                                // Native SVG <title> content: endpoint edges
+                                // describe direction + method+path + def. Avoid
+                                // any def.properties or sourceField read on the
+                                // ep:: side (no such thing).
                                 const tooltipText = () => {
+                                  if (isEndpointEdge) {
+                                    const dir = edge.refKind === "endpoint-input" ? "input" : "output";
+                                    const epStr = prettyEp(edge.source) ?? prettyEp(edge.target) ?? "";
+                                    const defName = edge.refKind === "endpoint-input" ? edge.target : edge.source;
+                                    const head = `${epStr} (${dir}) -> ${defName}`;
+                                    return `${head}\n${edge.typeLabel}`;
+                                  }
                                   const head = edge.refKind === "extends"
                                     ? `${edge.source} extends ${edge.target}`
                                     : `${edge.source}.${edge.sourceField} -> ${edge.target}`;
@@ -4188,36 +4351,85 @@ function SchemasPage(props: {
                                         data-target-entity={edge.target}
                                         data-cardinality={edge.cardinality}
                                         data-edge-id={edge.id}
+                                        data-edge-refkind={edge.refKind}
+                                        data-edge-direction={
+                                          edge.refKind === "endpoint-input"
+                                            ? "input"
+                                            : edge.refKind === "endpoint-output"
+                                              ? "output"
+                                              : undefined
+                                        }
                                         onMouseEnter={() => setHoveredEdgeId(edge.id)}
                                         onMouseLeave={() => setHoveredEdgeId(null)}
                                       />
-                                      {/* Cardinality label near source */}
-                                      <text
-                                        x={srcCardX()}
-                                        y={srcCardY()}
-                                        fill={isHovered() ? "#93c5fd" : "#6b7280"}
-                                        font-size="10"
-                                        font-family="ui-monospace, monospace"
-                                      >1</text>
-                                      {/* Cardinality label near target */}
-                                      <text
-                                        x={tgtCardX()}
-                                        y={tgtCardY()}
-                                        fill={isHovered() ? "#93c5fd" : "#6b7280"}
-                                        font-size="10"
-                                        font-family="ui-monospace, monospace"
-                                        text-anchor="end"
-                                      >{edge.cardinality === "1:N" ? "N" : "1"}</text>
+                                      {/* Cardinality label — suppressed for
+                                          endpoint edges ('1'/'N' meaningless
+                                          for ep:: endpoints). Property-ref +
+                                          extends edges render the 1 + (1|N)
+                                          pair as before. */}
+                                      <Show when={!isEndpointEdge}>
+                                        <text
+                                          x={srcCardX()}
+                                          y={srcCardY()}
+                                          fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                          font-size="10"
+                                          font-family="ui-monospace, monospace"
+                                        >1</text>
+                                        <text
+                                          x={tgtCardX()}
+                                          y={tgtCardY()}
+                                          fill={isHovered() ? "#93c5fd" : "#6b7280"}
+                                          font-size="10"
+                                          font-family="ui-monospace, monospace"
+                                          text-anchor="end"
+                                        >{edge.cardinality === "1:N" ? "N" : "1"}</text>
+                                      </Show>
                                       {/* Arrow marker at target end.
                                           Property-ref edges: rightward triangle (source is
                                           on left, target on right). Extends edges: upward
                                           triangle so arrow points from child UP to parent
-                                          (TB layout with parent above child). Tip anchored
-                                          on dagre polyline endpoint when available to hug
-                                          the real connection point, else on target coord. */}
+                                          (TB layout with parent above child). Endpoint
+                                          edges: orientation derived from the final dagre
+                                          polyline segment (pts[last] - pts[last-1]) so the
+                                          triangle points along the actual incoming segment
+                                          regardless of whether the ep:: node lays out above,
+                                          below, left, or right of the schema (simaris
+                                          019d930d). Fill binds to style.stroke so arrow
+                                          color tracks the edge variant (simaris 019da14e-b1b9). */}
                                       <polygon
                                         points={(() => {
                                           const pts = dagrePoints();
+                                          if (isEndpointEdge && pts && pts.length >= 2) {
+                                            // Derive orientation from final
+                                            // segment tangent. Fallback to a
+                                            // rightward triangle on degenerate
+                                            // zero-length final segment.
+                                            const last = pts[pts.length - 1];
+                                            const prev = pts[pts.length - 2];
+                                            const dx = last.x - prev.x;
+                                            const dy = last.y - prev.y;
+                                            const mag = Math.hypot(dx, dy);
+                                            const size = 6;
+                                            if (mag === 0) {
+                                              const ax = last.x;
+                                              const ay = last.y;
+                                              return `${ax},${ay} ${ax - size},${ay - 3} ${ax - size},${ay + 3}`;
+                                            }
+                                            const ux = dx / mag;
+                                            const uy = dy / mag;
+                                            // Perpendicular unit vector for
+                                            // base-of-triangle offset.
+                                            const px = -uy;
+                                            const py = ux;
+                                            const baseX = last.x - ux * size;
+                                            const baseY = last.y - uy * size;
+                                            const halfBase = 3;
+                                            const leftX = baseX + px * halfBase;
+                                            const leftY = baseY + py * halfBase;
+                                            const rightX = baseX - px * halfBase;
+                                            const rightY = baseY - py * halfBase;
+                                            return `${last.x},${last.y} ${leftX},${leftY} ${rightX},${rightY}`;
+                                          }
                                           if (edge.refKind === "extends") {
                                             const endX = pts ? pts[pts.length - 1].x : tx();
                                             const endY = pts ? pts[pts.length - 1].y : ty();
@@ -4228,6 +4440,13 @@ function SchemasPage(props: {
                                           return `${ax},${ay} ${ax - 6},${ay - 3} ${ax - 6},${ay + 3}`;
                                         })()}
                                         fill={isHovered() ? "#60a5fa" : style.stroke}
+                                        data-edge-direction={
+                                          edge.refKind === "endpoint-input"
+                                            ? "input"
+                                            : edge.refKind === "endpoint-output"
+                                              ? "output"
+                                              : undefined
+                                        }
                                       />
                                       {/* Midpoint field-name label (focal-connected edges always; non-focal edges only on hover).
                                           Hover expands to two lines: source.field (or 'extends') + '-> target'. */}
