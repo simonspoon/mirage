@@ -2023,7 +2023,7 @@ function App() {
                 />
               </Show>
 
-              {/* Step 5: Name + seed count + save & activate */}
+              {/* Step 5: Name + save & activate */}
               <Show when={recipeStep() === "name"}>
                 <div class="space-y-4">
                   <div>
@@ -2034,17 +2034,6 @@ function App() {
                       onInput={(e) => setRecipeName(e.currentTarget.value)}
                       placeholder="e.g., Petstore Dev"
                       class="w-full bg-[#070c17] border border-gray-800 rounded-lg px-4 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-gray-700 focus:ring-1 focus:ring-gray-700 transition-colors"
-                    />
-                  </div>
-                  <div>
-                    <label class="block text-sm text-gray-400 mb-1.5">Seed rows per table</label>
-                    <input
-                      type="number"
-                      value={recipeSeedCount()}
-                      min={1}
-                      max={100}
-                      onInput={(e) => setRecipeSeedCount(parseInt(e.currentTarget.value) || 1)}
-                      class="w-24 bg-[#070c17] border border-gray-800 rounded-md px-2.5 py-2 text-sm text-gray-100 focus:outline-none focus:border-gray-700"
                     />
                   </div>
 
