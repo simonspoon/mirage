@@ -552,3 +552,64 @@ export function bucketHiddenByBand(
   }
   return buckets;
 }
+
+// Endpoint pseudo-node key prefix. Schemas in real specs cannot collide with
+// "ep::" because schema names follow Swagger identifier rules (letters,
+// digits, _ and . only — no colons). Lowercase method matches backend
+// EndpointEdge.method casing (entity_graph.rs ~264).
+export const ENDPOINT_KEY_PREFIX = "ep::";
+
+export interface EndpointEdgeLike {
+  endpoint: { method: string; path: string };
+  target_def: string;
+  direction?: string;
+}
+
+/**
+ * Append endpoint pseudo-nodes to a visible-defs list when the endpoint
+ * layer is on. Pure: no Solid signals, no DOM. Both empty-state hub and
+ * focused-graph variants share this so the keying / dedup logic stays
+ * single-source.
+ *
+ * - layerOn === false → returns baseList UNCHANGED (byte-identical OFF
+ *   path; downstream layout/render see no ep:: keys, no jitter risk).
+ * - Includes an endpoint only when at least one of its edges targets a
+ *   def already present in baseList (acceptance: hide endpoints whose
+ *   linked schemas aren't on screen).
+ * - Dedupes via Set keyed `ep::${method}::${path}`; an endpoint with both
+ *   input AND output edges yields a single pseudo-node.
+ * - Concatenates after baseList so stable def positions stay first
+ *   (downstream <For> referential identity for string elements is
+ *   value-equal — safe — but order stability still helps debugging).
+ */
+export function appendEndpointPseudoNodes(
+  baseList: string[],
+  endpointEdges: EndpointEdgeLike[],
+  layerOn: boolean,
+): string[] {
+  if (!layerOn) return baseList;
+  const baseSet = new Set(baseList);
+  const seen = new Set<string>();
+  const epKeys: string[] = [];
+  for (const e of endpointEdges) {
+    if (!baseSet.has(e.target_def)) continue;
+    const key = `${ENDPOINT_KEY_PREFIX}${e.endpoint.method}::${e.endpoint.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    epKeys.push(key);
+  }
+  if (epKeys.length === 0) return baseList;
+  return baseList.concat(epKeys);
+}
+
+/**
+ * Parse an endpoint pseudo-node key back into (method, path). Returns
+ * null when name is not an endpoint key. Method is lowercase per backend.
+ */
+export function parseEndpointKey(name: string): { method: string; path: string } | null {
+  if (!name.startsWith(ENDPOINT_KEY_PREFIX)) return null;
+  const rest = name.slice(ENDPOINT_KEY_PREFIX.length);
+  const sep = rest.indexOf("::");
+  if (sep < 0) return null;
+  return { method: rest.slice(0, sep), path: rest.slice(sep + 2) };
+}

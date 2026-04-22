@@ -10,6 +10,9 @@ import {
   computeFullGraphDepths,
   bucketHiddenByBand,
   computeTopHubs,
+  appendEndpointPseudoNodes,
+  parseEndpointKey,
+  ENDPOINT_KEY_PREFIX,
 } from "./dagLayout";
 import { computeDagrePositions } from "./dagreLayout";
 
@@ -2350,6 +2353,9 @@ function SchemasPage(props: {
   const roots = () => (graph()?.roots || {}) as Record<string, { method: string; path: string }[]>;
   const arrayTargets = () => [...new Set((graph()?.array_properties || []).map((ap: any) => ap.target_def))] as string[];
   const virtualRoots = () => (graph()?.virtual_roots || []) as { endpoint: { method: string; path: string }; shape: string }[];
+  // Backend endpoint→schema edges (entity_graph.rs:45). Method is lowercase
+  // per backend; downstream key/lookup must stay lowercase.
+  const endpointEdges = () => (graph()?.endpoint_edges || []) as { endpoint: { method: string; path: string }; target_def: string; direction: string }[];
   const [vrCollapsed, setVrCollapsed] = createSignal(true);
   const [rightTab, setRightTab] = createSignal<"details" | "graph">("details");
 
@@ -2845,7 +2851,12 @@ function SchemasPage(props: {
                 });
 
                 // visibleList = hubs first, then 1-hop neighbors (Set-deduped).
-                const visibleList = createMemo(() => {
+                // When endpointLayerOn() is true, append endpoint pseudo-nodes
+                // (ep::method::path) for every endpoint whose target_def is
+                // already in the def list. Helper returns baseList unchanged
+                // when layer is OFF — preserves byte-identical OFF DOM, kills
+                // jitter risk on toggle.
+                const defOnlyList = createMemo(() => {
                   const out: string[] = [];
                   const seen = new Set<string>();
                   for (const h of hubs()) {
@@ -2856,6 +2867,9 @@ function SchemasPage(props: {
                   }
                   return out;
                 });
+                const visibleList = createMemo(() =>
+                  appendEndpointPseudoNodes(defOnlyList(), endpointEdges(), props.endpointLayerOn()),
+                );
 
                 // Stub set: non-hub neighbors render as collapsed stubs.
                 const stubSet = createMemo(() => new Set(neighbors()));
@@ -2884,8 +2898,15 @@ function SchemasPage(props: {
                   return edgeList;
                 });
 
-                // Single source of truth for per-node width.
+                // Single source of truth for per-node width. Endpoint pseudo-
+                // nodes (ep::method::path) get fit-to-label width before
+                // delegating to widthOfRaw — keeps the dagLayout pure-fn test
+                // surface unchanged.
                 const widthOf = (name: string): number => {
+                  if (name.startsWith(ENDPOINT_KEY_PREFIX)) {
+                    const parsed = parseEndpointKey(name);
+                    if (parsed) return endpointBoxWidth(parsed.method, parsed.path);
+                  }
                   const def = props.definitions()[name];
                   return widthOfRaw(name, def);
                 };
@@ -2933,11 +2954,30 @@ function SchemasPage(props: {
                               );
                             }}
                           </For>
-                          {/* Entity boxes */}
+                          {/* Entity + endpoint pseudo-node boxes. <For> over
+                              string list — value-equal identity is safe per
+                              SolidJS reactivity rules (simaris 019d900f).
+                              ep:: branch carries data-endpoint-node attr
+                              UNCONDITIONALLY (NO onClick wiring — protects
+                              focusMembership from contamination). */}
                           <For each={visibleList()}>
                             {(entityName) => {
-                              const def = () => props.definitions()[entityName];
                               const pos = () => hubLayout().positions[entityName];
+                              if (entityName.startsWith(ENDPOINT_KEY_PREFIX)) {
+                                const parsed = parseEndpointKey(entityName);
+                                return (
+                                  <Show when={parsed && pos()}>
+                                    <EndpointBox
+                                      method={parsed!.method}
+                                      path={parsed!.path}
+                                      x={pos()!.x}
+                                      y={pos()!.y}
+                                      width={widthOf(entityName)}
+                                    />
+                                  </Show>
+                                );
+                              }
+                              const def = () => props.definitions()[entityName];
                               const isStub = () => stubSet().has(entityName);
                               const isHub = () => hubSet().has(entityName);
                               return (
@@ -3186,7 +3226,13 @@ function SchemasPage(props: {
                     });
                     // All visible entities: focals + all neighbors (Set-deduped,
                     // filtered to defs present). Drives layout + edges.
-                    const visibleList = createMemo(() => {
+                    // defOnlyVisible holds the def-only list — passed to every
+                    // graph-internal consumer (BFS partition, hubSet,
+                    // hiddenBandInfo rightX, etc.) to keep ep:: keys out.
+                    // visibleList appends endpoint pseudo-nodes when layer is
+                    // ON; OFF returns defOnlyVisible byte-identical (kills
+                    // jitter risk on toggle).
+                    const defOnlyVisible = createMemo(() => {
                       const defs = props.definitions();
                       const focals = focusMembership();
                       const out: string[] = [];
@@ -3205,6 +3251,9 @@ function SchemasPage(props: {
                       }
                       return out;
                     });
+                    const visibleList = createMemo(() =>
+                      appendEndpointPseudoNodes(defOnlyVisible(), endpointEdges(), props.endpointLayerOn()),
+                    );
                     const stubSet = createMemo(() => new Set(stubList()));
 
                     const boxSpacing = 300;
@@ -3212,8 +3261,15 @@ function SchemasPage(props: {
 
                     // Single source of truth for per-node width. Layout, edge
                     // routing, fit-to-viewport, and EntityBox render all read
-                    // through this helper so widths never drift.
+                    // through this helper so widths never drift. Endpoint
+                    // pseudo-nodes (ep::method::path) get fit-to-label width
+                    // BEFORE delegating to widthOfRaw — keeps the dagLayout
+                    // pure-fn test surface unchanged.
                     const widthOf = (name: string): number => {
+                      if (name.startsWith(ENDPOINT_KEY_PREFIX)) {
+                        const parsed = parseEndpointKey(name);
+                        if (parsed) return endpointBoxWidth(parsed.method, parsed.path);
+                      }
                       const def = props.definitions()[name];
                       return widthOfRaw(name, def);
                     };
@@ -3424,7 +3480,9 @@ function SchemasPage(props: {
                       // hopOf is hopOf(h) - 1). Fallback: if none found or v
                       // has no rank (legacy DAG), use fullDepth-based band
                       // bucket via bucketHiddenByBand as safety net.
-                      const visibleSet = new Set(visibleList());
+                      // Source from defOnlyVisible — endpoint pseudo-nodes
+                      // never own a band ring nor inflate rightX.
+                      const visibleSet = new Set(defOnlyVisible());
                       const unresolved = new Set<string>();
                       for (const h of hiddenRing) {
                         // Outbound: h → ref (visible?)
@@ -4225,9 +4283,29 @@ function SchemasPage(props: {
                               }}
                             </For>
                           </g>
-                          {/* Entity boxes */}
+                          {/* Entity + endpoint pseudo-node boxes. <For> over
+                              string list — value-equal identity is safe per
+                              SolidJS reactivity rules (simaris 019d900f).
+                              ep:: branch carries data-endpoint-node attr
+                              UNCONDITIONALLY (NO onClick wiring — protects
+                              focusMembership from contamination). */}
                           <For each={visibleList()}>
                             {(entityName, idx) => {
+                              if (entityName.startsWith(ENDPOINT_KEY_PREFIX)) {
+                                const parsed = parseEndpointKey(entityName);
+                                const epPos = () => entityPositions()[entityName];
+                                return (
+                                  <Show when={parsed && epPos()}>
+                                    <EndpointBox
+                                      method={parsed!.method}
+                                      path={parsed!.path}
+                                      x={epPos()!.x}
+                                      y={epPos()!.y}
+                                      width={widthOf(entityName)}
+                                    />
+                                  </Show>
+                                );
+                              }
                               const def = () => props.definitions()[entityName];
                               const xPos = () => entityPositions()[entityName]?.x ?? 0;
                               const yPos = () => entityPositions()[entityName]?.y ?? 0;
@@ -5789,6 +5867,91 @@ function MethodBadge(props: { method: string }) {
     <span class={`inline-block font-mono text-xs font-medium px-2 py-0.5 rounded ring-1 ${cls}`}>
       {props.method.toUpperCase()}
     </span>
+  );
+}
+
+// Hex mirror of MethodBadge Tailwind palette. Duplicated because SVG <rect>
+// fill cannot consume Tailwind utility classes — it needs literal colors.
+// Keep keys in sync with MethodBadge.colors above. head/options fall back
+// to gray (no MethodBadge entry — task palette spec).
+const ENDPOINT_METHOD_FILL: Record<string, { fill: string; stroke: string; text: string }> = {
+  get:     { fill: "#10b981", stroke: "#34d399", text: "#022c22" },
+  post:    { fill: "#3b82f6", stroke: "#60a5fa", text: "#0b1d3a" },
+  put:     { fill: "#f59e0b", stroke: "#fbbf24", text: "#27170a" },
+  patch:   { fill: "#8b5cf6", stroke: "#a78bfa", text: "#1d0f3a" },
+  delete:  { fill: "#ef4444", stroke: "#f87171", text: "#3b0a0a" },
+  head:    { fill: "#6b7280", stroke: "#9ca3af", text: "#0a0c10" },
+  options: { fill: "#6b7280", stroke: "#9ca3af", text: "#0a0c10" },
+};
+const ENDPOINT_METHOD_FALLBACK = { fill: "#6b7280", stroke: "#9ca3af", text: "#0a0c10" };
+
+const ENDPOINT_BOX_HEIGHT = HEADER_HEIGHT;
+const ENDPOINT_BOX_PAD_X = 10;
+const ENDPOINT_METHOD_LABEL_GAP = 8;
+const ENDPOINT_METHOD_FONT_PX = 11;
+const ENDPOINT_PATH_FONT_PX = 12;
+// Approx px-per-char at the chosen font sizes (mono). Used by both width
+// computation (widthOf at call sites) and render. Single source of truth.
+const ENDPOINT_METHOD_CHAR_PX = 7;
+const ENDPOINT_PATH_CHAR_PX = 7;
+
+/** Pixel width an endpoint pseudo-node needs to render its method + path. */
+function endpointBoxWidth(method: string, path: string): number {
+  const methodPx = method.toUpperCase().length * ENDPOINT_METHOD_CHAR_PX + 12; // pill padding
+  const pathPx = path.length * ENDPOINT_PATH_CHAR_PX;
+  return Math.max(160, ENDPOINT_BOX_PAD_X * 2 + methodPx + ENDPOINT_METHOD_LABEL_GAP + pathPx);
+}
+
+function EndpointBox(props: { method: string; path: string; x: number; y: number; width: number }) {
+  const palette = () => ENDPOINT_METHOD_FILL[props.method.toLowerCase()] ?? ENDPOINT_METHOD_FALLBACK;
+  const methodLabel = () => props.method.toUpperCase();
+  const methodPx = () => methodLabel().length * ENDPOINT_METHOD_CHAR_PX + 12;
+  return (
+    <g
+      data-endpoint-node
+      data-endpoint-key={`${ENDPOINT_KEY_PREFIX}${props.method}::${props.path}`}
+      transform={`translate(${props.x}, ${props.y})`}
+    >
+      {/* Outer card — body-color hint via low-opacity method fill */}
+      <rect
+        x={0}
+        y={0}
+        width={props.width}
+        height={ENDPOINT_BOX_HEIGHT}
+        rx={6}
+        ry={6}
+        fill="#0d1117"
+        stroke={palette().stroke}
+        stroke-width={1}
+      />
+      {/* Method pill */}
+      <rect
+        x={ENDPOINT_BOX_PAD_X}
+        y={(ENDPOINT_BOX_HEIGHT - 18) / 2}
+        width={methodPx()}
+        height={18}
+        rx={3}
+        ry={3}
+        fill={palette().fill}
+      />
+      <text
+        x={ENDPOINT_BOX_PAD_X + methodPx() / 2}
+        y={ENDPOINT_BOX_HEIGHT / 2 + 4}
+        fill={palette().text}
+        font-size={String(ENDPOINT_METHOD_FONT_PX)}
+        font-weight="700"
+        font-family="ui-monospace, monospace"
+        text-anchor="middle"
+      >{methodLabel()}</text>
+      {/* Path label */}
+      <text
+        x={ENDPOINT_BOX_PAD_X + methodPx() + ENDPOINT_METHOD_LABEL_GAP}
+        y={ENDPOINT_BOX_HEIGHT / 2 + 4}
+        fill="#c9d1d9"
+        font-size={String(ENDPOINT_PATH_FONT_PX)}
+        font-family="ui-monospace, monospace"
+      >{props.path}</text>
+    </g>
   );
 }
 
