@@ -4,3 +4,4 @@ ui/dist/
 !ui/dist/.gitkeep
 mirage.db
 .limbo/
+tests/screenshots/
