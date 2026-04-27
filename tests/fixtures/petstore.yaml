@@ -92,3 +92,15 @@ definitions:
           - available
           - pending
           - sold
+      breed:
+        type: string
+        description: pet breed (used by recipes learn for custom_list detection)
+      tagId:
+        type: string
+        description: external UUID identifier (used for uuid-format detection)
+      email:
+        type: string
+        description: contact email (used for email-format detection)
+      kind:
+        type: string
+        description: constant tag (used for Const-rule detection)

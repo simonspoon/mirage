@@ -1,5 +1,6 @@
 mod composer;
 mod entity_graph;
+mod learn;
 mod parser;
 mod recipe;
 mod rules;
@@ -129,6 +130,56 @@ enum RecipesCommand {
     },
     /// Manage a recipe's parsed config (quantity configs, faker rules, rules, frozen rows, custom lists)
     Config(ConfigArgs),
+    /// Synthesize rules from sample data and write them into a recipe in-place.
+    ///
+    /// Reads JSONL or JSON-array sample rows from stdin (or --file), detects
+    /// per-field rules deterministically (no LLM), and writes the merged
+    /// config via PUT /_api/admin/recipes/:id/config. See spec for details.
+    Learn {
+        /// Recipe id
+        #[arg(long)]
+        id: i64,
+        /// Definition name (e.g. "Pet")
+        #[arg(long)]
+        def: String,
+        /// Path to a JSONL or JSON-array sample file. If omitted, samples are
+        /// read from stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Compute the plan and print the report; do NOT call PUT /config.
+        #[arg(long)]
+        dry_run: bool,
+        /// Step through proposed rules interactively (requires --file so stdin
+        /// is free for y/n input).
+        #[arg(long)]
+        ask: bool,
+        /// Conflict policy: only fill empty slots (default).
+        #[arg(long)]
+        merge: bool,
+        /// Conflict policy: replace existing entries.
+        #[arg(long)]
+        overwrite: bool,
+        /// Conflict policy: error on first conflict (no writes).
+        #[arg(long)]
+        fail: bool,
+        /// Distinct values <= this threshold → Choice rule.
+        #[arg(long, default_value_t = 20)]
+        max_choice: usize,
+        /// Distinct string values <= this threshold → custom list.
+        #[arg(long, default_value_t = 200)]
+        max_list: usize,
+        /// Per-field non-null sample count below this → skip.
+        #[arg(long, default_value_t = 5)]
+        min_samples: usize,
+        /// Cap the number of samples read.
+        #[arg(long)]
+        max_samples: Option<usize>,
+        /// Auto-accept all proposed rules under --ask (test hook).
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, env = "MIRAGE_URL")]
+        url: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -716,7 +767,340 @@ async fn run_recipes(args: &RecipesArgs) {
                 println!("{body}");
             }
         },
+        RecipesCommand::Learn {
+            id,
+            def,
+            file,
+            dry_run,
+            ask,
+            merge,
+            overwrite,
+            fail,
+            max_choice,
+            max_list,
+            min_samples,
+            max_samples,
+            yes,
+            url,
+        } => {
+            run_learn(
+                &client,
+                *id,
+                def,
+                file.as_deref(),
+                *dry_run,
+                *ask,
+                *merge,
+                *overwrite,
+                *fail,
+                *max_choice,
+                *max_list,
+                *min_samples,
+                *max_samples,
+                *yes,
+                url,
+            )
+            .await
+        }
     }
+}
+
+/// Drive `mirage recipes learn`. Reads samples from `--file` or stdin,
+/// fetches the existing recipe via GET, computes a plan, applies it under
+/// the resolved policy, and (unless `--dry-run`) writes the merged config
+/// back via PUT. Prints a JSON report on stdout.
+#[allow(clippy::too_many_arguments)]
+async fn run_learn(
+    client: &reqwest::Client,
+    id: i64,
+    def: &str,
+    file: Option<&std::path::Path>,
+    dry_run: bool,
+    ask: bool,
+    merge: bool,
+    overwrite: bool,
+    fail: bool,
+    max_choice: usize,
+    max_list: usize,
+    min_samples: usize,
+    max_samples: Option<usize>,
+    yes: bool,
+    url: &Option<String>,
+) {
+    // Resolve conflict policy. Exactly one of merge/overwrite/fail; default merge.
+    let chosen = [merge, overwrite, fail].iter().filter(|b| **b).count();
+    if chosen > 1 {
+        emit_err_and_exit("--merge, --overwrite, --fail are mutually exclusive");
+    }
+    let policy = if overwrite {
+        learn::ConflictPolicy::Overwrite
+    } else if fail {
+        learn::ConflictPolicy::Fail
+    } else {
+        learn::ConflictPolicy::Merge
+    };
+
+    // --ask requires --file so stdin stays free for prompts.
+    if ask && file.is_none() {
+        emit_err_and_exit("--ask requires --file");
+    }
+
+    // Read samples.
+    let samples: Vec<serde_json::Value> = match file {
+        Some(path) => {
+            let f = std::fs::File::open(path).unwrap_or_else(|e| {
+                emit_err_and_exit(format!("failed to open {}: {e}", path.display()))
+            });
+            learn::read_samples(f).unwrap_or_else(|e| emit_err_and_exit(e))
+        }
+        None => {
+            let stdin = std::io::stdin();
+            let lock = stdin.lock();
+            learn::read_samples(lock).unwrap_or_else(|e| emit_err_and_exit(e))
+        }
+    };
+    let samples = match max_samples {
+        Some(n) if samples.len() > n => samples.into_iter().take(n).collect(),
+        _ => samples,
+    };
+
+    // Fetch recipe + spec.
+    let base = resolve_base_url(url);
+    let resp = client
+        .get(format!("{base}/_api/admin/recipes/{id}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+    let resp = ensure_success(resp).await;
+    let recipe: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|e| emit_err_and_exit(format!("invalid response body: {e}")));
+
+    let spec_source = recipe
+        .get("spec_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| emit_err_and_exit("recipe response missing spec_source"));
+    let spec: parser::SwaggerSpec = serde_yaml::from_str(spec_source)
+        .unwrap_or_else(|e| emit_err_and_exit(format!("recipe spec_source invalid: {e}")));
+
+    // Existing config view.
+    let current = current_config_from_recipe(&recipe);
+
+    // Plan.
+    let cfg = learn::LearnConfig {
+        max_choice,
+        max_list,
+        min_samples,
+        max_samples,
+    };
+    let mut plan = learn::plan_learn(&spec, def, &samples, &cfg);
+
+    // --ask: filter proposed list interactively.
+    if ask {
+        plan.proposed = ask_filter_proposed(plan.proposed, yes);
+    }
+
+    // Apply.
+    let (new_cfg, report) = match learn::apply_plan(&plan, &current, policy) {
+        Ok(pair) => pair,
+        Err(err) => {
+            let payload = serde_json::json!({
+                "error": err.message,
+                "field": err.field,
+                "slot": err.slot,
+            });
+            eprintln!("{payload}");
+            std::process::exit(1);
+        }
+    };
+
+    // Dry-run → no PUT.
+    if dry_run {
+        let r = learn::report_json(&report, id, false);
+        println!("{r}");
+        return;
+    }
+
+    // PUT the merged config.
+    let body = build_put_body(&new_cfg);
+    let put = client
+        .put(format!("{base}/_api/admin/recipes/{id}/config"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| emit_err_and_exit(format!("request failed: {e}")));
+    let _ = ensure_success(put).await;
+
+    let r = learn::report_json(&report, id, true);
+    println!("{r}");
+}
+
+/// Read the existing config slots out of the recipe response. The admin GET
+/// returns config fields as JSON-encoded strings; parse them into typed
+/// learn-compatible shapes.
+fn current_config_from_recipe(recipe: &serde_json::Value) -> learn::CurrentConfig {
+    use std::collections::HashMap;
+
+    let parse_str = |v: &serde_json::Value| -> serde_json::Value {
+        let Some(s) = v.as_str() else {
+            return v.clone();
+        };
+        serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+    };
+
+    let faker_rules_v = recipe
+        .get("faker_rules")
+        .map(parse_str)
+        .unwrap_or(serde_json::json!({}));
+    let custom_lists_v = recipe
+        .get("custom_lists")
+        .map(parse_str)
+        .unwrap_or(serde_json::json!({}));
+    let rules_v = recipe
+        .get("rules")
+        .map(parse_str)
+        .unwrap_or(serde_json::json!([]));
+    let quantity_configs = recipe
+        .get("quantity_configs")
+        .map(parse_str)
+        .unwrap_or(serde_json::json!({}));
+    let frozen_rows = recipe
+        .get("frozen_rows")
+        .map(parse_str)
+        .unwrap_or(serde_json::json!({}));
+
+    let mut faker_rules: HashMap<String, String> = HashMap::new();
+    if let Some(obj) = faker_rules_v.as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                faker_rules.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    let mut custom_lists: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(obj) = custom_lists_v.as_object() {
+        for (k, v) in obj {
+            if let Some(arr) = v.as_array() {
+                let vals: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
+                custom_lists.insert(k.clone(), vals);
+            }
+        }
+    }
+    let rules: Vec<rules::Rule> =
+        rules::parse_rules(&serde_json::to_string(&rules_v).unwrap_or_default())
+            .unwrap_or_default();
+
+    learn::CurrentConfig {
+        faker_rules,
+        custom_lists,
+        rules,
+        quantity_configs,
+        frozen_rows,
+    }
+}
+
+/// Build a JSON body matching the PUT /config admin endpoint contract from a
+/// `NewConfig`. Faker rules are encoded as `{"DefName.propName": "strategy"}`
+/// strings (the wire shape `composer::parse_faker_rules` expects).
+fn build_put_body(new_cfg: &learn::NewConfig) -> serde_json::Value {
+    let mut faker_rules = serde_json::Map::new();
+    for (k, v) in &new_cfg.faker_rules {
+        faker_rules.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    let mut custom_lists = serde_json::Map::new();
+    for (k, v) in &new_cfg.custom_lists {
+        custom_lists.insert(
+            k.clone(),
+            serde_json::Value::Array(
+                v.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    let rules: Vec<serde_json::Value> = new_cfg
+        .rules
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+        .collect();
+    serde_json::json!({
+        "quantity_configs": new_cfg.quantity_configs,
+        "faker_rules": serde_json::Value::Object(faker_rules),
+        "rules": rules,
+        "frozen_rows": new_cfg.frozen_rows,
+        "custom_lists": serde_json::Value::Object(custom_lists),
+    })
+}
+
+/// Step through proposed rules on stderr; read y/n from /dev/tty (or stdin if
+/// no TTY). `--yes` short-circuits to accept all (test hook).
+fn ask_filter_proposed(
+    proposed: Vec<learn::ProposedRule>,
+    yes: bool,
+) -> Vec<learn::ProposedRule> {
+    if yes {
+        return proposed;
+    }
+    use std::io::{BufRead, BufReader, Write};
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok();
+    let mut accepted = Vec::with_capacity(proposed.len());
+    for rule in proposed {
+        let summary = match &rule.action {
+            learn::ProposedAction::SetFaker { strategy } => {
+                format!("faker {} = {}", rule.field, strategy)
+            }
+            learn::ProposedAction::SetCustomList { list_name, values } => {
+                format!(
+                    "custom_list {} = {} ({} values)",
+                    rule.field,
+                    list_name,
+                    values.len()
+                )
+            }
+            learn::ProposedAction::SetRule { rule: r } => match r {
+                rules::Rule::Const { value, .. } => {
+                    format!("const {} = {}", rule.field, value)
+                }
+                rules::Rule::Choice { options, .. } => {
+                    format!("choice {} ({} options)", rule.field, options.len())
+                }
+                rules::Rule::Range { min, max, .. } => {
+                    format!("range {} [{} .. {}]", rule.field, min, max)
+                }
+                _ => format!("rule {}", rule.field),
+            },
+        };
+        eprint!("apply: {summary} [y/N]? ");
+        std::io::stderr().flush().ok();
+
+        let answer = match &tty {
+            Some(t) => {
+                let mut reader = BufReader::new(t);
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(_) => line.trim().to_lowercase(),
+                    Err(_) => String::new(),
+                }
+            }
+            None => {
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line).ok();
+                line.trim().to_lowercase()
+            }
+        };
+        if answer == "y" || answer == "yes" {
+            accepted.push(rule);
+        }
+    }
+    accepted
 }
 
 #[tokio::main]

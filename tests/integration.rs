@@ -2339,3 +2339,436 @@ fn test_recipe_custom_lists_persist_delete_no_leak() {
         "recipe B custom_lists must be unchanged after A is deleted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `mirage recipes learn` (task hpuy)
+// ---------------------------------------------------------------------------
+
+/// POST a recipe whose `spec_source` IS the petstore.yaml file (so the
+/// `Pet` definition resolves) and the selected_endpoints cover /pet.
+fn post_pet_recipe(server: &MirageServer, name: &str) -> serde_json::Value {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let spec_path = manifest_dir.join("tests/fixtures/petstore.yaml");
+    let spec_source = std::fs::read_to_string(&spec_path).expect("read petstore.yaml");
+    let body = serde_json::json!({
+        "name": name,
+        "spec_source": spec_source,
+        "endpoints": [
+            { "method": "GET", "path": "/pet/{petId}" },
+            { "method": "POST", "path": "/pet" },
+        ],
+        "seed_count": 5,
+        "shared_pools": {},
+        "quantity_configs": {},
+        "faker_rules": {},
+        "rules": [],
+        "frozen_rows": {},
+    });
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(server.url("/_api/admin/recipes"))
+        .json(&body)
+        .send()
+        .expect("POST /_api/admin/recipes failed");
+    assert_eq!(resp.status(), 201, "create pet recipe should return 201");
+    resp.json().expect("create pet recipe response should be JSON")
+}
+
+fn pets_jsonl_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pets.jsonl")
+}
+
+fn get_recipe(server: &MirageServer, id: i64) -> serde_json::Value {
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(server.url(&format!("/_api/admin/recipes/{id}")))
+        .send()
+        .expect("GET recipe failed");
+    assert!(resp.status().is_success(), "GET recipe failed: {}", resp.status());
+    resp.json().expect("recipe response JSON")
+}
+
+fn put_recipe_config(
+    server: &MirageServer,
+    id: i64,
+    body: &serde_json::Value,
+) -> reqwest::blocking::Response {
+    let client = reqwest::blocking::Client::new();
+    client
+        .put(server.url(&format!("/_api/admin/recipes/{id}/config")))
+        .json(body)
+        .send()
+        .expect("PUT config failed")
+}
+
+#[test]
+fn test_recipes_cli_learn_dry_run() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn DryRun");
+    let id = created["id"].as_i64().unwrap();
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "learn --dry-run should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("dry-run stdout should be JSON");
+    assert_eq!(report["id"].as_i64(), Some(id));
+    assert_eq!(report["wrote"], false);
+    assert!(report["applied"].is_array());
+    assert!(report["skipped"].is_array());
+    let applied = report["applied"].as_array().unwrap();
+    assert!(
+        !applied.is_empty(),
+        "dry-run should propose at least one rule, got: {report}"
+    );
+
+    // Confirm config is UNCHANGED on the server.
+    let recipe = get_recipe(&server, id);
+    let faker_rules: serde_json::Value =
+        serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
+    assert_eq!(faker_rules, serde_json::json!({}));
+    let rules: serde_json::Value =
+        serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
+    assert_eq!(rules, serde_json::json!([]));
+    let custom_lists: serde_json::Value =
+        serde_json::from_str(recipe["custom_lists"].as_str().unwrap()).unwrap();
+    assert_eq!(custom_lists, serde_json::json!({}));
+}
+
+#[test]
+fn test_recipes_cli_learn_writes() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Writes");
+    let id = created["id"].as_i64().unwrap();
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "learn (write) should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("learn stdout should be JSON");
+    assert_eq!(report["wrote"], true);
+
+    // Server-side: faker_rules + rules + custom_lists all populated.
+    let recipe = get_recipe(&server, id);
+    let faker_rules: serde_json::Value =
+        serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
+    let custom_lists: serde_json::Value =
+        serde_json::from_str(recipe["custom_lists"].as_str().unwrap()).unwrap();
+    let rules: serde_json::Value =
+        serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
+
+    let f_obj = faker_rules.as_object().expect("faker_rules object");
+    assert_eq!(
+        f_obj.get("Pet.tagId").and_then(|v| v.as_str()),
+        Some("uuid"),
+        "Pet.tagId should map to uuid faker. faker_rules: {faker_rules}"
+    );
+    assert_eq!(
+        f_obj.get("Pet.email").and_then(|v| v.as_str()),
+        Some("email"),
+        "Pet.email should map to email faker. faker_rules: {faker_rules}"
+    );
+
+    // breed has 25 distinct → custom_list path.
+    assert!(
+        custom_lists
+            .as_object()
+            .map(|o| o.contains_key("learned_pet_breed"))
+            .unwrap_or(false),
+        "custom_lists should include learned_pet_breed: {custom_lists}"
+    );
+
+    // rules should include at minimum: Const(kind), Choice(status), Range(id).
+    let rules_arr = rules.as_array().expect("rules array");
+    let kinds: Vec<&str> = rules_arr
+        .iter()
+        .filter_map(|r| r.get("kind").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        kinds.contains(&"const"),
+        "rules should contain a const rule (Pet.kind). rules: {rules}"
+    );
+    assert!(
+        kinds.contains(&"choice"),
+        "rules should contain a choice rule (Pet.status). rules: {rules}"
+    );
+    assert!(
+        kinds.contains(&"range"),
+        "rules should contain a range rule (Pet.id). rules: {rules}"
+    );
+}
+
+#[test]
+fn test_recipes_cli_learn_merge_no_overwrite() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Merge");
+    let id = created["id"].as_i64().unwrap();
+
+    // Pre-seed: Pet.tagId already mapped to a different faker.
+    let pre = serde_json::json!({
+        "quantity_configs": {},
+        "faker_rules": {"Pet.tagId": "name"},
+        "rules": [],
+        "frozen_rows": {},
+        "custom_lists": {},
+    });
+    let resp = put_recipe_config(&server, id, &pre);
+    assert!(resp.status().is_success());
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "merge learn should succeed");
+
+    // Pet.tagId must still be "name" (not overwritten with "uuid").
+    let recipe = get_recipe(&server, id);
+    let faker_rules: serde_json::Value =
+        serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        faker_rules["Pet.tagId"].as_str(),
+        Some("name"),
+        "merge default must preserve existing faker_rule. got: {faker_rules}"
+    );
+    // But Pet.email (no prior rule) gets the proposed faker.
+    assert_eq!(faker_rules["Pet.email"].as_str(), Some("email"));
+}
+
+#[test]
+fn test_recipes_cli_learn_overwrite_replaces() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Overwrite");
+    let id = created["id"].as_i64().unwrap();
+
+    let pre = serde_json::json!({
+        "quantity_configs": {},
+        "faker_rules": {"Pet.tagId": "name"},
+        "rules": [],
+        "frozen_rows": {},
+        "custom_lists": {},
+    });
+    let resp = put_recipe_config(&server, id, &pre);
+    assert!(resp.status().is_success());
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+            "--overwrite",
+        ],
+    );
+    assert!(out.status.success(), "overwrite learn should succeed");
+
+    let recipe = get_recipe(&server, id);
+    let faker_rules: serde_json::Value =
+        serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        faker_rules["Pet.tagId"].as_str(),
+        Some("uuid"),
+        "overwrite must replace existing faker_rule. got: {faker_rules}"
+    );
+}
+
+#[test]
+fn test_recipes_cli_learn_fail_conflict() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Fail");
+    let id = created["id"].as_i64().unwrap();
+
+    let pre = serde_json::json!({
+        "quantity_configs": {},
+        "faker_rules": {"Pet.tagId": "name"},
+        "rules": [],
+        "frozen_rows": {},
+        "custom_lists": {},
+    });
+    let resp = put_recipe_config(&server, id, &pre);
+    assert!(resp.status().is_success());
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+            "--fail",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "fail-on-conflict must exit non-zero. stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(err.get("error").is_some());
+
+    // Recipe must be UNCHANGED — pre-existing rule preserved.
+    let recipe = get_recipe(&server, id);
+    let faker_rules: serde_json::Value =
+        serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
+    assert_eq!(faker_rules["Pet.tagId"].as_str(), Some("name"));
+    // No new entries should have been written either.
+    assert!(
+        faker_rules.as_object().unwrap().get("Pet.email").is_none(),
+        "fail mode must perform NO writes, got: {faker_rules}"
+    );
+}
+
+#[test]
+fn test_recipes_cli_learn_stdin() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Stdin");
+    let id = created["id"].as_i64().unwrap();
+
+    let path = pets_jsonl_path();
+    let samples = std::fs::read_to_string(&path).unwrap();
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .args([
+            "recipes",
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--url",
+            &server.base(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mirage");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(samples.as_bytes())
+        .expect("write samples");
+    let out = child.wait_with_output().expect("wait child");
+    assert!(
+        out.status.success(),
+        "learn via stdin should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be JSON");
+    assert_eq!(report["wrote"], true);
+    assert!(!report["applied"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_recipes_cli_learn_ask_yes() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Ask Yes");
+    let id = created["id"].as_i64().unwrap();
+
+    let path = pets_jsonl_path();
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--file",
+            path.to_str().unwrap(),
+            "--ask",
+            "--yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "--ask --yes should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout JSON");
+    assert_eq!(report["wrote"], true);
+    let applied = report["applied"].as_array().unwrap();
+    assert!(!applied.is_empty(), "ask --yes should auto-accept all proposed");
+}
+
+#[test]
+fn test_recipes_cli_learn_ask_without_file_errors() {
+    let server = MirageServer::start_isolated("tests/fixtures/petstore.yaml", "/pet");
+    let created = post_pet_recipe(&server, "Learn Ask NoFile");
+    let id = created["id"].as_i64().unwrap();
+
+    let out = mirage_cli(
+        &server,
+        &[
+            "learn",
+            "--id",
+            &id.to_string(),
+            "--def",
+            "Pet",
+            "--ask",
+        ],
+    );
+    assert!(!out.status.success(), "--ask without --file must error");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let err: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr JSON");
+    assert!(
+        err["error"].as_str().unwrap().contains("--ask requires --file"),
+        "error message must mention requirement: {stderr}"
+    );
+}

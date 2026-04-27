@@ -1,0 +1,25 @@
+{"id": 1, "name": "Rex", "status": "available", "breed": "Labrador", "tagId": "550e8400-e29b-41d4-a716-446655440000", "email": "rex@example.com", "kind": "dog"}
+{"id": 2, "name": "Whiskers", "status": "pending", "breed": "Persian", "tagId": "550e8400-e29b-41d4-a716-446655440001", "email": "whiskers@example.com", "kind": "dog"}
+{"id": 3, "name": "Buddy", "status": "sold", "breed": "Golden", "tagId": "550e8400-e29b-41d4-a716-446655440002", "email": "buddy@example.com", "kind": "dog"}
+{"id": 4, "name": "Mittens", "status": "available", "breed": "Siamese", "tagId": "550e8400-e29b-41d4-a716-446655440003", "email": "mittens@example.com", "kind": "dog"}
+{"id": 5, "name": "Charlie", "status": "pending", "breed": "Beagle", "tagId": "550e8400-e29b-41d4-a716-446655440004", "email": "charlie@example.com", "kind": "dog"}
+{"id": 6, "name": "Luna", "status": "sold", "breed": "Poodle", "tagId": "550e8400-e29b-41d4-a716-446655440005", "email": "luna@example.com", "kind": "dog"}
+{"id": 7, "name": "Bella", "status": "available", "breed": "Bulldog", "tagId": "550e8400-e29b-41d4-a716-446655440006", "email": "bella@example.com", "kind": "dog"}
+{"id": 8, "name": "Rocky", "status": "pending", "breed": "Husky", "tagId": "550e8400-e29b-41d4-a716-446655440007", "email": "rocky@example.com", "kind": "dog"}
+{"id": 9, "name": "Daisy", "status": "sold", "breed": "Boxer", "tagId": "550e8400-e29b-41d4-a716-446655440008", "email": "daisy@example.com", "kind": "dog"}
+{"id": 10, "name": "Max", "status": "available", "breed": "Collie", "tagId": "550e8400-e29b-41d4-a716-446655440009", "email": "max@example.com", "kind": "dog"}
+{"id": 11, "name": "Lucy", "status": "pending", "breed": "Shih Tzu", "tagId": "550e8400-e29b-41d4-a716-44665544000a", "email": "lucy@example.com", "kind": "dog"}
+{"id": 12, "name": "Cooper", "status": "sold", "breed": "Pug", "tagId": "550e8400-e29b-41d4-a716-44665544000b", "email": "cooper@example.com", "kind": "dog"}
+{"id": 13, "name": "Bailey", "status": "available", "breed": "Dalmatian", "tagId": "550e8400-e29b-41d4-a716-44665544000c", "email": "bailey@example.com", "kind": "dog"}
+{"id": 14, "name": "Toby", "status": "pending", "breed": "Maltese", "tagId": "550e8400-e29b-41d4-a716-44665544000d", "email": "toby@example.com", "kind": "dog"}
+{"id": 15, "name": "Molly", "status": "sold", "breed": "Yorkie", "tagId": "550e8400-e29b-41d4-a716-44665544000e", "email": "molly@example.com", "kind": "dog"}
+{"id": 16, "name": "Zeus", "status": "available", "breed": "Akita", "tagId": "550e8400-e29b-41d4-a716-44665544000f", "email": "zeus@example.com", "kind": "dog"}
+{"id": 17, "name": "Stella", "status": "pending", "breed": "Corgi", "tagId": "550e8400-e29b-41d4-a716-446655440010", "email": "stella@example.com", "kind": "dog"}
+{"id": 18, "name": "Oliver", "status": "sold", "breed": "Spaniel", "tagId": "550e8400-e29b-41d4-a716-446655440011", "email": "oliver@example.com", "kind": "dog"}
+{"id": 19, "name": "Sadie", "status": "available", "breed": "Pomeranian", "tagId": "550e8400-e29b-41d4-a716-446655440012", "email": "sadie@example.com", "kind": "dog"}
+{"id": 20, "name": "Duke", "status": "pending", "breed": "Rottweiler", "tagId": "550e8400-e29b-41d4-a716-446655440013", "email": "duke@example.com", "kind": "dog"}
+{"id": 21, "name": "Ruby", "status": "sold", "breed": "Schnauzer", "tagId": "550e8400-e29b-41d4-a716-446655440014", "email": "ruby@example.com", "kind": "dog"}
+{"id": 22, "name": "Penny", "status": "available", "breed": "Vizsla", "tagId": "550e8400-e29b-41d4-a716-446655440015", "email": "penny@example.com", "kind": "dog"}
+{"id": 23, "name": "Jack", "status": "pending", "breed": "Mastiff", "tagId": "550e8400-e29b-41d4-a716-446655440016", "email": "jack@example.com", "kind": "dog"}
+{"id": 24, "name": "Roxy", "status": "sold", "breed": "Doberman", "tagId": "550e8400-e29b-41d4-a716-446655440017", "email": "roxy@example.com", "kind": "dog"}
+{"id": 25, "name": "Thor", "status": "available", "breed": "Greyhound", "tagId": "550e8400-e29b-41d4-a716-446655440018", "email": "thor@example.com", "kind": "dog"}
