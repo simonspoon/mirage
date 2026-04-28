@@ -547,8 +547,7 @@ pub fn plan_learn(
         }
 
         // Object subschemas without ref also out of scope.
-        if prop_schema.schema_type.as_deref() == Some("object")
-            || prop_schema.properties.is_some()
+        if prop_schema.schema_type.as_deref() == Some("object") || prop_schema.properties.is_some()
         {
             plan.skipped.push(SkippedField {
                 field: field_path,
@@ -868,9 +867,7 @@ pub fn apply_plan(
                 new_cfg
                     .custom_lists
                     .insert(list_name.clone(), values.clone());
-                new_cfg
-                    .faker_rules
-                    .insert(field.clone(), list_name.clone());
+                new_cfg.faker_rules.insert(field.clone(), list_name.clone());
                 report.applied.push(AppliedEntry {
                     field: field.clone(),
                     kind: "custom_list".to_string(),
@@ -1247,9 +1244,7 @@ definitions:
     #[test]
     fn plan_range_branch() {
         let spec = pet_spec();
-        let samples: Vec<Value> = (1..=30)
-            .map(|i| serde_json::json!({ "id": i }))
-            .collect();
+        let samples: Vec<Value> = (1..=30).map(|i| serde_json::json!({ "id": i })).collect();
         let plan = plan_learn(&spec, "Pet", &samples, &LearnConfig::default());
         let p = plan
             .proposed
@@ -1377,7 +1372,10 @@ definitions:
             .faker_rules
             .insert("Pet.id".to_string(), "integer".to_string());
         let (new_cfg, report) = apply_plan(&plan, &existing, ConflictPolicy::Merge).unwrap();
-        assert_eq!(new_cfg.faker_rules.get("Pet.id"), Some(&"integer".to_string()));
+        assert_eq!(
+            new_cfg.faker_rules.get("Pet.id"),
+            Some(&"integer".to_string())
+        );
         assert!(report.applied.is_empty());
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].reason, "conflict_existing_faker_rule");
@@ -1459,8 +1457,7 @@ definitions:
             }],
             ..Default::default()
         };
-        let (new_cfg, report) =
-            apply_plan(&plan, &existing, ConflictPolicy::Overwrite).unwrap();
+        let (new_cfg, report) = apply_plan(&plan, &existing, ConflictPolicy::Overwrite).unwrap();
         assert_eq!(new_cfg.rules.len(), 1);
         assert!(matches!(new_cfg.rules[0], Rule::Choice { .. }));
         assert_eq!(report.applied.len(), 1);

@@ -2371,7 +2371,8 @@ fn post_pet_recipe(server: &MirageServer, name: &str) -> serde_json::Value {
         .send()
         .expect("POST /_api/admin/recipes failed");
     assert_eq!(resp.status(), 201, "create pet recipe should return 201");
-    resp.json().expect("create pet recipe response should be JSON")
+    resp.json()
+        .expect("create pet recipe response should be JSON")
 }
 
 fn pets_jsonl_path() -> PathBuf {
@@ -2384,7 +2385,11 @@ fn get_recipe(server: &MirageServer, id: i64) -> serde_json::Value {
         .get(server.url(&format!("/_api/admin/recipes/{id}")))
         .send()
         .expect("GET recipe failed");
-    assert!(resp.status().is_success(), "GET recipe failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "GET recipe failed: {}",
+        resp.status()
+    );
     resp.json().expect("recipe response JSON")
 }
 
@@ -2443,8 +2448,7 @@ fn test_recipes_cli_learn_dry_run() {
     let faker_rules: serde_json::Value =
         serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
     assert_eq!(faker_rules, serde_json::json!({}));
-    let rules: serde_json::Value =
-        serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
+    let rules: serde_json::Value = serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
     assert_eq!(rules, serde_json::json!([]));
     let custom_lists: serde_json::Value =
         serde_json::from_str(recipe["custom_lists"].as_str().unwrap()).unwrap();
@@ -2485,8 +2489,7 @@ fn test_recipes_cli_learn_writes() {
         serde_json::from_str(recipe["faker_rules"].as_str().unwrap()).unwrap();
     let custom_lists: serde_json::Value =
         serde_json::from_str(recipe["custom_lists"].as_str().unwrap()).unwrap();
-    let rules: serde_json::Value =
-        serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
+    let rules: serde_json::Value = serde_json::from_str(recipe["rules"].as_str().unwrap()).unwrap();
 
     let f_obj = faker_rules.as_object().expect("faker_rules object");
     assert_eq!(
@@ -2739,11 +2742,13 @@ fn test_recipes_cli_learn_ask_yes() {
         "--ask --yes should succeed. stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("stdout JSON");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout JSON");
     assert_eq!(report["wrote"], true);
     let applied = report["applied"].as_array().unwrap();
-    assert!(!applied.is_empty(), "ask --yes should auto-accept all proposed");
+    assert!(
+        !applied.is_empty(),
+        "ask --yes should auto-accept all proposed"
+    );
 }
 
 #[test]
@@ -2754,21 +2759,16 @@ fn test_recipes_cli_learn_ask_without_file_errors() {
 
     let out = mirage_cli(
         &server,
-        &[
-            "learn",
-            "--id",
-            &id.to_string(),
-            "--def",
-            "Pet",
-            "--ask",
-        ],
+        &["learn", "--id", &id.to_string(), "--def", "Pet", "--ask"],
     );
     assert!(!out.status.success(), "--ask without --file must error");
     let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
-    let err: serde_json::Value =
-        serde_json::from_str(stderr.trim()).expect("stderr JSON");
+    let err: serde_json::Value = serde_json::from_str(stderr.trim()).expect("stderr JSON");
     assert!(
-        err["error"].as_str().unwrap().contains("--ask requires --file"),
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("--ask requires --file"),
         "error message must mention requirement: {stderr}"
     );
 }

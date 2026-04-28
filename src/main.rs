@@ -1038,10 +1038,7 @@ fn build_put_body(new_cfg: &learn::NewConfig) -> serde_json::Value {
 
 /// Step through proposed rules on stderr; read y/n from /dev/tty (or stdin if
 /// no TTY). `--yes` short-circuits to accept all (test hook).
-fn ask_filter_proposed(
-    proposed: Vec<learn::ProposedRule>,
-    yes: bool,
-) -> Vec<learn::ProposedRule> {
+fn ask_filter_proposed(proposed: Vec<learn::ProposedRule>, yes: bool) -> Vec<learn::ProposedRule> {
     if yes {
         return proposed;
     }

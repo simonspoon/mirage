@@ -361,21 +361,23 @@ mod tests {
         assert_eq!(listed[0].seed_counts, payload);
 
         let updated_payload = r#"{"AccessDto":12}"#;
-        assert!(update_recipe(
-            &conn,
-            recipe.id,
-            "My Recipe",
-            "spec",
-            "[]",
-            10,
-            "{}",
-            "{}",
-            "[]",
-            "{}",
-            "{}",
-            updated_payload,
-        )
-        .unwrap());
+        assert!(
+            update_recipe(
+                &conn,
+                recipe.id,
+                "My Recipe",
+                "spec",
+                "[]",
+                10,
+                "{}",
+                "{}",
+                "[]",
+                "{}",
+                "{}",
+                updated_payload,
+            )
+            .unwrap()
+        );
         let after = get_recipe(&conn, recipe.id).unwrap().unwrap();
         assert_eq!(after.seed_counts, updated_payload);
     }

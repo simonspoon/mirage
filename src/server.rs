@@ -3174,7 +3174,9 @@ mod tests {
         let id = created["id"].as_i64().unwrap();
         assert_eq!(
             created["seed_counts"],
-            serde_json::json!(r#"{"Gadget":3,"Thing":2,"Widget":7}"#).as_str().unwrap_or_default(),
+            serde_json::json!(r#"{"Gadget":3,"Thing":2,"Widget":7}"#)
+                .as_str()
+                .unwrap_or_default(),
             "seed_counts persisted as JSON string — actual: {}",
             created["seed_counts"]
         );
