@@ -25,8 +25,9 @@ seeder.rs          Seed rows (field-level rule pre-pass + compare-repair),
                    composer pass overwrites them.
     |
     v
-composer.rs        Build shared entity pools, compose response documents
-                   for each endpoint; same rule machinery as the seeder.
+composer.rs        Compose response documents for each endpoint;
+                   same rule machinery as the seeder. Nested $ref samples
+                   are drawn from each def's SQLite backing table.
                    Produces an in-memory DocumentStore of composed rows.
     |
     v
@@ -49,10 +50,15 @@ HTTP responses (JSON)
 ```
 
 On boot (`main.rs`) the same pipeline runs once with default configs
-(no recipe rules, no frozen rows). Recipe activation
-(`admin_activate_recipe` in `server.rs`) runs it again with the recipe's
-faker rules, constraint rules, pool config, quantity configs, and
-frozen rows.
+(no recipe rules, no frozen rows; scalar seed count of 10 per def).
+Recipe activation (`admin_activate_recipe` in `server.rs`) runs it
+again with the recipe's faker rules, constraint rules, custom lists,
+quantity configs, per-definition `seed_counts` (with the scalar
+`seed_count` as fallback), and frozen rows. The
+`admin_reset_active_recipe` handler (`POST /_api/admin/recipes/reset`)
+re-runs the same activation pipeline for the recipe id currently
+tracked on `RouteRegistry::active_recipe_id` — process-local state, not
+persisted across restarts.
 
 ## Modules
 
@@ -87,6 +93,25 @@ target tables and INSERTs the composed rows. **SQLite is the single
 source of truth at request-time** — every read path, admin or mock,
 queries SQLite.
 
+### `learn.rs`
+
+Pure deterministic rule synthesizer for the `mirage recipes learn` CLI
+subcommand. Reads JSON sample rows (JSONL or JSON-array), inspects
+each property of a target definition, and emits a `LearnPlan` with one
+of four decisions per field: apply faker strategy, apply custom list,
+apply field-level rule, or skip with a reason. No LLM, no network, no
+filesystem access (apart from the dedicated `read_samples` reader
+helper). Detection is by regex + simple distinct-count statistics, in
+priority order: low-sample skip → const → format-detected faker
+(uuid/email/ipv4/date) → choice → custom list (string-only) → numeric
+range → too-distinct skip. The `apply_plan` function merges the plan
+into an existing recipe config under one of three policies: `merge`
+(only fill empty slots), `overwrite` (replace), and `fail` (error on
+first conflict). The CLI driver in `main.rs::run_learn` reads samples,
+fetches the recipe via the admin API, calls `plan_learn` and
+`apply_plan`, and writes the merged config back via
+`PUT /_api/admin/recipes/:id/config`.
+
 ### `rules.rs`
 
 The constraint-rules subsystem. Defines the `Rule` enum (five variants: `Range`, `Choice`, `Const`, `Pattern`, `Compare`) and `CompareOp` (`eq`/`neq`/`gt`/`gte`/`lt`/`lte`, numeric AND string). Responsibilities:
@@ -101,20 +126,29 @@ The same rule machinery is used by both `seeder::seed_table` (SQLite rows) and `
 ### `recipe.rs`
 
 SQLite-backed recipe persistence. A recipe bundles everything a user
-configures for a spec: selected endpoints, seed count, quantity
-configs, faker rules, constraint rules, and **frozen rows**
+configures for a spec: selected endpoints, scalar `seed_count`
+(fallback default), per-definition `seed_counts` map, quantity configs,
+faker rules, custom lists, constraint rules, and **frozen rows**
 (user-pinned rows replayed after recomposition). Stored as JSON-string
 columns in a `recipes` table. Idempotent `ALTER TABLE ... ADD COLUMN`-style
 migrations so existing databases pick up new columns
 (`quantity_configs`, `faker_rules`, `rules TEXT NOT NULL DEFAULT '[]'`,
-`frozen_rows TEXT NOT NULL DEFAULT '{}'`) without a schema reset. The
-legacy `shared_pools` column is retained for schema back-compat — old
-rows still carry it but the value is no longer read; nested-$ref
-samples are sourced implicitly from each def's SQLite backing table at
-compose time. `FrozenRows` is `HashMap<String, Vec<serde_json::Value>>`
-keyed by table name. CRUD helpers: `create_recipe`, `list_recipes`,
+`frozen_rows TEXT NOT NULL DEFAULT '{}'`, `custom_lists TEXT NOT NULL
+DEFAULT '{}'`, `seed_counts TEXT NOT NULL DEFAULT '{}'`) without a
+schema reset. The legacy `shared_pools` column is retained for schema
+back-compat — old rows still carry it but the value is no longer read;
+nested-$ref samples are sourced implicitly from each def's SQLite
+backing table at compose time. `FrozenRows` is
+`HashMap<String, Vec<serde_json::Value>>` keyed by table name.
+`seed_counts` parses to `HashMap<String, usize>` keyed by definition
+name; defs missing from the map fall back to the scalar `seed_count`
+during activation. CRUD helpers: `create_recipe`, `list_recipes`,
 `get_recipe`, `update_recipe`, `update_recipe_config`, `delete_recipe`,
-plus `find_unique_clone_name` used by the clone endpoint.
+plus `find_unique_clone_name` used by the clone endpoint. Migration
+note: when the `seed_counts` column is first added by a running server,
+existing recipe rows are back-filled by fanning the scalar `seed_count`
+onto every definition that appears in the recipe's spec, so per-table
+overrides start from a known value rather than empty.
 
 ### `entity_graph.rs`
 
@@ -123,7 +157,8 @@ Nodes are definition names; edges are `$ref` relationships; roots are
 the definitions that appear directly in endpoint responses; shared
 entities are definitions referenced by more than one parent. Also
 surfaces scalar property metadata (name, type, format) for faker-rule
-authoring and array property metadata for shared-pool configuration.
+authoring and array property metadata used by the recipe configure
+view.
 
 **Virtual roots** — endpoints whose primary response shape is *not* a
 named definition (primitive values, primitive arrays, freeform
@@ -133,6 +168,18 @@ the admin UI can surface them. Virtual roots are distinct from
 extension-only roots (definitions that only appear as `allOf` bases
 and are never used as a root directly). Construction lives at
 `src/entity_graph.rs:37` (field), `:203` (init), `:275` (emit).
+
+**Endpoint edges** — `EntityGraph.endpoint_edges` is a deterministic
+list of `EndpointEdge { endpoint, target_def, direction }` records
+emitted alongside the regular `$ref` edges. Each edge ties a real
+endpoint pseudo-node to the definition referenced by its body
+parameter (`direction = "input"`) or its primary 2xx response
+(`direction = "output"`). Endpoints whose primary response is a virtual
+root contribute no edge. Edges to extension-only roots and edges to
+definitions absent from `nodes` are filtered out before emit. The
+admin UI hides endpoint pseudo-nodes by default and only renders them
+when the **Endpoints** layer toggle is on; with the toggle off, the
+graph is definition-only.
 
 ### `server.rs`
 
@@ -214,7 +261,12 @@ left sidebar for navigation:
   unconditionally from `ui/src/index.tsx`; **Dagre is the sole layout
   engine**. The legacy custom layout in `ui/src/dagLayout.ts` is
   retained only for unit-test coverage of helpers and shared types —
-  it is never invoked from the render path.
+  it is never invoked from the render path. The page exposes an
+  **Endpoints** layer toggle (default OFF, signal
+  `endpointLayerOn` in `ui/src/index.tsx`) that appends endpoint
+  pseudo-nodes plus directed input/output edges from
+  `EntityGraph.endpoint_edges` (assembled by `appendEndpointPseudoNodes`).
+  When OFF the graph is definition-only.
 - **Recipes** — list, create, rename, clone, delete, import, export,
   and activate recipes.
 - **Recipe configure wizard** — per-recipe editor. A unified Properties
@@ -246,6 +298,7 @@ Admin API endpoints:
 | GET | `/_api/admin/recipes/:id/config` | Get parsed pools/quantities/faker rules/constraint rules |
 | PUT | `/_api/admin/recipes/:id/config` | Update pools/quantities/faker rules/constraint rules |
 | POST | `/_api/admin/recipes/:id/activate` | Apply a recipe and start serving |
+| POST | `/_api/admin/recipes/reset` | Re-run activation for the recipe currently active on this process. 409 when none. |
 | GET | `/_api/admin/recipes/:id/export` | Export a recipe as JSON |
 | POST | `/_api/admin/recipes/:id/clone` | Clone a recipe |
 | POST | `/_api/admin/recipes/import` | Import a previously exported recipe |

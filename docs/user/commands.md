@@ -9,6 +9,7 @@ Mirage is a Swagger 2.0 mock API server. It reads a spec, generates an in-memory
 ```
 mirage [OPTIONS] [SPEC]
 mirage inspect <SPEC>
+mirage recipes <SUBCOMMAND>
 ```
 
 ### Arguments
@@ -74,6 +75,115 @@ mirage inspect petstore.yaml
 
 ---
 
+## Recipes CLI
+
+`mirage recipes` is a thin client over the admin HTTP API. Every subcommand
+talks to a running mirage server (default `http://localhost:3737`, override
+with `--url` or the `MIRAGE_URL` env var). The CLI does not touch the
+recipe database directly — start a server first.
+
+```
+mirage recipes <SUBCOMMAND>
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `list` | List all recipes as a JSON array of summaries. |
+| `show <id>` | Print one recipe with its parsed config nested. |
+| `create` | Create a recipe from spec + endpoints + optional config files. |
+| `delete <id>` | Delete a recipe by id. |
+| `clone <id>` | Clone a recipe; server picks a unique name. |
+| `activate <id>` | Drop tables, re-seed, re-apply frozen rows, swap route set. |
+| `reset` | Re-run activation for the recipe currently active on the server. Errors with `409 {"error":"no active recipe"}` if nothing is active. |
+| `import --file <path>` | Create a recipe from an exported-recipe JSON file. |
+| `export <id> [--file <path>]` | Write a recipe as standalone JSON (default: stdout). |
+| `config apply <id> --file <path>` | Replace a recipe's parsed config from a JSON file. The body matches `PUT /_api/admin/recipes/:id/config`; whole config is replaced (no partial-patch). |
+| `learn` | Synthesize rules from sample data and merge them into a recipe (see below). |
+
+Common flags:
+
+| Flag | Description |
+|---|---|
+| `--url <URL>` | Admin server URL. Default `http://localhost:3737`. Honors `MIRAGE_URL` env var. |
+
+### `mirage recipes create`
+
+Create a recipe by composing a Swagger spec file, an endpoints file, and an
+optional config file:
+
+```bash
+mirage recipes create   --name "petstore bounded"   --spec-file petstore.yaml   --endpoints-file endpoints.json   --seed-count 10   --config-file config.json
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--name` | Yes | Recipe display name. |
+| `--spec-file` | Yes | Path to the Swagger spec used as `spec_source`. |
+| `--endpoints-file` | Yes | JSON file with `[{"method":"...","path":"..."}, ...]`. |
+| `--seed-count` | No | Default per-table seed count (the scalar fallback). |
+| `--config-file` | No | JSON file containing any of `quantity_configs`, `faker_rules`, `rules`, `frozen_rows`, `custom_lists`, `seed_counts`. |
+
+### `mirage recipes reset`
+
+Re-runs activation for the recipe currently tracked as active on the server.
+Useful for restoring seeded state after editing rows in the admin UI or via
+the mock API.
+
+```bash
+mirage recipes reset
+# -> {"status":"activated", ...}
+```
+
+Calls `POST /_api/admin/recipes/reset`. Returns `409 Conflict` (and the CLI
+exits non-zero) when no recipe has been activated in the current server
+process.
+
+### `mirage recipes learn`
+
+Synthesize per-field rules from sample data and merge them into a saved
+recipe. Detection is **deterministic** — regex + simple stats, no LLM and
+no network calls beyond the admin API.
+
+```bash
+# Pipe samples on stdin
+cat pets.jsonl | mirage recipes learn --id 7 --def Pet
+
+# Or pass a file (required when using --ask interactive mode)
+mirage recipes learn --id 7 --def Pet --file pets.jsonl --dry-run
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--id` | — | Recipe id to write into. |
+| `--def` | — | Definition name in the spec (e.g. `Pet`). |
+| `--file` | stdin | Path to a JSONL or JSON-array sample file. |
+| `--dry-run` | off | Compute the plan and print the report; do NOT call `PUT /config`. |
+| `--ask` | off | Step through proposed rules interactively (requires `--file`). |
+| `--merge` | on | Conflict policy: only fill empty slots (default). |
+| `--overwrite` | off | Conflict policy: replace existing entries. |
+| `--fail` | off | Conflict policy: error on first conflict (no writes). |
+| `--max-choice` | 20 | Distinct values ≤ this → emit a `Choice` rule. |
+| `--max-list` | 200 | Distinct string values ≤ this → emit a custom list. |
+| `--min-samples` | 5 | Per-field non-null count below this → skip the field. |
+| `--max-samples` | none | Cap on samples read from input. |
+| `--yes` | off | Auto-accept all proposals under `--ask` (test hook). |
+
+Detection priority (first match wins per field):
+
+1. Non-null sample count below `--min-samples` → skip with reason `low_samples`.
+2. All values identical (1 distinct) → `Const` rule.
+3. All string samples match a format regex → faker rule (`uuid`, `email`, `ipv4`, `date`).
+4. Distinct count ≤ `--max-choice` → `Choice` rule.
+5. All string values, distinct ≤ `--max-list` → custom list (named `learned_<def>_<prop>`) plus a faker rule referencing it.
+6. All numeric, distinct above `--max-choice` → `Range` rule (computed `[min, max]`).
+7. Distinct above `--max-list` → skip with reason `too_distinct`.
+
+Output is a JSON report on stdout describing the plan, applied entries,
+skipped fields, and whether the merged config was written. With `--dry-run`,
+nothing is written and the report carries `wrote: false`.
+
+---
+
 ## Admin UI
 
 ```
@@ -94,7 +204,7 @@ On load, the UI checks `/_api/admin/spec` and `/_api/admin/endpoints`. If a spec
 
 After a successful import, the UI displays every operation found in the spec as a checkbox list. All endpoints are checked by default. Uncheck any you do not want the mock server to serve.
 
-A **Seed count** field (default: 10, range 1-100) controls how many fake rows to generate per table.
+A per-table **seed counts** input (default 10 each, range 1-100) controls how many fake rows to generate for each definition. The legacy global seed-rows input has been removed; per-recipe configuration uses the `seed_counts` map (see [Recipes](#recipes)).
 
 Click **Start Mock Server** to post the selection to `/_api/admin/configure`. The server drops and recreates all tables, seeds them, and activates the selected routes.
 
@@ -106,13 +216,13 @@ Click **Import New Spec** to return to Step 1. This clears the local UI state on
 
 ### Recipe configure view
 
-The recipe configure view (opened via **Edit configuration** on any saved recipe) is the authoring surface for the non-endpoint recipe fields: shared pools, per-property quantity, faker strategies, and constraint rules. It is organised as one **table block** per endpoint group, each containing a unified **Properties** list.
+The recipe configure view (opened via **Edit configuration** on any saved recipe) is the authoring surface for the non-endpoint recipe fields: per-table seed count, per-property quantity, faker strategies, custom lists, and constraint rules. It is organised as one **table block** per endpoint group, each containing a unified **Properties** list.
 
-**Table block header.** Each block header names the underlying definition (or virtual root) and carries shared-pool controls inline — a toggle to enable pool sharing for this table and a numeric input for pool size. Filter chips on the view let you scope the list to a specific endpoint or table.
+**Table block header.** Each block header names the underlying definition (or virtual root) and carries the per-table seed count input inline. Filter chips on the view let you scope the list to a specific endpoint or table. The legacy `shared_pools` opt-in surface has been removed — nested-`$ref` samples are now drawn implicitly from each definition's SQLite backing table at compose time.
 
 **Properties list.** Every property of every response/body definition used by the selected endpoints appears as a single row, regardless of whether it is an array, scalar, or nested reference. Each row carries its controls inline:
 
-- **Faker control** — dropdown selecting the faker strategy for this property (or `default` to fall back to the `x-faker` / format / heuristic pipeline).
+- **Faker control** — dropdown selecting the faker strategy for this property (or `default` to fall back to the `x-faker` / format / heuristic pipeline). Custom lists (defined at the recipe level) appear in the same dropdown and shadow built-in strategies that share their name.
 - **Array quantity** — `min`/`max` numeric inputs, shown on every row; only take effect for array-typed properties, but are always visible to keep the row shape uniform.
 - **Constraint rule chips** — compact chips representing the `range`, `choice`, `const`, `pattern`, and `compare` rules attached to this property. Click a chip to edit; click the `+` chip to add a new rule. Rule validation runs on save (see [Constraint Rules](#constraint-rules)).
 
@@ -315,14 +425,14 @@ A **recipe** is a saved configuration for a spec. It bundles:
 
 - The spec source (raw YAML/JSON text)
 - The subset of endpoints to activate
-- The per-table seed count
-- **Shared entity pools** — sizes of cross-definition shared pools
+- A scalar **`seed_count`** (default fallback) plus a **`seed_counts`** map of per-definition overrides
 - **Quantity configs** — min/max collection sizes for array properties
 - **Faker rules** — per-field faker strategy overrides
+- **Custom lists** — named string pools usable from `faker_rules`
 - **Constraint rules** — bounded ranges, choices, constants, patterns, and cross-field compares
 - **Frozen rows** — exact table rows that must be re-inserted on every activate
 
-Recipes are persisted to a `mirage.db` SQLite file in the working directory and survive restarts. All recipe fields (except name, spec source, and seed count) are stored as JSON strings.
+Recipes are persisted to a `mirage.db` SQLite file in the working directory and survive restarts. All recipe fields (except name, spec source, and the scalar `seed_count`) are stored as JSON strings. The legacy `shared_pools` user surface has been removed — nested-`$ref` samples are sourced implicitly from each definition's SQLite backing table at compose time. The `shared_pools` column is retained on the schema for back-compat but is never read.
 
 ### Recipe CRUD endpoints
 
@@ -337,6 +447,7 @@ Recipes are persisted to a `mirage.db` SQLite file in the working directory and 
 | PUT | `/_api/admin/recipes/:id/config` | Update the parsed config (accepts `frozen_rows` alongside the other config fields) |
 | POST | `/_api/admin/recipes/:id/clone` | Clone a recipe, returning the new record |
 | POST | `/_api/admin/recipes/:id/activate` | Apply this recipe and start serving traffic |
+| POST | `/_api/admin/recipes/reset` | Re-run activation for the currently active recipe (re-seed, replay frozen rows). 409 if no recipe is active. |
 | GET | `/_api/admin/recipes/:id/export` | Export a recipe as JSON for backup/transfer |
 | POST | `/_api/admin/recipes/import` | Import a previously exported recipe |
 
@@ -356,6 +467,8 @@ Creates a new recipe. Validates constraint rules at create time (see [Constraint
 | `faker_rules` | string (JSON object) | No | `{"DefName": {"prop": "strategy"}}` (default `{}`) |
 | `rules` | string (JSON array) | No | Constraint rules (default `[]`) |
 | `frozen_rows` | string (JSON object) | No | `{"TableName": [{...row}, ...]}` — pinned rows re-inserted on every activate (default `{}`) |
+| `custom_lists` | string (JSON object) | No | `{"ListName": ["val", ...]}` — named string-pool definitions referenced by faker rules. Empty or non-string entries are dropped (default `{}`) |
+| `seed_counts` | string (JSON object) | No | `{"DefName": 12, ...}` — per-table seed counts. Defs missing from this map fall back to the scalar `seed_count`. Default `{}`. |
 
 ### Constraint Rules
 
@@ -412,7 +525,34 @@ curl -X POST http://localhost:3737/_api/admin/recipes \
   }'
 ```
 
-On activate, rules apply to BOTH the seeded SQLite rows (via the seeder) AND any composed JSON response documents (via the composer / shared entity pools).
+On activate, rules apply to BOTH the seeded SQLite rows (via the seeder) AND any composed JSON response documents (via the composer).
+
+### POST /_api/admin/recipes/reset
+
+Re-runs activation for the recipe currently active on the server. The same
+pipeline as `POST /_api/admin/recipes/:id/activate` runs (drop + re-seed +
+re-compose + replay frozen rows). Useful after row edits via the admin UI
+or mock API to restore the seeded baseline.
+
+**Request:** No body.
+
+**Response on success (200):** Same payload as `/recipes/:id/activate`.
+
+**Response when no recipe is active (409):**
+
+```json
+{"error": "no active recipe"}
+```
+
+This happens when no `activate` has been called in the current server
+process or when the previously active recipe has been deleted. The active
+recipe id is process-local — it is **not** persisted across restarts.
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3737/_api/admin/recipes/reset
+```
 
 ### Schemas graph
 
@@ -423,6 +563,16 @@ On activate, rules apply to BOTH the seeded SQLite rows (via the seeder) AND any
 - **Virtual roots** — endpoints whose response shape is not a named definition (primitive arrays, loose objects, etc.). They are tracked separately so the UI can still render them as graph nodes even though they are not backed by a definition.
 
 All three sets, plus the edge list, are returned in a single payload; the UI uses Dagre to lay out the graph.
+
+The response also includes an `endpoint_edges` field — a list of
+`{endpoint, target_def, direction}` objects describing **directed** edges
+between endpoint pseudo-nodes and their primary `$ref` definition. The
+`direction` value is `"input"` for body parameters and `"output"` for
+the primary 2xx response definition. The endpoint pseudo-nodes are
+hidden by default; toggle the **Endpoints** control in the Schemas
+sidebar to render them. When the toggle is off, only definition nodes
+and `$ref` edges are drawn — `endpoint_edges` is still returned by the
+API but ignored by the layout.
 
 ---
 

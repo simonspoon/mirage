@@ -8,10 +8,14 @@ Swagger 2.0 mock API server. Feed it a spec, get live CRUD endpoints backed by S
 - **Automatic table generation** -- SQLite tables created from Swagger definitions
 - **Smart fake data** -- 40+ faker strategies with layered resolution: `x-faker` > format > name heuristic > type fallback
 - **Live CRUD endpoints** -- GET collection, GET by ID, POST create, DELETE
-- **Shared entity pools** -- cross-definition referential integrity
+- **Implicit referential integrity** -- nested `$ref` samples are drawn from each definition's SQLite backing table at compose time
 - **Constraint rules** -- bounded ranges, enum choices, constants, regex patterns, and cross-field compares (`gt`/`lt`/`eq`/...) applied during seeding
-- **Admin UI** -- SolidJS browser wizard with recipe management, request log, schema browser, entity graph
-- **Recipe persistence** -- saved recipes (endpoints, seed counts, shared pools, faker rules, constraint rules) survive restarts, SQLite-backed
+- **Custom lists** -- named string pools usable from faker rules; shadow built-in strategies that share their name
+- **Admin UI** -- SolidJS browser wizard with recipe management, schema browser with optional endpoint-edge layer, request log
+- **Recipe persistence** -- saved recipes (endpoints, per-table seed counts, faker rules, custom lists, constraint rules, frozen rows) survive restarts, SQLite-backed
+- **Frozen rows** -- exact rows that are re-inserted on every activate / reset
+- **Recipes CLI** -- `mirage recipes ...` thin client over the admin HTTP API: list/show/create/clone/activate/reset/export/import/config-apply
+- **`recipes learn`** -- deterministic, LLM-free rule synthesizer driven by sample JSONL data
 - **`inspect` subcommand** -- spec diagnostics without starting a server
 - **Single binary** -- UI embedded via rust-embed
 
@@ -85,6 +89,19 @@ Diagnose a spec without starting the server:
 ```bash
 mirage inspect petstore.yaml
 ```
+
+### Recipes
+
+Manage saved recipes from the CLI against a running server:
+
+```bash
+mirage recipes list
+mirage recipes activate 7
+mirage recipes reset
+mirage recipes learn --id 7 --def Pet --file pets.jsonl
+```
+
+The full subcommand tree (`create`, `clone`, `import`, `export`, `config apply`, …) is documented in [Commands and API > Recipes CLI](docs/user/commands.md#recipes-cli).
 
 ## Documentation
 

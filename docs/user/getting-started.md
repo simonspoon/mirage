@@ -13,7 +13,7 @@ cargo build --release
 
 ### CLI Mode
 
-Pass a spec file directly. Mirage imports it, creates tables, seeds 10 rows per definition, and starts serving immediately.
+Pass a spec file directly. Mirage imports it, creates tables, seeds 10 rows per definition (the default), and starts serving immediately. When you save a recipe through the admin UI you can override this per-definition via the `seed_counts` map.
 
 ```bash
 mirage path/to/swagger.json
@@ -35,10 +35,12 @@ Open `http://localhost:3737/_admin/` and:
 
 1. Paste your Swagger 2.0 spec (JSON or YAML), click **Import Spec**
 2. Select which endpoints to activate, set seed count
-3. Configure shared entity pools, faker strategies, and constraint rules
-4. Name and save as a **recipe**, then **Activate** — the server drops tables, reseeds with your config, and starts serving
+3. Configure faker strategies, custom lists, per-property quantities, per-table seed counts, and constraint rules
+4. Name and save as a **recipe**, then **Activate** — the server drops tables, reseeds with your config, replays any frozen rows, and starts serving
 
-Recipes persist to a `mirage.db` SQLite file in the working directory (separate from the in-memory database that holds mock data), so they survive restarts because the file is on disk. See [Commands and API > Recipes](commands.md#recipes) for the full recipe API, including the **constraint rules** system for bounded ranges, choices, constants, regex patterns, and cross-field compares.
+Recipes persist to a `mirage.db` SQLite file in the working directory (separate from the in-memory database that holds mock data), so they survive restarts because the file is on disk. The currently active recipe id is **process-local** — it is not persisted across restarts; `mirage recipes reset` only works while the same server process is running.
+
+See [Commands and API > Recipes](commands.md#recipes) for the full recipe API, including the **constraint rules** system for bounded ranges, choices, constants, regex patterns, and cross-field compares, the per-definition `seed_counts` map, and the `mirage recipes learn` workflow for synthesising rules from sample data.
 
 ### Inspect Mode
 
@@ -82,3 +84,13 @@ curl -X DELETE http://localhost:3737/pet/1
 | Custom port | `mirage swagger.json -p 8080` |
 | Admin UI mode | `mirage` then open `http://localhost:3737/_admin/` |
 | Inspect spec | `mirage inspect swagger.json` |
+| List recipes (server running) | `mirage recipes list` |
+| Activate a recipe by id | `mirage recipes activate <id>` |
+| Re-seed the active recipe | `mirage recipes reset` |
+| Synth rules from samples | `mirage recipes learn --id <id> --def Pet --file pets.jsonl` |
+
+`mirage recipes ...` is a thin client that talks to a running mirage server
+(default `http://localhost:3737`, override with `--url` or `MIRAGE_URL`).
+Start a server first, then drive recipes from the CLI or the admin UI. See
+[Commands and API > Recipes CLI](commands.md#recipes-cli) for the full set
+of subcommands.
