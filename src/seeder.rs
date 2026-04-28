@@ -798,13 +798,7 @@ pub fn seed_table(
                 "INTEGER" => {
                     let n = match &value {
                         serde_json::Value::Number(num) => num.as_i64().unwrap_or(0),
-                        serde_json::Value::Bool(b) => {
-                            if *b {
-                                1
-                            } else {
-                                0
-                            }
-                        }
+                        serde_json::Value::Bool(b) => i64::from(*b),
                         _ => 0,
                     };
                     params.push(Box::new(n));
