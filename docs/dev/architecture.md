@@ -272,7 +272,7 @@ left sidebar for navigation:
 - **Recipe configure wizard** — per-recipe editor. A unified Properties
   table per endpoint/table block exposes inline controls for each
   property row (faker rule, array quantity, constraint-rule chips).
-  Shared-pool controls live inline in the table-block header.
+  Per-table seed count inputs live inline in each table-block header.
 
 Admin API endpoints:
 

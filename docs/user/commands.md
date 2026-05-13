@@ -204,7 +204,7 @@ On load, the UI checks `/_api/admin/spec` and `/_api/admin/endpoints`. If a spec
 
 After a successful import, the UI displays every operation found in the spec as a checkbox list. All endpoints are checked by default. Uncheck any you do not want the mock server to serve.
 
-A per-table **seed counts** input (default 10 each, range 1-100) controls how many fake rows to generate for each definition. The legacy global seed-rows input has been removed; per-recipe configuration uses the `seed_counts` map (see [Recipes](#recipes)).
+A **seed rows** input (default 10, range 1–100) sets how many fake rows to generate per table. For per-definition overrides use the recipe configure view's `seed_counts` map (see [Recipes](#recipes)).
 
 Click **Start Mock Server** to post the selection to `/_api/admin/configure`. The server drops and recreates all tables, seeds them, and activates the selected routes.
 
