@@ -1222,6 +1222,7 @@ async fn main() {
     let router = server::build_router(state);
 
     println!("Mirage server running on port {}", cli.port);
+    println!("Admin UI: http://localhost:{}/_admin/", cli.port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", cli.port))
         .await
         .unwrap();

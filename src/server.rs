@@ -2636,6 +2636,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/_api/admin", admin_api)
         .route(
+            "/",
+            get(|| async { axum::response::Redirect::permanent("/_admin/") }),
+        )
+        .route(
             "/_admin",
             get(|| async { axum::response::Redirect::permanent("/_admin/") }),
         )
@@ -2806,6 +2810,16 @@ mod tests {
             content_type.contains("text/html"),
             "expected text/html, got {content_type}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_root_redirects_to_admin() {
+        let router = setup();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "/_admin/");
     }
 
     #[tokio::test]
