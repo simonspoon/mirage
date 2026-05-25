@@ -190,7 +190,7 @@ nothing is written and the report carries `wrote: false`.
 http://localhost:3737/_admin/
 ```
 
-The admin UI is a SolidJS single-page application embedded in the binary. It provides a three-step wizard for importing and configuring the mock server at runtime. Navigating to `/_admin` (without trailing slash) redirects permanently to `/_admin/`.
+The admin UI is a SolidJS single-page application embedded in the binary. It provides a three-step wizard for importing and configuring the mock server at runtime. Navigating to the server root `/` or to `/_admin` (without trailing slash) redirects permanently to `/_admin/`.
 
 ### Step 1: Idle — Import Spec
 

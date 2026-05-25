@@ -21,6 +21,7 @@ mirage path/to/swagger.json
 
 ```
 Mirage server running on port 3737
+Admin UI: http://localhost:3737/_admin/
 ```
 
 ### Admin UI Mode
